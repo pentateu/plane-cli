@@ -11,7 +11,7 @@ if [ -z "$TARGET" ]; then
   echo "WARNING: plane shim could not resolve its symlink (no readlink -f / realpath) — using the invoked path; symlink installs may run a stale copy" >&2
 fi
 DIR="$(cd "$(dirname "$TARGET")" && pwd)"
-REPO="$(cd "$DIR/../../.." && pwd)"
+REPO="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || cd "$DIR/.." && pwd)"
 if [ "${PLANE_NO_PULL:-0}" != "1" ] && [ -d "$REPO/.git" ]; then
   if [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     git -C "$REPO" pull --ff-only -q origin development 2>/dev/null || true
