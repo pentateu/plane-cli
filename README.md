@@ -22,12 +22,33 @@ The shim resolves symlinks and fast-forward-pulls this repo before every run
 when the checkout is clean (skip with `PLANE_NO_PULL=1`) — PATH installs always
 execute latest main.
 
-## Auth — project-scoped by design
+## Auth — seats are PER-PROJECT identities
 
-Credentials live in **`.plane-seats`** (gitignored, chmod 600), found by walking
-up from your current directory. Keys: `HOMETUTOR_TICKETS_TOKEN_<SEAT>`.
-Precedence: project `.plane-seats` > legacy `~/.config/plane/seats.env` >
-exported `$HOMETUTOR_TICKETS_TOKEN_<SEAT>` > `$PLANE_TOKEN`. Provision per-seat
-tokens as chmod 600 files; the admin bootstrap token is never used implicitly.
+Seat names are unique per project: `dev1` in project A and `dev1` in project B
+are different Plane accounts with different tokens. Every project runs its own
+fleet (dev1…, tester1…, review1…, design, docs), provisions its own users in
+its Plane workspace (`<seat>-<project>@…` naming), and keeps its own
+credentials:
+
+- **`.plane-seats`** (project root, gitignored, provision as chmod 600) — keys
+  `HOMETUTOR_TICKETS_TOKEN_<SEAT>`, one per line.
+- **`.plane-env`** (same rules) — `PLANE_URL`, `PLANE_API_BASE`,
+  workspace, project id.
+
+The CLI walks up from your current directory to find these files, so tokens
+never leave the project they belong to — cross-project bleed is impossible by
+construction. Precedence: project `.plane-seats` > legacy
+`~/.config/plane/seats.env` > exported `$HOMETUTOR_TICKETS_TOKEN_<SEAT>` >
+`$PLANE_TOKEN`. The admin bootstrap token is never used implicitly.
+
+### Onboard a new project (one-time)
+
+1. Create one Plane user per seat in that workspace; add each to the project.
+2. As each seat user: Settings → API keys → mint one token.
+3. Write `HOMETUTOR_TICKETS_TOKEN_<SEAT>=…` lines into the project root's
+   `.plane-seats`; fill `.plane-env`.
+4. Verify per seat: `plane --seat <name> whoami`.
+
+Reference deployment: **pentateu/AI_Tutor** (Ai Tutor project).
 
 `plane help` is the canonical contract text.
