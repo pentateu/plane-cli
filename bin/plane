@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# plane — Plane ticket CLI shim (HomeTutor fleet).
+# Install (after merge to development): ln -s "$PWD/tools/plane-cli/bin/plane" ~/.local/bin/plane
+# Resolves through symlinks; fast-forward pulls AI_Tutor's development branch
+# before every run when the checkout is clean (skip with PLANE_NO_PULL=1).
+set -e
+SELF="$0"
+TARGET="$(readlink -f "$SELF" 2>/dev/null || realpath "$SELF" 2>/dev/null || true)"
+if [ -z "$TARGET" ]; then
+  TARGET="$SELF"
+  echo "WARNING: plane shim could not resolve its symlink (no readlink -f / realpath) — using the invoked path; symlink installs may run a stale copy" >&2
+fi
+DIR="$(cd "$(dirname "$TARGET")" && pwd)"
+REPO="$(cd "$DIR/../../.." && pwd)"
+if [ "${PLANE_NO_PULL:-0}" != "1" ] && [ -d "$REPO/.git" ]; then
+  if [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    git -C "$REPO" pull --ff-only -q origin development 2>/dev/null || true
+  fi
+fi
+BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
+exec "$BUN" run "$DIR/../src/cli.ts" "$@"
