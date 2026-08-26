@@ -151,7 +151,11 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
     try {
       await p.removeBlockEdge(blocker.uuid, blocked.uuid);
     } catch (e) {
-      if (e instanceof ApiError && /\b405\b/.test(e.message))
+      // Existence was just confirmed, so any 404/405 here means the instance
+      // lacks the relation-DELETE route (community: 405 method-not-allowed;
+      // some installs: route-level 404) — not a genuine race.
+      const msg = e instanceof Error ? e.message : String(e);
+      if ((e instanceof ApiError && (e.kind === "not-found" || /\b405\b/.test(msg))) || /\b405\b/.test(msg))
         throw new ApiError("api", "this Plane instance does not expose relation DELETE yet (public API v1 is GET+POST only)", {
           suggestion: "apply the plane-fork relation-delete patch, or remove the edge in the web UI",
         });
@@ -331,24 +335,29 @@ export async function run(argv: string[]): Promise<unknown> {
       cache.drop(`member:${cfg.seat}`);
       cache.drop("members");
       cache.drop("seqmap");
-      cache.drop("relmap");
       await p.ensureProject();
       const [states, labels] = await Promise.all([p.stateMap(), p.labelMap()]);
       await p.member(cfg.seat);
       const all = await fetchAll(p, "");
-      const relmap: RelMap = {};
-      for (let i = 0; i < all.raw.length; i += 20) {
+      // Relations walk: rate-limited instances make per-ticket lookups flaky,
+      // so merge into the previous map (never clobber good data with zeros),
+      // skip failed lookups entirely, and pace the batches.
+      const prevRelmap = ((cache.stale("relmap") as RelMap | undefined) ?? {}) as RelMap;
+      const relmap: RelMap = { ...prevRelmap };
+      let edgeErrors = 0;
+      for (let i = 0; i < all.raw.length; i += 10) {
         await Promise.all(
-          all.raw.slice(i, i + 10).map(async (i) => {
-            const u = String(i.id);
+          all.raw.slice(i, i + 10).map(async (issue) => {
+            const u = String(issue.id);
             try {
               const r = await p.relations(u);
               relmap[u] = { b: r.blockers, f: r.blocks };
             } catch {
-              relmap[u] = { b: [], f: [] };
+              edgeErrors++;
             }
           }),
         );
+        if (i + 10 < all.raw.length) await new Promise((r) => setTimeout(r, 200));
       }
       cache.set("relmap", relmap);
       return {
@@ -357,6 +366,7 @@ export async function run(argv: string[]): Promise<unknown> {
         labels: Object.keys(labels).length,
         tickets: all.raw.length,
         edges: Object.values(relmap).reduce((n, r) => n + r.b.length, 0),
+        edgeErrors,
       };
     }
     case "get": {

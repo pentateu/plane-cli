@@ -45,6 +45,21 @@ function relationEntry(uuid: string): Record<string, unknown> {
   return { project_id: "pr-1", issue_id: uuid };
 }
 
+/** Minimal router serving one issue + a relations payload in any wire shape. */
+function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p: string) => { status: number; json?: any } {
+  return (_m, path) => {
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path === "/members/") return { status: 200, json: MEMBERS };
+    if (/\/work-items\/([^/]+)\/relations\/$/.test(path)) return { status: 200, json: relations };
+    if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+    if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+    if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+    const m = path.match(/\/issues\/(is-\d+)\/$/);
+    if (m) return { status: 200, json: ISSUES.find((i) => i.id === m[1])! };
+    return { status: 404 };
+  };
+}
+
 const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_SEAT", "PLANE_TOKEN", "PLANE_CACHE", "HOMETUTOR_TICKETS_PROJECT_ID"];
 
 function capture(obj: any, method: string): any {
@@ -129,6 +144,7 @@ function useDefaultRouter() {
     }
     m = path.match(/\/work-items\/([^/]+)\/relations\/([^/]+)\/$/);
     if (m && _m === "DELETE") {
+      if (globalThis.__relationsDeleteMode === "route-404") return { status: 404, json: { error: "Page not found." } };
       if (!globalThis.__relationsDeleteEnabled) return { status: 405 };
       return removeEdgeAnyOrientation(m[1]!, m[2]!) ? { status: 204 } : { status: 404 };
     }
@@ -156,6 +172,8 @@ declare global {
   var __relations: Record<string, { blocking: string[]; blocked_by: string[] }> | undefined;
   // eslint-disable-next-line no-var
   var __relationsDeleteEnabled: boolean;
+  // eslint-disable-next-line no-var
+  var __relationsDeleteMode: "off" | "route-404";
 }
 
 globalThis.__method = "GET";
@@ -164,6 +182,7 @@ globalThis.__patchBody = undefined;
 globalThis.__postBody = undefined;
 globalThis.__relations = {};
 globalThis.__relationsDeleteEnabled = false;
+globalThis.__relationsDeleteMode = "off";
 
 beforeEach(() => {
   calls = [];
@@ -173,6 +192,7 @@ beforeEach(() => {
   globalThis.__postBody = undefined;
   globalThis.__relations = {};
   globalThis.__relationsDeleteEnabled = false;
+  globalThis.__relationsDeleteMode = "off";
   envSnapshot = {};
   for (const k of ENV_KEYS) envSnapshot[k] = process.env[k];
   process.env.PLANE_API_BASE = "http://localhost:8999/api/v1";
@@ -675,17 +695,47 @@ describe("states / labels / modules lookups (PC5)", () => {
 describe("sync", () => {
   test("rebuilds every cached namespace and reports counts", async () => {
     const d = (await run(["sync"])) as Record<string, unknown>;
-    expect(d).toEqual({ project: "Ai Tutor", states: 6, labels: 4, tickets: 2, edges: 0 });
+    expect(d).toEqual({ project: "Ai Tutor", states: 6, labels: 4, tickets: 2, edges: 0, edgeErrors: 0 });
   });
 
   test("refreshes relations into the cache so short handles render offline", async () => {
     addEdge("is-67", "is-66");
     const d = (await run(["sync"])) as Record<string, unknown>;
     expect(d.edges).toBe(1);
+    expect(d.edgeErrors).toBe(0);
     const c = peekCache()!;
     const relmap = c.fresh("relmap") as Record<string, { b: string[]; f: string[] }>;
     expect(relmap["is-67"]).toEqual({ b: [], f: ["is-66"] });
     expect(relmap["is-66"]).toEqual({ b: ["is-67"], f: [] });
+  });
+
+  test("rate-limited relation lookups are skipped (no zero-poison) and reported", async () => {
+    addEdge("is-67", "is-66");
+    // seed a previous good entry the walk must NOT lose
+    const seed = new Cache(process.env.PLANE_CACHE!);
+    seed.set("relmap", { "is-66": { b: ["is-67"], f: [] } });
+    seed.save();
+    let n = 0;
+    router = (_m, path) => {
+      if (/\/work-items\/([^/]+)\/relations\/$/.test(path)) {
+        n++;
+        if (n === 1 && path.includes("is-67")) return { status: 200, json: { blocking: ["is-66"], blocked_by: [] } };
+        if (path.includes("is-67")) return { status: 200, json: { blocking: ["is-66"], blocked_by: [] } };
+        return { status: 429 };
+      }
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      return { status: 404 };
+    };
+    const d = (await run(["sync"])) as Record<string, any>;
+    expect(d.edgeErrors).toBe(1);
+    const c = peekCache()!;
+    const relmap = c.fresh("relmap") as Record<string, { b: string[]; f: string[] }>;
+    expect(relmap["is-67"]).toEqual({ b: [], f: ["is-66"] }); // fresh from this walk
+    expect(relmap["is-66"]).toEqual({ b: ["is-67"], f: [] }); // preserved from before
   });
 });
 
@@ -741,12 +791,19 @@ describe("blocks / depends / unblocks", () => {
     expect(calls.some((c) => c.method === "DELETE")).toBeFalse();
   });
 
-  test("pre-patch instance (DELETE 405) fails loud with fork/UI guidance", async () => {
+  test("pre-patch instance fails loud with fork/UI guidance (405 and route-404 modes)", async () => {
     addEdge("is-66", "is-67");
     const e = await kindOf(["unblocks", "HT-66", "HT-67"]);
     expect(e.kind).toBe("api");
     expect(e.message).toContain("relation DELETE");
     expect(String(e.suggestion)).toContain("plane-fork");
+
+    // trial-style: DELETE route itself 404s instead of method-405
+    globalThis.__relationsDeleteMode = "route-404";
+    const e2 = await kindOf(["unblocks", "HT-66", "HT-67"]);
+    expect(e2.kind).toBe("api");
+    expect(e2.message).toContain("relation DELETE");
+    globalThis.__relationsDeleteMode = "off";
   });
 
   test("self-edge rejected with validation exit 4 before any network call", async () => {
@@ -836,18 +893,13 @@ describe("edge read side", () => {
   });
 
   test("relations entries in upstream shape ({id}) parse too, not just live {issue_id}", async () => {
-    router = (_m, path) => {
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
-      if (path === "/members/") return { status: 200, json: MEMBERS };
-      if (/\/work-items\/([^/]+)\/relations\/$/.test(path))
-        return { status: 200, json: { blocking: [{ id: "is-67" }], blocked_by: [] } };
-      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
-      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
-      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
-      const m = path.match(/\/issues\/(is-\d+)\/$/);
-      if (m) return { status: 200, json: ISSUES.find((i) => i.id === m[1])! };
-      return { status: 404 };
-    };
+    router = relationsShapeRouter({ blocking: [{ id: "is-67" }], blocked_by: [] });
+    const d = (await run(["get", "HT-66", "--fields", "blocks"])) as Record<string, any>;
+    expect(d.blocks).toEqual(["HT-67"]);
+  });
+
+  test("relations entries as bare uuid strings (commercial trial shape) parse too", async () => {
+    router = relationsShapeRouter({ blocking: ["is-67"], blocked_by: [] });
     const d = (await run(["get", "HT-66", "--fields", "blocks"])) as Record<string, any>;
     expect(d.blocks).toEqual(["HT-67"]);
   });

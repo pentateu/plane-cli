@@ -97,6 +97,11 @@ export class Plane {
     };
     let res = await doFetch();
     let retries = 0;
+    const retryAfterMs = (): number => {
+      const h = res.headers.get("retry-after");
+      const s = h ? Number(h) : NaN;
+      return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
+    };
     while ((res.status === 429 || res.status >= 500) && retries < 3) {
       retries++;
       try {
@@ -104,7 +109,7 @@ export class Plane {
       } catch {
         /* best effort */
       }
-      await new Promise((r) => setTimeout(r, this.backoffMs * 2 ** (retries - 1)));
+      await new Promise((r) => setTimeout(r, Math.max(retryAfterMs(), this.backoffMs * 2 ** (retries - 1))));
       res = await doFetch();
     }
     if (res.status === 401 || res.status === 403)
@@ -325,12 +330,15 @@ export class Plane {
   /** Native blocking edges (Plane stores one row: issue=blocked, related=blocker,
    *  relation_type="blocked_by"; "blocking"/"blocked_by" are two spellings).
    *  Only the work-items prefix exposes /relations/ on current instances.
-   *  Entry shape varies by version ({issue_id} on iswe.co.nz, {id} upstream) — accept both. */
+   *  Entry shape varies by install: bare uuid strings (commercial trial),
+   *  {issue_id} (community), {id} (upstream master) — accept all three. */
   async relations(uuid: string): Promise<IssueRelations> {
     const raw = (await this.request("GET", `${this.projectPath()}/work-items/${uuid}/relations/`)) as Raw;
     const ids = (v: unknown): string[] =>
       Array.isArray(v)
-        ? v.map((r: any) => String(r?.issue_id ?? r?.id ?? "")).filter((s) => s && s !== "undefined")
+        ? v
+            .map((r: any) => (typeof r === "string" ? r : String(r?.issue_id ?? r?.id ?? "")))
+            .filter((s) => s && s !== "undefined")
         : [];
     return { blockers: ids(raw.blocked_by), blocks: ids(raw.blocking) };
   }
