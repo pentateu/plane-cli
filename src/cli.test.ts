@@ -13,11 +13,6 @@ let spies: Array<{ mockRestore: () => void }> = [];
 let envSnapshot: Record<string, string | undefined> = {};
 let tmpDirs: string[] = [];
 
-function seqOfIssue(uuid: string): number {
-  const i = ISSUES.find((x) => x.id === uuid);
-  return i ? Number(i.sequence_id) : 0;
-}
-
 function relsOf(uuid: string): { blocking: string[]; blocked_by: string[] } {
   const m = (globalThis.__relations ??= {});
   return (m[uuid] ??= { blocking: [], blocked_by: [] });
@@ -46,7 +41,8 @@ function removeEdgeAnyOrientation(a: string, b: string): boolean {
 }
 
 function relationEntry(uuid: string): Record<string, unknown> {
-  return { id: uuid, name: "[edge] target", sequence_id: seqOfIssue(uuid), project_id: "pr-1", priority: "none", relation_type: "blocked_by" };
+  // live instance shape (iswe.co.nz): {project_id, issue_id} — no id/sequence_id
+  return { project_id: "pr-1", issue_id: uuid };
 }
 
 const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_SEAT", "PLANE_TOKEN", "PLANE_CACHE", "HOMETUTOR_TICKETS_PROJECT_ID"];
@@ -425,6 +421,32 @@ describe("get", () => {
 });
 
 describe("list", () => {
+  test("cursor pagination is followed and rows are deduped (legacy page= ignored by instance)", async () => {
+    const row = (n: number) => ({ id: `is-${n}`, sequence_id: n, name: `t${n}`, state: "st-todo", priority: "none", assignees: [], labels: [], parent: null });
+    // harness strips query strings, so branch on call count: call 1 = page 1
+    // (hostile: duplicate rows + next_cursor), call 2 = cursor page 2.
+    let issueListCalls = 0;
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) {
+        issueListCalls++;
+        if (issueListCalls === 1)
+          return { status: 200, json: { results: [row(100), row(100), row(67)], next_page_results: true, next_cursor: "1000:1:0" } };
+        return { status: 200, json: { results: [row(101)], next_page_results: false } };
+      }
+      if (/\/projects\/[^/]+\/issues\/is-\d+\/$/.test(path)) return { status: 200, json: ISSUES[0] };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      return { status: 404 };
+    };
+    const d = (await run(["list"])) as Record<string, any>;
+    expect(d.items.filter((i: any) => i.id === "HT-100").length).toBe(1);
+    expect(d.items.map((i: any) => i.id)).toEqual(["HT-100", "HT-67", "HT-101"]);
+    expect(issueListCalls).toBe(2);
+  });
+
   test("filters by me via exact member match", async () => {
     const d = (await run(["list", "--assignee", "me"])) as Record<string, any>;
     expect(d.total).toBe(1);
@@ -811,6 +833,23 @@ describe("edge read side", () => {
     const d = (await run(["get", "HT-66", "--fields", "blockedBy"])) as Record<string, any>;
     expect(d.blockedBy).toEqual(["edge:zzzzzzzz"]);
     expect(JSON.stringify(d)).not.toMatch(/zzzzzzzz-0000/);
+  });
+
+  test("relations entries in upstream shape ({id}) parse too, not just live {issue_id}", async () => {
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (/\/work-items\/([^/]+)\/relations\/$/.test(path))
+        return { status: 200, json: { blocking: [{ id: "is-67" }], blocked_by: [] } };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+      const m = path.match(/\/issues\/(is-\d+)\/$/);
+      if (m) return { status: 200, json: ISSUES.find((i) => i.id === m[1])! };
+      return { status: 404 };
+    };
+    const d = (await run(["get", "HT-66", "--fields", "blocks"])) as Record<string, any>;
+    expect(d.blocks).toEqual(["HT-67"]);
   });
 
   test("list --blocked-by HT-N lists tickets N blocks (what can start now)", async () => {

@@ -337,7 +337,7 @@ export async function run(argv: string[]): Promise<unknown> {
       await p.member(cfg.seat);
       const all = await fetchAll(p, "");
       const relmap: RelMap = {};
-      for (let i = 0; i < all.raw.length; i += 10) {
+      for (let i = 0; i < all.raw.length; i += 20) {
         await Promise.all(
           all.raw.slice(i, i + 10).map(async (i) => {
             const u = String(i.id);
@@ -581,14 +581,7 @@ export async function run(argv: string[]): Promise<unknown> {
 }
 
 async function fetchAll(p: Plane, search: string): Promise<{ raw: Array<Record<string, unknown>> }> {
-  const outArr: Array<Record<string, unknown>> = [];
-  for (let pageN = 1; pageN <= 5; pageN++) {
-    const q = new URLSearchParams({ per_page: "100", page: String(pageN) });
-    if (search) q.set("search", search);
-    const page = (await p.request("GET", `${p.projectPath()}/issues/?${q}`)) as Record<string, unknown>;
-    outArr.push(...((page.results as Array<Record<string, unknown>>) ?? []));
-    if (!(page.next_page_results ?? false)) break;
-  }
+  const outArr = await p.listIssues(search ? { search } : {});
   p.cache.set("seqmap", Object.fromEntries(outArr.map((i) => [String(i.sequence_id), i.id as string])));
   return { raw: outArr };
 }

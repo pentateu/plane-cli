@@ -204,6 +204,31 @@ export class Plane {
     return ids.map((i) => (names[i] ? names[i] : `member:${i.slice(0, 8)}`));
   }
 
+  /** Walk the project's issue list. Current instances are CURSOR-paginated
+   *  (next_cursor/next_page_results) and ignore the legacy offset `page` param —
+   *  following `page=N` would re-fetch page 1 forever. Dedupes defensively. */
+  async listIssues(params: Record<string, string> = {}, maxPages = 10): Promise<Raw[]> {
+    const out: Raw[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let i = 0; i < maxPages; i++) {
+      const q = new URLSearchParams({ per_page: "100", ...params });
+      if (cursor) q.set("cursor", cursor);
+      const page = (await this.request("GET", `${this.projectPath()}/issues/?${q}`)) as Raw;
+      for (const r of (page.results as Raw[]) ?? []) {
+        const key = String(r.id);
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push(r);
+        }
+      }
+      if (!(page.next_page_results ?? false)) break;
+      cursor = String(page.next_cursor ?? "");
+      if (!cursor) break;
+    }
+    return out;
+  }
+
   async issueRef(input: string): Promise<{ uuid: string; seq: number }> {
     const m = input.match(/^(?:HT-)?(\d+)$/i);
     if (!m)
@@ -215,11 +240,7 @@ export class Plane {
     const mapKey = "seqmap";
     const load = async (): Promise<Record<string, string>> => {
       const map: Record<string, string> = {};
-      for (let pageN = 1; pageN <= 5; pageN++) {
-        const page = (await this.request("GET", `${this.projectPath()}/issues/?per_page=100&page=${pageN}`)) as Raw;
-        for (const i of page.results as Raw[]) map[String(i.sequence_id)] = i.id;
-        if (!(page.next_page_results ?? false)) break;
-      }
+      for (const i of await this.listIssues()) map[String(i.sequence_id)] = i.id as string;
       this.cache.set(mapKey, map);
       return map;
     };
@@ -303,10 +324,14 @@ export class Plane {
 
   /** Native blocking edges (Plane stores one row: issue=blocked, related=blocker,
    *  relation_type="blocked_by"; "blocking"/"blocked_by" are two spellings).
-   *  Only the work-items prefix exposes /relations/ on current instances. */
+   *  Only the work-items prefix exposes /relations/ on current instances.
+   *  Entry shape varies by version ({issue_id} on iswe.co.nz, {id} upstream) — accept both. */
   async relations(uuid: string): Promise<IssueRelations> {
     const raw = (await this.request("GET", `${this.projectPath()}/work-items/${uuid}/relations/`)) as Raw;
-    const ids = (v: unknown): string[] => (Array.isArray(v) ? v.map((r: any) => String(r?.id)).filter(Boolean) : []);
+    const ids = (v: unknown): string[] =>
+      Array.isArray(v)
+        ? v.map((r: any) => String(r?.issue_id ?? r?.id ?? "")).filter((s) => s && s !== "undefined")
+        : [];
     return { blockers: ids(raw.blocked_by), blocks: ids(raw.blocking) };
   }
 
