@@ -39,9 +39,21 @@ The admin bootstrap token is never used implicitly.
 ## Decision trees
 
 **Claim a ticket**
+0. Before claiming, check `plane list --blocked-by` — never claim a ticket
+   blocked by an open ticket. `plane get HT-N --fields blockedBy,state` shows
+   who holds HT-N up.
 1. `plane claim HT-N --comment "starting"` — assigns you + moves to progress.
    The comment posts only when something actually changed, so retrying a timed-
    out claim never duplicates it (`commentPosted:false` tells you).
+
+**Wire dependencies between tickets (blocking edges)**
+1. `plane blocks HT-A HT-B` — edge: A blocks B. `plane depends HT-B HT-A`
+   spells the identical edge from the dependent side; both are idempotent
+   (re-applying => `changed:false`, exit 0). Set edges at creation time when
+   filing work with known ordering.
+2. `plane unblocks HT-A HT-B` removes the edge.
+3. Read side: `get` renders `blockedBy[]`/`blocks[]`; `list --blocked-by HT-N`
+   answers "what can start now".
 
 **Close out your fix**
 1. `plane state HT-N verify --comment "branch feature/x @ <sha>"` after merge-
@@ -83,3 +95,9 @@ The admin bootstrap token is never used implicitly.
 - First call per hour warms the disk cache; `plane sync` force-refreshes after
   someone else renames states/labels on the board. Board drift otherwise fails
   LOUD (missing state/label → exit 3 + `plane sync then retry`), never silently.
+  `sync` also refreshes blocking edges into the cache so short-handle rendering
+  works offline.
+- `unblocks` requires the plane-fork relation-DELETE patch: stock Plane's
+  public API exposes relations as GET+POST only, so removal fails loud (exit 1)
+  with guidance until the instance is patched. Creating/reading edges works on
+  stock instances.

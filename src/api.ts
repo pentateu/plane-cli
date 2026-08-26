@@ -23,6 +23,9 @@ export type IssueRow = {
 
 type Raw = Record<string, any>;
 
+export type IssueRelations = { blockers: string[]; blocks: string[] };
+export type RelMap = Record<string, { b: string[]; f: string[] }>;
+
 const STATE_TOKENS: Record<string, string> = {
   backlog: "backlog",
   todo: "todo",
@@ -243,7 +246,7 @@ export class Plane {
     return out;
   }
 
-  async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string> }): Promise<IssueRow & { description?: string }> {
+  async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
     const names = opts.memberNames ?? (await this.memberNames());
     const lm = opts.labelNames ?? (await this.labelMap());
     const sm = opts.stateTokens ?? inverse(await this.stateMap());
@@ -255,7 +258,7 @@ export class Plane {
       const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : 500);
       description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get HT-${i.sequence_id} --full)`;
     }
-    const row: IssueRow & { description?: string } = {
+    const row: IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] } = {
       id: `HT-${i.sequence_id}`,
       title: String(i.name),
       state: sm[i.state] ?? `state:${String(i.state).slice(0, 8)}`,
@@ -265,6 +268,11 @@ export class Plane {
       parent: i.parent ? (seqByUuid[i.parent as string] ?? `page:${String(i.parent).slice(0, 8)}`) : null,
     };
     if (description !== undefined) row.description = description;
+    if (opts.relations) {
+      const shortHandle = (u: string): string => seqByUuid[u] ?? `edge:${String(u).slice(0, 8)}`;
+      row.blockedBy = opts.relations.blockers.map(shortHandle);
+      row.blocks = opts.relations.blocks.map(shortHandle);
+    }
     return row;
   }
 
@@ -291,6 +299,41 @@ export class Plane {
 
   patchIssue(uuid: string, body: Raw): Promise<Raw> {
     return this.request("PATCH", `${this.projectPath()}/issues/${uuid}/`, body) as Promise<Raw>;
+  }
+
+  /** Native blocking edges (Plane stores one row: issue=blocked, related=blocker,
+   *  relation_type="blocked_by"; "blocking"/"blocked_by" are two spellings).
+   *  Only the work-items prefix exposes /relations/ on current instances. */
+  async relations(uuid: string): Promise<IssueRelations> {
+    const raw = (await this.request("GET", `${this.projectPath()}/work-items/${uuid}/relations/`)) as Raw;
+    const ids = (v: unknown): string[] => (Array.isArray(v) ? v.map((r: any) => String(r?.id)).filter(Boolean) : []);
+    return { blockers: ids(raw.blocked_by), blocks: ids(raw.blocking) };
+  }
+
+  async relationsCached(uuid: string): Promise<IssueRelations> {
+    const map = this.cache.fresh("relmap") as RelMap | undefined;
+    const hit = map?.[uuid];
+    if (hit) return { blockers: hit.b, blocks: hit.f };
+    const rels = await this.relations(uuid);
+    this.cacheRel(uuid, rels);
+    return rels;
+  }
+
+  cacheRel(uuid: string, rels: IssueRelations): void {
+    const map = (this.cache.stale("relmap") as RelMap | undefined) ?? {};
+    map[uuid] = { b: rels.blockers, f: rels.blocks };
+    this.cache.set("relmap", map);
+  }
+
+  setBlockEdge(blockerUuid: string, blockedUuid: string): Promise<Raw> {
+    return this.request("POST", `${this.projectPath()}/work-items/${blockerUuid}/relations/`, {
+      relation_type: "blocking",
+      issues: [blockedUuid],
+    }) as Promise<Raw>;
+  }
+
+  removeBlockEdge(blockerUuid: string, blockedUuid: string): Promise<Raw> {
+    return this.request("DELETE", `${this.projectPath()}/work-items/${blockerUuid}/relations/${blockedUuid}/`) as Promise<Raw>;
   }
 }
 

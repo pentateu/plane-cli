@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { Cache } from "./cache.ts";
-import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml } from "./api.ts";
+import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 
 let activeCache: Cache | undefined;
@@ -10,9 +10,9 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "fields", "page", "state", "label", "assignee", "parent", "search", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments"]);
 
 type Args = {
@@ -79,6 +79,101 @@ function requireTicket(positionals: string[]): string {
   return t;
 }
 
+const TICKET_REF_RE = /^(?:HT-)?(\d+)$/i;
+
+/** Resolve a handle, upgrading a bare not-found into one that carries
+ *  nearest-match suggestions computed from the cached ticket index. */
+async function resolveTicket(p: Plane, input: string): Promise<{ uuid: string; seq: number }> {
+  try {
+    return await p.issueRef(input);
+  } catch (e) {
+    if (e instanceof ApiError && e.kind === "not-found") {
+      const m = input.match(TICKET_REF_RE);
+      const seq = m ? Number(m[1]) : Number.NaN;
+      const idx = (p.cache.stale("seqmap") as Record<string, string> | undefined) ?? {};
+      const near = Object.keys(idx)
+        .map(Number)
+        .filter((n) => Number.isFinite(n))
+        .sort((a, b) => Math.abs(a - seq) - Math.abs(b - seq) || a - b)
+        .slice(0, 5)
+        .map((n) => `HT-${n}`);
+      throw new ApiError("not-found", `${input.toUpperCase()} not found on the board`, {
+        ...(near.length ? { valid: near } : {}),
+        suggestion: near.length ? "pick the nearest match or re-check the number" : "plane sync then retry",
+      });
+    }
+    throw e;
+  }
+}
+
+type EdgeVerbs = "blocks" | "depends" | "unblocks";
+
+async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): Promise<{ ok: true; edge: string; changed: boolean } | { dryRun: true; requests: Array<Record<string, unknown>> }> {
+  const remove = args.verb === ("unblocks" as EdgeVerbs);
+  if (args.positionals.length < 2)
+    throw new UsageError("validation", `${args.verb} needs exactly two ticket refs`, {
+      valid: ["HT-<number> HT-<number>"],
+      suggestion: `plane ${args.verb} HT-151 HT-184`,
+    });
+  if (args.positionals.length > 2)
+    throw new UsageError("validation", `ambiguous — ${args.verb} takes exactly two refs (got ${args.positionals.length})`, {
+      valid: ["HT-<number> HT-<number>"],
+      suggestion: `plane ${args.verb} HT-151 HT-184`,
+    });
+  const [rawA, rawB] = args.positionals as [string, string];
+  for (const t of [rawA, rawB])
+    if (!TICKET_REF_RE.test(t))
+      throw new UsageError("validation", `invalid ticket ref '${t}'`, { valid: ["HT-<number>"], suggestion: `plane ${args.verb} HT-151 HT-184` });
+  // "depends HT-B HT-A" is the same directed edge as "blocks HT-A HT-B"
+  const [blockerRef, blockedRef] = args.verb === "depends" ? ([rawB, rawA] as const) : ([rawA, rawB] as const);
+  const numOf = (t: string): number => Number(t.match(TICKET_REF_RE)![1]);
+  if (numOf(blockerRef) === numOf(blockedRef))
+    throw new UsageError("validation", `self-edge rejected — '${blockerRef}' cannot block itself`, { valid: ["two distinct tickets"] });
+
+  const [blocker, blocked] = await Promise.all([resolveTicket(p, blockerRef), resolveTicket(p, blockedRef)]);
+  if (blocker.uuid === blocked.uuid)
+    throw new UsageError("validation", `self-edge rejected — both refs resolve to HT-${blocker.seq}`, { valid: ["two distinct tickets"] });
+
+  const edge = `HT-${blocker.seq}->HT-${blocked.seq}`;
+  const rels = await p.relationsCached(blocker.uuid);
+  const exists = rels.blocks.includes(blocked.uuid);
+  // Adjust the in-process relation cache without extra fetches: the blocker
+  // side is already resolved above; the inverse side only when it was warm.
+  const warmInverse = (): IssueRelations | undefined => {
+    const hit = (p.cache.fresh("relmap") as RelMap | undefined)?.[blocked.uuid];
+    return hit ? { blockers: hit.b, blocks: hit.f } : undefined;
+  };
+
+  if (remove) {
+    if (!exists) return { ok: true, edge, changed: false };
+    const url = `${cfg.apiBase}${p.projectPath()}/work-items/${blocker.uuid}/relations/${blocked.uuid}/`;
+    if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url }] };
+    try {
+      await p.removeBlockEdge(blocker.uuid, blocked.uuid);
+    } catch (e) {
+      if (e instanceof ApiError && /\b405\b/.test(e.message))
+        throw new ApiError("api", "this Plane instance does not expose relation DELETE yet (public API v1 is GET+POST only)", {
+          suggestion: "apply the plane-fork relation-delete patch, or remove the edge in the web UI",
+        });
+      throw e;
+    }
+    p.cacheRel(blocker.uuid, { blockers: rels.blockers.filter((u) => u !== blocked.uuid), blocks: rels.blocks });
+    const inv = warmInverse();
+    if (inv) p.cacheRel(blocked.uuid, { blockers: inv.blockers, blocks: inv.blocks.filter((u) => u !== blocker.uuid) });
+    return { ok: true, edge, changed: true };
+  }
+
+  if (exists) return { ok: true, edge, changed: false };
+  const url = `${cfg.apiBase}${p.projectPath()}/work-items/${blocker.uuid}/relations/`;
+  const body = { relation_type: "blocking", issues: [blocked.uuid] };
+  if (dryRun) return { dryRun: true, requests: [{ method: "POST", url, body }] };
+  await p.setBlockEdge(blocker.uuid, blocked.uuid);
+  p.cacheRel(blocker.uuid, { blockers: rels.blockers, blocks: [...rels.blocks, blocked.uuid] });
+  const inv = warmInverse();
+  if (inv) p.cacheRel(blocked.uuid, { blockers: [...inv.blockers, blocker.uuid], blocks: inv.blocks });
+  return { ok: true, edge, changed: true };
+}
+
 function pickFields<T extends Record<string, unknown>>(data: T, fields?: string): T | Record<string, unknown> {
   if (!fields) return data;
   const keys = fields.split(",").map((s) => s.trim()).filter(Boolean);
@@ -123,6 +218,8 @@ CONTRACT
   boolean flags are bare; inline values ('--yes=false') are rejected with exit 4
   every mutating verb accepts --dry-run (prints exactly what execution would send, changes nothing)
   claim/state are idempotent: re-applying returns changed:false, exit 0 — safe retries.
+  blocks/depends/unblocks are idempotent the same way (re-creating or re-removing an
+  edge => changed:false, zero writes)
   claim --comment posts ONLY when something changed (retry-safe); state --comment always posts
   (it IS the payload, e.g. close-out notes) and reports commentPosted:true
   auth: --seat > $PLANE_SEAT; token from project-scoped .plane-seats (walks up from
@@ -134,12 +231,19 @@ VERBS
   config                          show resolved seat/apiBase/project/tokenSource/cache
   sync                            force-refresh cached states/labels/member/ticket index
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
-  list [--state s] [--label l] [--assignee me|name] [--parent HT-N] [--search q] [--page N]
+                                  renders blockedBy[]/blocks[] (short handles):
+                                  who holds HT-N up, what HT-N holds up
+  list [--state s] [--label l] [--assignee me|name] [--parent HT-N] [--blocked-by HT-N]
+       [--search q] [--page N]    --blocked-by = the "what can start now" query:
+                                  tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
   state HT-N <state> [--comment "…"]
   comments HT-N                   numbered thread c1,c2,… oldest first
   reply HT-N cM "text"            threaded answer to comment cM (review-loop close-out)
   comment HT-N "text"             top-level comment ('--file -' reads stdin)
+  blocks HT-A HT-B                edge: A blocks B — persisted natively on Plane
+  depends HT-B HT-A               same edge spelled from the dependent side
+  unblocks HT-A HT-B              remove that edge
   create --title t --type bug|feature|ops|plan [--priority urgent|high|medium|low]
          [--body html | --body-file f.html | --body-md f.md]
   sub HT-N …                      same as create, filed as child of HT-N
@@ -158,7 +262,8 @@ EXAMPLES
   plane get HT-66 --comments --fields id,state,description
   plane reply HT-66 c3 "fixed in a925b68 — guard added, tests green"
   plane state HT-66 verify --comment "branch feature/x @ sha"
-  plane list --assignee me --state progress`;
+  plane list --assignee me --state progress
+  plane blocks HT-151 HT-184 && plane list --blocked-by HT-151`;
 
 export async function run(argv: string[]): Promise<unknown> {
   const args = parseArgs(argv);
@@ -198,6 +303,10 @@ export async function run(argv: string[]): Promise<unknown> {
       if (!m) throw new UsageError("not-found", `seat '${cfg.seat}' resolved to a member missing from the workspace roster`, { suggestion: "plane sync then retry" });
       return { seat: cfg.seat, name: m.display_name || m.first_name, email: m.email };
     }
+    case "blocks":
+    case "depends":
+    case "unblocks":
+      return runEdgeVerb(args, p, cfg, dryRun);
     case "states": {
       const sm = await p.stateMap();
       return { states: Object.entries(sm).map(([token, id]) => ({ token, id })).sort((a, b) => a.token.localeCompare(b.token)) };
@@ -222,11 +331,33 @@ export async function run(argv: string[]): Promise<unknown> {
       cache.drop(`member:${cfg.seat}`);
       cache.drop("members");
       cache.drop("seqmap");
+      cache.drop("relmap");
       await p.ensureProject();
       const [states, labels] = await Promise.all([p.stateMap(), p.labelMap()]);
       await p.member(cfg.seat);
       const all = await fetchAll(p, "");
-      return { project: cfg.projectName, states: Object.keys(states).length, labels: Object.keys(labels).length, tickets: all.raw.length };
+      const relmap: RelMap = {};
+      for (let i = 0; i < all.raw.length; i += 10) {
+        await Promise.all(
+          all.raw.slice(i, i + 10).map(async (i) => {
+            const u = String(i.id);
+            try {
+              const r = await p.relations(u);
+              relmap[u] = { b: r.blockers, f: r.blocks };
+            } catch {
+              relmap[u] = { b: [], f: [] };
+            }
+          }),
+        );
+      }
+      cache.set("relmap", relmap);
+      return {
+        project: cfg.projectName,
+        states: Object.keys(states).length,
+        labels: Object.keys(labels).length,
+        tickets: all.raw.length,
+        edges: Object.values(relmap).reduce((n, r) => n + r.b.length, 0),
+      };
     }
     case "get": {
       const { uuid, seq } = await p.issueRef(requireTicket(args.positionals));
@@ -235,11 +366,12 @@ export async function run(argv: string[]): Promise<unknown> {
         return rawIssue;
       }
       const wantComments = args.flags.comments === true;
-      const [rawIssue, comments] = await Promise.all([
+      const [rawIssue, comments, rels] = await Promise.all([
         p.request("GET", `${p.projectPath()}/issues/${uuid}/`) as Promise<Record<string, unknown>>,
         wantComments ? p.comments(uuid) : Promise.resolve([]),
+        p.relationsCached(uuid),
       ]);
-      const shaped = await p.shapeIssue(rawIssue as never, { full });
+      const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels });
       const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text })) } : {}) };
       return pickFields(obj as Record<string, unknown>, fields);
     }
@@ -271,6 +403,15 @@ export async function run(argv: string[]): Promise<unknown> {
       if (typeof parentF === "string") {
         const parent = await p.issueRef(parentF);
         items = items.filter((i: Record<string, unknown>) => i.parent === parent.uuid);
+      }
+      const blockedByF = args.flags["blocked-by"];
+      if (typeof blockedByF === "string") {
+        // tickets held up by HT-N = the ones HT-N blocks
+        const ref = await resolveTicket(p, blockedByF);
+        const rels = await p.relations(ref.uuid);
+        p.cacheRel(ref.uuid, rels);
+        const heldUp = new Set(rels.blocks);
+        items = items.filter((i: Record<string, unknown>) => heldUp.has(String(i.id)));
       }
       const page = Number(args.flags.page ?? 1);
       if (!Number.isInteger(page) || page < 1)
@@ -464,6 +605,11 @@ export function main(argv: string[]): void {
     },
     (e) => fail(e),
   );
+}
+
+/** Test/debug seam: the cache instance bound to the most recent run(). */
+export function peekCache(): Cache | undefined {
+  return activeCache;
 }
 
 if (import.meta.main) {

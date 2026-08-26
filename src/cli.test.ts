@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cache } from "./cache.ts";
-import { run } from "./cli.ts";
+import { run, peekCache } from "./cli.ts";
 
 type Call = { method: string; path: string; body?: unknown };
 let calls: Call[] = [];
@@ -13,7 +13,43 @@ let spies: Array<{ mockRestore: () => void }> = [];
 let envSnapshot: Record<string, string | undefined> = {};
 let tmpDirs: string[] = [];
 
-const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_SEAT", "PLANE_TOKEN", "PLANE_CACHE"];
+function seqOfIssue(uuid: string): number {
+  const i = ISSUES.find((x) => x.id === uuid);
+  return i ? Number(i.sequence_id) : 0;
+}
+
+function relsOf(uuid: string): { blocking: string[]; blocked_by: string[] } {
+  const m = (globalThis.__relations ??= {});
+  return (m[uuid] ??= { blocking: [], blocked_by: [] });
+}
+
+function addEdge(blocker: string, blocked: string): void {
+  relsOf(blocker).blocking.push(blocked);
+  relsOf(blocked).blocked_by.push(blocker);
+}
+
+function removeEdgeAnyOrientation(a: string, b: string): boolean {
+  const pairs: Array<[string, string]> = [
+    [a, b],
+    [b, a],
+  ];
+  for (const [x, y] of pairs) {
+    const r = globalThis.__relations?.[x];
+    const idx = r?.blocking.indexOf(y);
+    if (r && idx !== undefined && idx >= 0) {
+      r.blocking.splice(idx, 1);
+      relsOf(y).blocked_by.splice(relsOf(y).blocked_by.indexOf(x), 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+function relationEntry(uuid: string): Record<string, unknown> {
+  return { id: uuid, name: "[edge] target", sequence_id: seqOfIssue(uuid), project_id: "pr-1", priority: "none", relation_type: "blocked_by" };
+}
+
+const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_SEAT", "PLANE_TOKEN", "PLANE_CACHE", "HOMETUTOR_TICKETS_PROJECT_ID"];
 
 function capture(obj: any, method: string): any {
   const s = spyOn(obj, method).mockImplementation(() => {});
@@ -76,7 +112,7 @@ const ISSUES = [
 
 function useDefaultRouter() {
   const ISSUE_RE = /\/projects\/[^/]+\/issues\/(is-\d+)\/$/;
-  router = (_m, path) => {
+  router = (_m, path, b) => {
     if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
     if (path === "/members/") return { status: 200, json: MEMBERS };
     if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
@@ -86,6 +122,20 @@ function useDefaultRouter() {
       return { status: 200, json: { ...(globalThis.__postBody ?? {}), id: "is-new", sequence_id: 69 } };
     if (/\/projects\/[^/]+\/issues\/$/.test(path))
       return { status: 200, json: { results: ISSUES, next_page_results: false, total_count: ISSUES.length } };
+    let m = path.match(/\/work-items\/([^/]+)\/relations\/$/);
+    if (m && _m === "GET") {
+      const r = relsOf(m[1]!);
+      return { status: 200, json: { blocking: r.blocking.map(relationEntry), blocked_by: r.blocked_by.map(relationEntry) } };
+    }
+    if (m && _m === "POST") {
+      for (const target of (b?.issues as string[]) ?? []) addEdge(m[1]!, target);
+      return { status: 201, json: [] };
+    }
+    m = path.match(/\/work-items\/([^/]+)\/relations\/([^/]+)\/$/);
+    if (m && _m === "DELETE") {
+      if (!globalThis.__relationsDeleteEnabled) return { status: 405 };
+      return removeEdgeAnyOrientation(m[1]!, m[2]!) ? { status: 204 } : { status: 404 };
+    }
     const issueHit = path.match(ISSUE_RE);
     if (issueHit) {
       const issue = ISSUES.find((i) => i.id === issueHit[1])!;
@@ -106,12 +156,18 @@ declare global {
   var __comments: Array<Record<string, unknown>>;
   // eslint-disable-next-line no-var
   var __postBody: Record<string, unknown> | undefined;
+  // eslint-disable-next-line no-var
+  var __relations: Record<string, { blocking: string[]; blocked_by: string[] }> | undefined;
+  // eslint-disable-next-line no-var
+  var __relationsDeleteEnabled: boolean;
 }
 
 globalThis.__method = "GET";
 globalThis.__comments = [];
 globalThis.__patchBody = undefined;
 globalThis.__postBody = undefined;
+globalThis.__relations = {};
+globalThis.__relationsDeleteEnabled = false;
 
 beforeEach(() => {
   calls = [];
@@ -119,6 +175,8 @@ beforeEach(() => {
   globalThis.__patchBody = undefined;
   globalThis.__comments = [];
   globalThis.__postBody = undefined;
+  globalThis.__relations = {};
+  globalThis.__relationsDeleteEnabled = false;
   envSnapshot = {};
   for (const k of ENV_KEYS) envSnapshot[k] = process.env[k];
   process.env.PLANE_API_BASE = "http://localhost:8999/api/v1";
@@ -146,7 +204,8 @@ beforeEach(() => {
     if (init?.method === "POST" && rel === "/issues/") globalThis.__postBody = body as Record<string, unknown>;
     calls.push({ method: init?.method ?? "POST", path: rel, body });
     const r = router(init?.method ?? "POST", rel, body);
-    return new Response(JSON.stringify(r.json ?? { ok: true, data: null }), { status: r.status, headers: { "Content-Type": "application/json" } });
+    const payload = r.status === 204 ? null : JSON.stringify(r.json ?? { ok: true, data: null });
+    return new Response(payload, { status: r.status, headers: { "Content-Type": "application/json" } });
   }) as any);
 });
 
@@ -206,6 +265,7 @@ describe("PC4 — disk cache persists across invocations", () => {
     cache.set("members", Object.fromEntries(MEMBERS.map((m) => [m.id, m.display_name])));
     cache.set("member:dev1", "mb-dev1");
     cache.set("seqmap", { "66": "is-66", "67": "is-67" });
+    cache.set("relmap", { "is-66": { b: [], f: [] }, "is-67": { b: [], f: [] } });
     cache.save();
     const before = calls.length;
     const d = (await run(["get", "HT-66", "--fields", "id"])) as Record<string, unknown>;
@@ -236,6 +296,7 @@ describe("PC4 — disk cache persists across invocations", () => {
         if (path.endsWith("/labels/")) return j({ results: LABELS });
         if (/\/issues\/$/.test(path)) return j({ results: ISSUES, next_page_results: false });
         if (/\/issues\/is-\d+\/$/.test(path)) return j(ISSUES[0]);
+        if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return j({ blocking: [], blocked_by: [] });
         return new Response("{}", { status: 404 });
       },
     });
@@ -592,7 +653,178 @@ describe("states / labels / modules lookups (PC5)", () => {
 describe("sync", () => {
   test("rebuilds every cached namespace and reports counts", async () => {
     const d = (await run(["sync"])) as Record<string, unknown>;
-    expect(d).toEqual({ project: "Ai Tutor", states: 6, labels: 4, tickets: 2 });
+    expect(d).toEqual({ project: "Ai Tutor", states: 6, labels: 4, tickets: 2, edges: 0 });
+  });
+
+  test("refreshes relations into the cache so short handles render offline", async () => {
+    addEdge("is-67", "is-66");
+    const d = (await run(["sync"])) as Record<string, unknown>;
+    expect(d.edges).toBe(1);
+    const c = peekCache()!;
+    const relmap = c.fresh("relmap") as Record<string, { b: string[]; f: string[] }>;
+    expect(relmap["is-67"]).toEqual({ b: [], f: ["is-66"] });
+    expect(relmap["is-66"]).toEqual({ b: ["is-67"], f: [] });
+  });
+});
+
+describe("blocks / depends / unblocks", () => {
+  async function kindOf(args: string[]): Promise<{ kind?: string; exitCode?: number; message?: string; valid?: string[]; suggestion?: string }> {
+    try {
+      await run(args);
+      return {};
+    } catch (e: any) {
+      return { kind: e.kind, exitCode: e.exitCode, message: e.message, valid: e.valid, suggestion: e.suggestion };
+    }
+  }
+
+  test("blocks posts the exact native payload on the blocker's relations endpoint", async () => {
+    const d = (await run(["blocks", "HT-66", "HT-67"])) as Record<string, unknown>;
+    expect(d).toEqual({ ok: true, edge: "HT-66->HT-67", changed: true });
+    const post = calls.find((c) => c.method === "POST" && c.path.includes("/relations/"))!;
+    expect(post.path).toContain("/work-items/is-66/relations/");
+    expect(post.body).toEqual({ relation_type: "blocking", issues: ["is-67"] });
+  });
+
+  test("depends HT-B HT-A is the same directed edge as blocks HT-A HT-B", async () => {
+    const d = (await run(["depends", "HT-67", "HT-66"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ edge: "HT-66->HT-67", changed: true });
+    const post = calls.find((c) => c.method === "POST" && c.path.includes("/relations/"))!;
+    expect(post.path).toContain("/work-items/is-66/relations/");
+    expect(post.body).toEqual({ relation_type: "blocking", issues: ["is-67"] });
+  });
+
+  test("re-creating an existing edge is idempotent: changed:false, zero writes", async () => {
+    await run(["blocks", "HT-66", "HT-67"]);
+    const writes = calls.filter((c) => c.method !== "GET").length;
+    const d = (await run(["blocks", "HT-66", "HT-67"])) as Record<string, unknown>;
+    expect(d).toEqual({ ok: true, edge: "HT-66->HT-67", changed: false });
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(writes);
+  });
+
+  test("unblocks removes the edge via DELETE and reports changed:true", async () => {
+    globalThis.__relationsDeleteEnabled = true;
+    addEdge("is-66", "is-67");
+    const d = (await run(["unblocks", "HT-66", "HT-67"])) as Record<string, unknown>;
+    expect(d).toEqual({ ok: true, edge: "HT-66->HT-67", changed: true });
+    const del = calls.find((c) => c.method === "DELETE")!;
+    expect(del.path).toBe("/projects/pr-1/work-items/is-66/relations/is-67/");
+    expect(relsOf("is-66").blocking).toEqual([]);
+    expect(relsOf("is-67").blocked_by).toEqual([]);
+  });
+
+  test("unblocks a missing edge is idempotent: changed:false, no DELETE sent", async () => {
+    globalThis.__relationsDeleteEnabled = true;
+    const d = (await run(["unblocks", "HT-66", "HT-67"])) as Record<string, unknown>;
+    expect(d).toEqual({ ok: true, edge: "HT-66->HT-67", changed: false });
+    expect(calls.some((c) => c.method === "DELETE")).toBeFalse();
+  });
+
+  test("pre-patch instance (DELETE 405) fails loud with fork/UI guidance", async () => {
+    addEdge("is-66", "is-67");
+    const e = await kindOf(["unblocks", "HT-66", "HT-67"]);
+    expect(e.kind).toBe("api");
+    expect(e.message).toContain("relation DELETE");
+    expect(String(e.suggestion)).toContain("plane-fork");
+  });
+
+  test("self-edge rejected with validation exit 4 before any network call", async () => {
+    const e = await kindOf(["blocks", "HT-66", "66"]);
+    expect(e).toMatchObject({ kind: "validation", exitCode: 4, message: expect.stringContaining("self-edge") });
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+    const e2 = await kindOf(["depends", "HT-66", "HT-66"]);
+    expect(e2.kind).toBe("validation");
+  });
+
+  test("malformed refs are validation errors", async () => {
+    const e = await kindOf(["blocks", "HT-six", "HT-66"]);
+    expect(e).toMatchObject({ kind: "validation", exitCode: 4 });
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+  });
+
+  test("arity is exactly two: missing and extra refs both fail loud", async () => {
+    expect(await kindOf(["blocks", "HT-66"])).toMatchObject({ kind: "validation" });
+    expect(await kindOf(["blocks", "HT-66", "HT-67", "HT-68"])).toMatchObject({ kind: "validation", message: expect.stringContaining("ambiguous") });
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+  });
+
+  test("unknown handle -> not-found exit 3 with nearest matches from the ticket index", async () => {
+    await run(["list"]); // warm seqmap cache like production
+    const before = calls.length;
+    const e = await kindOf(["blocks", "HT-70", "HT-66"]);
+    expect(e).toMatchObject({ kind: "not-found", exitCode: 3, message: expect.stringContaining("HT-70") });
+    expect(e.valid).toEqual(["HT-67", "HT-66"]);
+    expect(calls.length).toBeGreaterThan(before);
+  });
+
+  test("--dry-run prints exact would-be requests and mutates nothing", async () => {
+    const d = (await run(["blocks", "HT-66", "HT-67", "--dry-run"])) as Record<string, any>;
+    expect(d.dryRun).toBe(true);
+    expect(d.requests[0]).toEqual({
+      method: "POST",
+      url: expect.stringContaining("/work-items/is-66/relations/"),
+      body: { relation_type: "blocking", issues: ["is-67"] },
+    });
+    addEdge("is-66", "is-67");
+    const d2 = (await run(["unblocks", "HT-66", "HT-67", "--dry-run"])) as Record<string, any>;
+    expect(d2.requests[0]!.method).toBe("DELETE");
+    expect(d2.requests[0]!.url).toContain("/work-items/is-66/relations/is-67/");
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+    expect(relsOf("is-66").blocking).toEqual(["is-67"]);
+  });
+
+  test("acceptance shape: blocks HT-151 HT-184 then get HT-184 --fields blockedBy => [HT-151]", async () => {
+    // same mechanics as the live acceptance pair, exercised on fixture tickets
+    await run(["blocks", "HT-66", "HT-67"]);
+    const c = new Cache(process.env.PLANE_CACHE!);
+    c.set("relmap", { "is-67": { b: ["is-66"], f: [] }, "is-66": { b: [], f: ["is-67"] } });
+    c.set("seqmap", { "66": "is-66", "67": "is-67" });
+    c.save();
+    const g = (await run(["get", "HT-67", "--fields", "blockedBy"])) as Record<string, unknown>;
+    expect(g.blockedBy).toEqual(["HT-66"]);
+  });
+});
+
+describe("edge read side", () => {
+  test("get renders blockedBy/blocks as short handles; empty arrays fine", async () => {
+    addEdge("is-67", "is-66"); // HT-67 blocks HT-66
+    const g66 = (await run(["get", "HT-66", "--fields", "id,blockedBy,blocks"])) as Record<string, any>;
+    expect(g66.blockedBy).toEqual(["HT-67"]);
+    expect(g66.blocks).toEqual([]);
+    const g67 = (await run(["get", "HT-67", "--fields", "blockedBy,blocks"])) as Record<string, any>;
+    expect(g67.blockedBy).toEqual([]);
+    expect(g67.blocks).toEqual(["HT-66"]);
+  });
+
+  test("get default output carries empty relation arrays without noise", async () => {
+    const d = (await run(["get", "HT-66"])) as Record<string, any>;
+    expect(d.blockedBy).toEqual([]);
+    expect(d.blocks).toEqual([]);
+  });
+
+  test("untranslated edge uuids render with short edge: prefix, never raw uuids", async () => {
+    const c = new Cache(process.env.PLANE_CACHE!);
+    c.set("states", Object.fromEntries(STATES.map((s) => [s.id, s.name.toLowerCase() === "in progress" ? "progress" : s.name.toLowerCase().split(" ")[0]!])));
+    c.set("labels", Object.fromEntries(LABELS.map((l) => [l.name, l.id])));
+    c.set("seqmap", { "66": "is-66" });
+    c.set("relmap", { "is-66": { b: ["zzzzzzzz-0000-0000-0000-000000000000"], f: [] } });
+    c.save();
+    const d = (await run(["get", "HT-66", "--fields", "blockedBy"])) as Record<string, any>;
+    expect(d.blockedBy).toEqual(["edge:zzzzzzzz"]);
+    expect(JSON.stringify(d)).not.toMatch(/zzzzzzzz-0000/);
+  });
+
+  test("list --blocked-by HT-N lists tickets N blocks (what can start now)", async () => {
+    addEdge("is-66", "is-67"); // HT-66 blocks HT-67
+    const d = (await run(["list", "--blocked-by", "HT-66"])) as Record<string, any>;
+    expect(d.total).toBe(1);
+    expect(d.items[0]!.id).toBe("HT-67");
+  });
+
+  test("list --blocked-by composes with other filters and rejects unknown handles", async () => {
+    addEdge("is-66", "is-67");
+    const none = (await run(["list", "--blocked-by", "HT-67"])) as Record<string, any>;
+    expect(none.total).toBe(0);
+    await expect(run(["list", "--blocked-by", "HT-999"])).rejects.toMatchObject({ kind: "not-found", exitCode: 3 });
   });
 });
 

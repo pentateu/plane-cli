@@ -7,6 +7,7 @@ const TTL: Record<string, number> = {
   member: 24 * 3600_000,
   members: 24 * 3600_000,
   seqmap: 300_000,
+  relmap: 300_000,
 };
 
 export type CacheData = Record<string, { at: number; value: unknown }>;
