@@ -1,6 +1,6 @@
 ---
 name: plane-cli
-description: Use when reading or writing Ai Tutor tickets on Plane (https://plane.iswe.co.nz) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
+description: Use when reading or writing Ai Tutor tickets on Plane (https://rafael-linux.tail8a19c.ts.net) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
 ---
 
 # plane-cli

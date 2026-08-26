@@ -1,6 +1,6 @@
 # plane-cli
 
-Agent-only CLI for the Ai Tutor tracker on Plane (https://plane.iswe.co.nz).
+Agent-only CLI for the Ai Tutor tracker on Plane (https://rafael-linux.tail8a19c.ts.net).
 Companion to `outline-cli` (`ot`). Process owner: `docs/REQUESTS.md` in
 pentateu/AI_Tutor; full usage doc: `docs/ops/PLANE_CLI.md` there.
 

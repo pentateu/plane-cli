@@ -109,7 +109,7 @@ export function resolveConfig(opts: { seat?: string }): Config {
   const { token, tokenSource } = resolveToken(resolvedSeat, seats, processEnv);
 
   const url = env("PLANE_URL");
-  const apiBase = (process.env.PLANE_API_BASE ?? env("PLANE_API_BASE") ?? env("HOMETUTOR_TICKETS_API_BASE") ?? (url ? `${url.replace(/\/$/, "")}/api/v1` : "https://plane.iswe.co.nz/api/v1")).replace(/\/$/, "");
+  const apiBase = (process.env.PLANE_API_BASE ?? env("PLANE_API_BASE") ?? env("HOMETUTOR_TICKETS_API_BASE") ?? (url ? `${url.replace(/\/$/, "")}/api/v1` : "https://rafael-linux.tail8a19c.ts.net/api/v1")).replace(/\/$/, "");
   const projectId = process.env.PLANE_PROJECT_ID ?? env("HOMETUTOR_TICKETS_PROJECT_ID");
 
   return {
