@@ -38,6 +38,27 @@ const STATE_TOKENS: Record<string, string> = {
 export const VALID_STATES = ["todo", "progress", "verify", "done", "cancelled"];
 export const VALID_LABELS = ["type:bug", "type:feature", "type:ops", "type:plan"];
 
+export type TicketRef = { ident?: string; seq: number };
+
+/** Single source for ticket-ref grammar: `<IDENT>-<n>`, `HT-<n>`, bare `<n>`.
+ *  Identifiers normalize to uppercase; a missing ident means the default
+ *  project (display prefix HT). Invalid refs fail loud with the grammar. */
+export function parseTicketRef(input: string): TicketRef {
+  const s = input.trim();
+  let m = s.match(/^(\d+)$/);
+  if (m) return { seq: Number(m[1]) };
+  m = s.match(/^([A-Za-z][A-Za-z0-9]*)-(\d+)$/);
+  if (m) return { ident: m[1]!.toUpperCase(), seq: Number(m[2]) };
+  throw new ApiError("validation", `invalid ticket ref '${input}'`, {
+    valid: ["HT-<number>", "<IDENT>-<number>", "<number>"],
+    suggestion: "prefix the number with its project identifier, e.g. HT-66",
+  });
+}
+
+export function formatTicketRef(ref: TicketRef): string {
+  return `${ref.ident ?? "HT"}-${ref.seq}`;
+}
+
 export function htmlToText(html: string): string {
   return html
     .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
@@ -235,13 +256,13 @@ export class Plane {
   }
 
   async issueRef(input: string): Promise<{ uuid: string; seq: number }> {
-    const m = input.match(/^(?:HT-)?(\d+)$/i);
-    if (!m)
+    const ref = parseTicketRef(input);
+    if (ref.ident && ref.ident !== "HT")
       throw new ApiError("validation", `invalid ticket ref '${input}'`, {
         valid: ["HT-<number>", "<number>"],
         suggestion: "plane get HT-66",
       });
-    const seq = Number(m[1]);
+    const seq = ref.seq;
     const mapKey = "seqmap";
     const load = async (): Promise<Record<string, string>> => {
       const map: Record<string, string> = {};

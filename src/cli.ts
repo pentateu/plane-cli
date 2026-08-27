@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { Cache } from "./cache.ts";
-import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, type IssueRelations, type RelMap } from "./api.ts";
+import { ApiError, Plane, VALID_STATES, formatTicketRef, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 
 let activeCache: Cache | undefined;
@@ -79,8 +79,6 @@ function requireTicket(positionals: string[]): string {
   return t;
 }
 
-const TICKET_REF_RE = /^(?:HT-)?(\d+)$/i;
-
 /** Resolve a handle, upgrading a bare not-found into one that carries
  *  nearest-match suggestions computed from the cached ticket index. */
 async function resolveTicket(p: Plane, input: string): Promise<{ uuid: string; seq: number }> {
@@ -88,15 +86,14 @@ async function resolveTicket(p: Plane, input: string): Promise<{ uuid: string; s
     return await p.issueRef(input);
   } catch (e) {
     if (e instanceof ApiError && e.kind === "not-found") {
-      const m = input.match(TICKET_REF_RE);
-      const seq = m ? Number(m[1]) : Number.NaN;
+      const seq = parseTicketRef(input).seq;
       const idx = (p.cache.stale("seqmap") as Record<string, string> | undefined) ?? {};
       const near = Object.keys(idx)
         .map(Number)
         .filter((n) => Number.isFinite(n))
         .sort((a, b) => Math.abs(a - seq) - Math.abs(b - seq) || a - b)
         .slice(0, 5)
-        .map((n) => `HT-${n}`);
+        .map((n) => formatTicketRef({ seq: n }));
       throw new ApiError("not-found", `${input.toUpperCase()} not found on the board`, {
         ...(near.length ? { valid: near } : {}),
         suggestion: near.length ? "pick the nearest match or re-check the number" : "plane sync then retry",
@@ -121,12 +118,10 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
       suggestion: `plane ${args.verb} HT-151 HT-184`,
     });
   const [rawA, rawB] = args.positionals as [string, string];
-  for (const t of [rawA, rawB])
-    if (!TICKET_REF_RE.test(t))
-      throw new UsageError("validation", `invalid ticket ref '${t}'`, { valid: ["HT-<number>"], suggestion: `plane ${args.verb} HT-151 HT-184` });
+  for (const t of [rawA, rawB]) parseTicketRef(t);
   // "depends HT-B HT-A" is the same directed edge as "blocks HT-A HT-B"
   const [blockerRef, blockedRef] = args.verb === "depends" ? ([rawB, rawA] as const) : ([rawA, rawB] as const);
-  const numOf = (t: string): number => Number(t.match(TICKET_REF_RE)![1]);
+  const numOf = (t: string): number => parseTicketRef(t).seq;
   if (numOf(blockerRef) === numOf(blockedRef))
     throw new UsageError("validation", `self-edge rejected — '${blockerRef}' cannot block itself`, { valid: ["two distinct tickets"] });
 
