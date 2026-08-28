@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { Cache } from "./cache.ts";
-import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, type IssueRelations, type RelMap } from "./api.ts";
+import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 
 let activeCache: Cache | undefined;
@@ -10,7 +10,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments"]);
@@ -75,35 +75,8 @@ function fail(e: unknown): never {
 
 function requireTicket(positionals: string[]): string {
   const t = positionals[0];
-  if (!t) throw new UsageError("validation", "missing ticket ref", { valid: ["HT-<number>"], suggestion: "plane get HT-66" });
+  if (!t) throw new UsageError("validation", "missing ticket ref", { valid: ["HT-<number>", "<IDENT>-<number>", "<number>"], suggestion: "plane get HT-66" });
   return t;
-}
-
-const TICKET_REF_RE = /^(?:HT-)?(\d+)$/i;
-
-/** Resolve a handle, upgrading a bare not-found into one that carries
- *  nearest-match suggestions computed from the cached ticket index. */
-async function resolveTicket(p: Plane, input: string): Promise<{ uuid: string; seq: number }> {
-  try {
-    return await p.issueRef(input);
-  } catch (e) {
-    if (e instanceof ApiError && e.kind === "not-found") {
-      const m = input.match(TICKET_REF_RE);
-      const seq = m ? Number(m[1]) : Number.NaN;
-      const idx = (p.cache.stale("seqmap") as Record<string, string> | undefined) ?? {};
-      const near = Object.keys(idx)
-        .map(Number)
-        .filter((n) => Number.isFinite(n))
-        .sort((a, b) => Math.abs(a - seq) - Math.abs(b - seq) || a - b)
-        .slice(0, 5)
-        .map((n) => `HT-${n}`);
-      throw new ApiError("not-found", `${input.toUpperCase()} not found on the board`, {
-        ...(near.length ? { valid: near } : {}),
-        suggestion: near.length ? "pick the nearest match or re-check the number" : "plane sync then retry",
-      });
-    }
-    throw e;
-  }
 }
 
 type EdgeVerbs = "blocks" | "depends" | "unblocks";
@@ -112,30 +85,28 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
   const remove = args.verb === ("unblocks" as EdgeVerbs);
   if (args.positionals.length < 2)
     throw new UsageError("validation", `${args.verb} needs exactly two ticket refs`, {
-      valid: ["HT-<number> HT-<number>"],
+      valid: ["HT-<number>", "<IDENT>-<number>"],
       suggestion: `plane ${args.verb} HT-151 HT-184`,
     });
   if (args.positionals.length > 2)
     throw new UsageError("validation", `ambiguous — ${args.verb} takes exactly two refs (got ${args.positionals.length})`, {
-      valid: ["HT-<number> HT-<number>"],
+      valid: ["HT-<number>", "<IDENT>-<number>"],
       suggestion: `plane ${args.verb} HT-151 HT-184`,
     });
   const [rawA, rawB] = args.positionals as [string, string];
-  for (const t of [rawA, rawB])
-    if (!TICKET_REF_RE.test(t))
-      throw new UsageError("validation", `invalid ticket ref '${t}'`, { valid: ["HT-<number>"], suggestion: `plane ${args.verb} HT-151 HT-184` });
+  const refA = parseTicketRef(rawA);
+  const refB = parseTicketRef(rawB);
+  if ((refA.ident ?? "HT") === (refB.ident ?? "HT") && refA.seq === refB.seq)
+    throw new UsageError("validation", `self-edge rejected — '${rawA}' cannot block itself`, { valid: ["two distinct tickets"] });
   // "depends HT-B HT-A" is the same directed edge as "blocks HT-A HT-B"
   const [blockerRef, blockedRef] = args.verb === "depends" ? ([rawB, rawA] as const) : ([rawA, rawB] as const);
-  const numOf = (t: string): number => Number(t.match(TICKET_REF_RE)![1]);
-  if (numOf(blockerRef) === numOf(blockedRef))
-    throw new UsageError("validation", `self-edge rejected — '${blockerRef}' cannot block itself`, { valid: ["two distinct tickets"] });
 
-  const [blocker, blocked] = await Promise.all([resolveTicket(p, blockerRef), resolveTicket(p, blockedRef)]);
+  const [blocker, blocked] = await Promise.all([p.issueRef(blockerRef), p.issueRef(blockedRef)]);
   if (blocker.uuid === blocked.uuid)
-    throw new UsageError("validation", `self-edge rejected — both refs resolve to HT-${blocker.seq}`, { valid: ["two distinct tickets"] });
+    throw new UsageError("validation", `self-edge rejected — both refs resolve to ${blocker.ident}-${blocker.seq}`, { valid: ["two distinct tickets"] });
 
-  const edge = `HT-${blocker.seq}->HT-${blocked.seq}`;
-  const rels = await p.relationsCached(blocker.uuid);
+  const edge = `${blocker.ident}-${blocker.seq}->${blocked.ident}-${blocked.seq}`;
+  const rels = await p.relationsCached(blocker.uuid, blocker.projectId);
   const exists = rels.blocks.includes(blocked.uuid);
   // Adjust the in-process relation cache without extra fetches: the blocker
   // side is already resolved above; the inverse side only when it was warm.
@@ -146,10 +117,10 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
 
   if (remove) {
     if (!exists) return { ok: true, edge, changed: false };
-    const url = `${cfg.apiBase}${p.projectPath()}/work-items/${blocker.uuid}/relations/${blocked.uuid}/`;
+    const url = `${cfg.apiBase}${p.projectPathFor(blocker.projectId)}/work-items/${blocker.uuid}/relations/${blocked.uuid}/`;
     if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url }] };
     try {
-      await p.removeBlockEdge(blocker.uuid, blocked.uuid);
+      await p.removeBlockEdge(blocker.uuid, blocked.uuid, blocker.projectId);
     } catch (e) {
       // Existence was just confirmed, so any 404/405 here means the instance
       // lacks the relation-DELETE route (community: 405 method-not-allowed;
@@ -168,10 +139,10 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
   }
 
   if (exists) return { ok: true, edge, changed: false };
-  const url = `${cfg.apiBase}${p.projectPath()}/work-items/${blocker.uuid}/relations/`;
+  const url = `${cfg.apiBase}${p.projectPathFor(blocker.projectId)}/work-items/${blocker.uuid}/relations/`;
   const body = { relation_type: "blocking", issues: [blocked.uuid] };
   if (dryRun) return { dryRun: true, requests: [{ method: "POST", url, body }] };
-  await p.setBlockEdge(blocker.uuid, blocked.uuid);
+  await p.setBlockEdge(blocker.uuid, blocked.uuid, blocker.projectId);
   p.cacheRel(blocker.uuid, { blockers: rels.blockers, blocks: [...rels.blocks, blocked.uuid] });
   const inv = warmInverse();
   if (inv) p.cacheRel(blocked.uuid, { blockers: [...inv.blockers, blocker.uuid], blocks: inv.blocks });
@@ -213,7 +184,8 @@ CONTRACT
   success -> one JSON line on stdout, exit 0
   failure -> one JSON error on stderr, exit 1 api|network · 2 auth · 3 not-found · 4 validation · 5 rate-limit
   errors carry code/message/valid/suggestion — fix per 'valid'/'suggestion', retry once, never loop
-  handles are short names everywhere: HT-<seq>, states todo|progress|verify|done|cancelled|backlog,
+  handles are short names everywhere: <IDENT>-<seq> (HT-<seq> and bare <seq> are the default
+  project), states todo|progress|verify|done|cancelled|backlog,
   labels type:bug|type:feature|type:ops|type:plan, seats dev1.. — UUIDs never appear in data fields
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only
   surfaces that can show native payloads)
@@ -233,6 +205,7 @@ CONTRACT
 VERBS
   whoami                          resolve seat -> workspace member
   config                          show resolved seat/apiBase/project/tokenSource/cache
+  projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
@@ -283,7 +256,7 @@ export async function run(argv: string[]): Promise<unknown> {
   const cache = new Cache(process.env.PLANE_CACHE ?? `${process.env.HOME}/.config/plane/cache.json`);
   activeCache = cache;
   const p = new Plane(cfg, cache);
-  await p.ensureProject();
+  if (args.verb !== "projects") await p.ensureProject();
   const dryRun = args.flags["dry-run"] === true;
   const full = args.flags.full === true;
   const fields = typeof args.flags.fields === "string" ? args.flags.fields : undefined;
@@ -323,6 +296,10 @@ export async function run(argv: string[]): Promise<unknown> {
       const page = (await p.request("GET", `${p.projectPath()}/modules/`)) as Record<string, unknown>;
       const rows = (page.results as Array<Record<string, any>>) ?? [];
       return { modules: rows.map((m) => ({ name: m.name, id: m.id })) };
+    }
+    case "projects": {
+      const projects = await p.projects();
+      return { projects: projects.map((x) => ({ name: x.name as string, identifier: x.identifier as string, id: x.id as string })) };
     }
     case "config": {
       await p.ensureProject();
@@ -370,18 +347,18 @@ export async function run(argv: string[]): Promise<unknown> {
       };
     }
     case "get": {
-      const { uuid, seq } = await p.issueRef(requireTicket(args.positionals));
+      const { uuid, ident, projectId } = await p.issueRef(requireTicket(args.positionals));
       if (args.flags.raw) {
-        const rawIssue = await p.request("GET", `${p.projectPath()}/issues/${uuid}/`);
+        const rawIssue = await p.request("GET", `${p.projectPathFor(projectId)}/issues/${uuid}/`);
         return rawIssue;
       }
       const wantComments = args.flags.comments === true;
       const [rawIssue, comments, rels] = await Promise.all([
-        p.request("GET", `${p.projectPath()}/issues/${uuid}/`) as Promise<Record<string, unknown>>,
-        wantComments ? p.comments(uuid) : Promise.resolve([]),
-        p.relationsCached(uuid),
+        p.request("GET", `${p.projectPathFor(projectId)}/issues/${uuid}/`) as Promise<Record<string, unknown>>,
+        wantComments ? p.comments(uuid, projectId) : Promise.resolve([]),
+        p.relationsCached(uuid, projectId),
       ]);
-      const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels });
+      const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels, ident, projectId });
       const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text })) } : {}) };
       return pickFields(obj as Record<string, unknown>, fields);
     }
@@ -416,9 +393,9 @@ export async function run(argv: string[]): Promise<unknown> {
       }
       const blockedByF = args.flags["blocked-by"];
       if (typeof blockedByF === "string") {
-        // tickets held up by HT-N = the ones HT-N blocks
-        const ref = await resolveTicket(p, blockedByF);
-        const rels = await p.relations(ref.uuid);
+        // tickets held up by TEAMCTL-16 = the ones TEAMCTL-16 blocks
+        const ref = await p.issueRef(blockedByF);
+        const rels = await p.relations(ref.uuid, ref.projectId);
         p.cacheRel(ref.uuid, rels);
         const heldUp = new Set(rels.blocks);
         items = items.filter((i: Record<string, unknown>) => heldUp.has(String(i.id)));
@@ -445,7 +422,11 @@ export async function run(argv: string[]): Promise<unknown> {
     }
     case "claim": {
       const ref = await p.issueRef(requireTicket(args.positionals));
-      const [issue, sm, meId] = await Promise.all([p.request("GET", `${p.projectPath()}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>, p.stateMap(), p.me()]);
+      const [issue, sm, meId] = await Promise.all([
+        p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>,
+        p.stateMap(ref.projectId),
+        p.me(),
+      ]);
       const progressId = requireStateId(sm, "progress");
       const assignees = ((issue.assignees as string[]) ?? []).slice();
       const addMe = !assignees.includes(meId);
@@ -459,19 +440,19 @@ export async function run(argv: string[]): Promise<unknown> {
       const postComment = Boolean(commentText) && changed;
       if (dryRun) {
         const reqs: Array<Record<string, unknown>> = [];
-        if (Object.keys(patch).length) reqs.push({ method: "PATCH", url: `${cfg.apiBase}${p.projectPath()}/issues/${ref.uuid}/`, body: patch });
-        if (postComment) reqs.push({ method: "POST", url: `${cfg.apiBase}${p.projectPath()}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText!) } });
+        if (Object.keys(patch).length) reqs.push({ method: "PATCH", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`, body: patch });
+        if (postComment) reqs.push({ method: "POST", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText!) } });
         return { dryRun: true, requests: reqs };
       }
-      if (Object.keys(patch).length) await p.patchIssue(ref.uuid, patch);
+      if (Object.keys(patch).length) await p.patchIssue(ref.uuid, patch, ref.projectId);
       let finalAssignees = addMe ? assignees : ((issue.assignees as string[]) ?? []);
       if (Object.keys(patch).length) {
-        const after = (await p.request("GET", `${p.projectPath()}/issues/${ref.uuid}/`)) as Record<string, unknown>;
+        const after = (await p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`)) as Record<string, unknown>;
         finalAssignees = (after.assignees as string[]) ?? finalAssignees;
       }
-      if (postComment) await p.postComment(ref.uuid, htmlEscape(commentText!));
+      if (postComment) await p.postComment(ref.uuid, htmlEscape(commentText!), undefined, ref.projectId);
       return {
-        id: `HT-${ref.seq}`,
+        id: `${ref.ident}-${ref.seq}`,
         state: "progress",
         changed,
         ...(commentText ? { commentPosted: postComment } : {}),
@@ -484,7 +465,7 @@ export async function run(argv: string[]): Promise<unknown> {
         throw new UsageError("validation", `invalid state '${target}'`, { valid: VALID_STATES });
       }
       const ref = await p.issueRef(requireTicket(args.positionals));
-      const [sm, issue] = await Promise.all([p.stateMap(), p.request("GET", `${p.projectPath()}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>]);
+      const [sm, issue] = await Promise.all([p.stateMap(ref.projectId), p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>]);
       const targetId = requireStateId(sm, target);
       const sameState = issue.state === targetId;
       const commentText = typeof args.flags.comment === "string" ? args.flags.comment : undefined;
@@ -492,15 +473,15 @@ export async function run(argv: string[]): Promise<unknown> {
         return {
           dryRun: true,
           requests: [
-            ...(sameState ? [] : [{ method: "PATCH", url: `${cfg.apiBase}${p.projectPath()}/issues/${ref.uuid}/`, body: { state: targetId } }]),
-            ...(commentText ? [{ method: "POST", url: `${cfg.apiBase}${p.projectPath()}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText) } }] : []),
+            ...(sameState ? [] : [{ method: "PATCH", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`, body: { state: targetId } }]),
+            ...(commentText ? [{ method: "POST", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText) } }] : []),
           ],
         };
       }
-      if (!sameState) await p.patchIssue(ref.uuid, { state: targetId });
-      if (commentText) await p.postComment(ref.uuid, htmlEscape(commentText));
+      if (!sameState) await p.patchIssue(ref.uuid, { state: targetId }, ref.projectId);
+      if (commentText) await p.postComment(ref.uuid, htmlEscape(commentText), undefined, ref.projectId);
       return {
-        id: `HT-${ref.seq}`,
+        id: `${ref.ident}-${ref.seq}`,
         state: target,
         changed: !sameState,
         ...(commentText ? { commentPosted: true } : {}),
@@ -508,9 +489,9 @@ export async function run(argv: string[]): Promise<unknown> {
     }
     case "comments": {
       const ref = await p.issueRef(requireTicket(args.positionals));
-      const list = await p.comments(ref.uuid);
+      const list = await p.comments(ref.uuid, ref.projectId);
       const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : truncateText(c.text, 300) }));
-      return pickFields({ id: `HT-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
+      return pickFields({ id: `${ref.ident}-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
     }
     case "reply":
     case "comment": {
@@ -533,7 +514,7 @@ export async function run(argv: string[]): Promise<unknown> {
         const handle = String(args.positionals[1] ?? "");
         const m = handle.match(/^c(\d+)$/);
         if (!m) throw new UsageError("validation", `invalid comment handle '${handle}'`, { valid: ["c<N>"], suggestion: `plane comments ${positional}` });
-        const list = await p.comments(ref.uuid);
+        const list = await p.comments(ref.uuid, ref.projectId);
         const target = list.find((c) => c.n === Number(m[1]));
         if (!target)
           throw new UsageError("not-found", `comment ${handle} not found on ${positional}`, {
@@ -545,11 +526,11 @@ export async function run(argv: string[]): Promise<unknown> {
       }
       if (dryRun) {
         const body: Record<string, unknown> = { comment_html: html, ...(parentId ? { parent: parentId } : {}) };
-        return { dryRun: true, requests: [{ method: "POST", url: `${cfg.apiBase}${p.projectPath()}/issues/${ref.uuid}/comments/`, body }] };
+        return { dryRun: true, requests: [{ method: "POST", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/`, body }] };
       }
-      await p.postComment(ref.uuid, html, parentId);
-      const listAfter = await p.comments(ref.uuid);
-      return { id: `HT-${ref.seq}`, ...(replyTo ? { replyTo } : {}), n: `c${listAfter.length}` };
+      await p.postComment(ref.uuid, html, parentId, ref.projectId);
+      const listAfter = await p.comments(ref.uuid, ref.projectId);
+      return { id: `${ref.ident}-${ref.seq}`, ...(replyTo ? { replyTo } : {}), n: `c${listAfter.length}` };
     }
     case "create":
     case "sub": {
@@ -561,7 +542,11 @@ export async function run(argv: string[]): Promise<unknown> {
       if (prio && !["urgent", "high", "medium", "low"].includes(prio))
         throw new UsageError("validation", `invalid --priority '${prio}'`, { valid: ["urgent", "high", "medium", "low"] });
       const html = await bodyText(args.flags);
-      const [lm, sm] = await Promise.all([p.labelMap(), p.stateMap()]);
+      let parentRef: { uuid: string; seq: number; ident: string; projectId: string } | undefined;
+      if (args.verb === "sub") parentRef = await p.issueRef(requireTicket(args.positionals));
+      const projectId = parentRef?.projectId;
+      const ident = parentRef?.ident;
+      const [lm, sm] = await Promise.all([p.labelMap(projectId), p.stateMap(projectId)]);
       const labelId = lm[typeName];
       if (!labelId)
         throw new UsageError("not-found", `label '${typeName}' not found on the board`, {
@@ -574,18 +559,16 @@ export async function run(argv: string[]): Promise<unknown> {
         state: requireStateId(sm, "todo"),
         label_ids: [labelId],
         ...(prio ? { priority: prio } : {}),
+        ...(parentRef ? { parent: parentRef.uuid } : {}),
       };
-      if (args.verb === "sub") {
-        const parent = await p.issueRef(requireTicket(args.positionals));
-        payload.parent = parent.uuid;
-      }
+      const targetId = projectId ?? p.projectId();
       const requests: Array<Record<string, unknown>> = [
-        { method: "POST", url: `${cfg.apiBase}${p.projectPath()}/issues/`, body: payload },
+        { method: "POST", url: `${cfg.apiBase}${p.projectPathFor(targetId)}/issues/`, body: payload },
       ];
       if (dryRun) return { dryRun: true, requests };
-      const created = (await p.request("POST", `${p.projectPath()}/issues/`, payload)) as Record<string, unknown>;
-      cache.drop("seqmap");
-      return { id: `HT-${created.sequence_id}` };
+      const created = (await p.request("POST", `${p.projectPathFor(targetId)}/issues/`, payload)) as Record<string, unknown>;
+      cache.drop(projectId && projectId !== p.projectId() ? `seqmap:${projectId}` : "seqmap");
+      return { id: `${ident ?? "HT"}-${created.sequence_id}` };
     }
   }
 }

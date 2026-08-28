@@ -4,6 +4,7 @@ const TTL: Record<string, number> = {
   states: 24 * 3600_000,
   labels: 24 * 3600_000,
   project: 24 * 3600_000,
+  projects: 24 * 3600_000,
   member: 24 * 3600_000,
   members: 24 * 3600_000,
   seqmap: 300_000,

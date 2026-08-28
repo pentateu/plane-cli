@@ -38,6 +38,27 @@ const STATE_TOKENS: Record<string, string> = {
 export const VALID_STATES = ["todo", "progress", "verify", "done", "cancelled"];
 export const VALID_LABELS = ["type:bug", "type:feature", "type:ops", "type:plan"];
 
+export type TicketRef = { ident?: string; seq: number };
+
+/** Single source for ticket-ref grammar: `<IDENT>-<n>`, `HT-<n>`, bare `<n>`.
+ *  Identifiers normalize to uppercase; a missing ident means the default
+ *  project (display prefix HT). Invalid refs fail loud with the grammar. */
+export function parseTicketRef(input: string): TicketRef {
+  const s = input.trim();
+  let m = s.match(/^(\d+)$/);
+  if (m) return { seq: Number(m[1]) };
+  m = s.match(/^([A-Za-z][A-Za-z0-9]*)-(\d+)$/);
+  if (m) return { ident: m[1]!.toUpperCase(), seq: Number(m[2]) };
+  throw new ApiError("validation", `invalid ticket ref '${input}'`, {
+    valid: ["HT-<number>", "<IDENT>-<number>", "<number>"],
+    suggestion: "prefix the number with its project identifier, e.g. HT-66",
+  });
+}
+
+export function formatTicketRef(ref: TicketRef): string {
+  return `${ref.ident ?? "HT"}-${ref.seq}`;
+}
+
 export function htmlToText(html: string): string {
   return html
     .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
@@ -131,7 +152,11 @@ export class Plane {
   }
 
   projectPath(): string {
-    return `${this.base()}/projects/${this.projectId()}`;
+    return this.projectPathFor(this.projectId());
+  }
+
+  projectPathFor(projectId: string): string {
+    return `${this.base()}/projects/${projectId}`;
   }
 
   projectId(): string {
@@ -144,39 +169,79 @@ export class Plane {
     throw new ApiError("api", "project id not cached yet", { suggestion: "plane sync" });
   }
 
+  /** Workspace project registry (cursor-paginated), cached under `projects`. */
+  async projects(): Promise<Raw[]> {
+    const cached = this.cache.fresh("projects");
+    if (Array.isArray(cached) && cached.length) return cached as Raw[];
+    const out: Raw[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    for (let i = 0; i < 10; i++) {
+      const q = new URLSearchParams({ per_page: "100" });
+      if (cursor) q.set("cursor", cursor);
+      const page = (await this.request("GET", `${this.base()}/projects/?${q}`)) as Raw;
+      for (const r of (page.results ?? []) as Raw[]) {
+        const k = String(r.id);
+        if (!seen.has(k)) {
+          seen.add(k);
+          out.push(r);
+        }
+      }
+      if (!(page.next_page_results ?? false)) break;
+      cursor = String(page.next_cursor ?? "");
+      if (!cursor) break;
+    }
+    this.cache.set("projects", out);
+    return out;
+  }
+
+  async resolveProjectByIdent(ident: string): Promise<Raw> {
+    const want = ident.toUpperCase();
+    const list = await this.projects();
+    const found = list.find((p) => String(p.identifier ?? "").toUpperCase() === want);
+    if (!found)
+      throw new ApiError("not-found", `no project with identifier '${ident}'`, {
+        valid: list.map((p) => String(p.identifier ?? "")).filter(Boolean).sort(),
+        suggestion: "plane projects to list available projects",
+      });
+    return found;
+  }
+
   async ensureProject(): Promise<void> {
     if (this.cfg.projectId) return;
     const key = `project:${this.cfg.projectName}`;
     if (this.cache.fresh(key)) return;
-    const page = (await this.request("GET", `${this.base()}/projects/`)) as Raw;
-    const results = (page.results ?? page) as Raw[];
-    const proj = results.find((p) => p.name === this.cfg.projectName || p.identifier === this.cfg.projectName);
+    const list = await this.projects();
+    const name = String(this.cfg.projectName);
+    const proj = list.find((p) => p.name === name)
+      ?? list.find((p) => String(p.identifier ?? "").toLowerCase() === name.toLowerCase())
+      ?? list.find((p) => String(p.name ?? "").toLowerCase() === name.toLowerCase());
     if (!proj)
       throw new ApiError("not-found", `project '${this.cfg.projectName}' not found in workspace '${this.cfg.workspace}'`, {
-        valid: results.map((p) => p.name),
+        valid: list.map((p) => p.name),
       });
     this.cache.set(key, proj.id);
   }
 
-  async stateMap(): Promise<Record<string, string>> {
-    const cached = this.cache.fresh("states");
+  async stateMap(projectId: string = this.projectId()): Promise<Record<string, string>> {
+    const key = projectId === this.projectId() ? "states" : `states:${projectId}`;
+    const cached = this.cache.fresh(key);
     if (cached) return cached as Record<string, string>;
-    await this.ensureProject();
-    const page = (await this.request("GET", `${this.base()}/projects/${this.projectId()}/states/`)) as Raw;
+    const page = (await this.request("GET", `${this.projectPathFor(projectId)}/states/`)) as Raw;
     const map: Record<string, string> = {};
     for (const s of page.results as Raw[]) map[STATE_TOKENS[s.name.toLowerCase()] ?? s.name.toLowerCase()] = s.id;
-    this.cache.set("states", map);
+    this.cache.set(key, map);
     return map;
   }
 
-  async labelMap(): Promise<Record<string, string>> {
-    const cached = this.cache.fresh("labels");
+  async labelMap(projectId: string = this.projectId()): Promise<Record<string, string>> {
+    const key = projectId === this.projectId() ? "labels" : `labels:${projectId}`;
+    const cached = this.cache.fresh(key);
     if (cached) return cached as Record<string, string>;
-    await this.ensureProject();
-    const page = (await this.request("GET", `${this.base()}/projects/${this.projectId()}/labels/`)) as Raw;
+    const page = (await this.request("GET", `${this.projectPathFor(projectId)}/labels/`)) as Raw;
     const map: Record<string, string> = {};
     for (const l of page.results as Raw[]) map[l.name] = l.id;
-    this.cache.set("labels", map);
+    this.cache.set(key, map);
     return map;
   }
 
@@ -212,14 +277,14 @@ export class Plane {
   /** Walk the project's issue list. Current instances are CURSOR-paginated
    *  (next_cursor/next_page_results) and ignore the legacy offset `page` param —
    *  following `page=N` would re-fetch page 1 forever. Dedupes defensively. */
-  async listIssues(params: Record<string, string> = {}, maxPages = 10): Promise<Raw[]> {
+  async listIssues(params: Record<string, string> = {}, maxPages = 10, projectId: string = this.projectId()): Promise<Raw[]> {
     const out: Raw[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     for (let i = 0; i < maxPages; i++) {
       const q = new URLSearchParams({ per_page: "100", ...params });
       if (cursor) q.set("cursor", cursor);
-      const page = (await this.request("GET", `${this.projectPath()}/issues/?${q}`)) as Raw;
+      const page = (await this.request("GET", `${this.projectPathFor(projectId)}/issues/?${q}`)) as Raw;
       for (const r of (page.results as Raw[]) ?? []) {
         const key = String(r.id);
         if (!seen.has(key)) {
@@ -234,18 +299,23 @@ export class Plane {
     return out;
   }
 
-  async issueRef(input: string): Promise<{ uuid: string; seq: number }> {
-    const m = input.match(/^(?:HT-)?(\d+)$/i);
-    if (!m)
-      throw new ApiError("validation", `invalid ticket ref '${input}'`, {
-        valid: ["HT-<number>", "<number>"],
-        suggestion: "plane get HT-66",
-      });
-    const seq = Number(m[1]);
-    const mapKey = "seqmap";
+  async issueRef(input: string): Promise<{ uuid: string; seq: number; ident: string; projectId: string }> {
+    const ref = parseTicketRef(input);
+    let projectId: string;
+    let ident: string;
+    if (!ref.ident || ref.ident === "HT") {
+      projectId = this.projectId();
+      ident = "HT";
+    } else {
+      const proj = await this.resolveProjectByIdent(ref.ident);
+      projectId = String(proj.id);
+      ident = String(proj.identifier ?? ref.ident).toUpperCase();
+    }
+    const seq = ref.seq;
+    const mapKey = projectId === this.projectId() ? "seqmap" : `seqmap:${projectId}`;
     const load = async (): Promise<Record<string, string>> => {
       const map: Record<string, string> = {};
-      for (const i of await this.listIssues()) map[String(i.sequence_id)] = i.id as string;
+      for (const i of await this.listIssues({}, 10, projectId)) map[String(i.sequence_id)] = i.id as string;
       this.cache.set(mapKey, map);
       return map;
     };
@@ -255,11 +325,19 @@ export class Plane {
       map = await load();
       uuid = map[String(seq)];
     }
-    if (!uuid)
-      throw new ApiError("not-found", `HT-${seq} not found`, {
-        suggestion: "plane list --search HT-" + seq,
+    if (!uuid) {
+      const near = Object.keys(map)
+        .map(Number)
+        .filter((n) => Number.isFinite(n))
+        .sort((a, b) => Math.abs(a - seq) - Math.abs(b - seq) || a - b)
+        .slice(0, 5)
+        .map((n) => `${ident}-${n}`);
+      throw new ApiError("not-found", `${ident}-${seq} not found`, {
+        ...(near.length ? { valid: near } : {}),
+        suggestion: near.length ? "pick the nearest match or re-check the number" : "plane sync then retry",
       });
-    return { uuid, seq };
+    }
+    return { uuid, seq, ident, projectId };
   }
 
   private async memberNames(): Promise<Record<string, string>> {
@@ -272,20 +350,22 @@ export class Plane {
     return out;
   }
 
-  async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
+  async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations; ident?: string; projectId?: string }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
+    const ident = opts.ident ?? "HT";
     const names = opts.memberNames ?? (await this.memberNames());
-    const lm = opts.labelNames ?? (await this.labelMap());
-    const sm = opts.stateTokens ?? inverse(await this.stateMap());
+    const lm = opts.labelNames ?? (await this.labelMap(opts.projectId));
+    const sm = opts.stateTokens ?? inverse(await this.stateMap(opts.projectId));
     const seqByUuid: Record<string, string> = {};
-    for (const [seq, uuid] of Object.entries(this.cache.stale("seqmap") as Record<string, string> ?? {})) seqByUuid[uuid] = `HT-${seq}`;
+    const smKey = opts.projectId && opts.projectId !== this.projectId() ? `seqmap:${opts.projectId}` : "seqmap";
+    for (const [seq, uuid] of Object.entries(this.cache.stale(smKey) as Record<string, string> ?? {})) seqByUuid[uuid] = `${ident}-${seq}`;
     let description: string | undefined;
     if ("description_html" in i) {
       const t = htmlToText(String(i.description_html ?? ""));
       const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : 500);
-      description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get HT-${i.sequence_id} --full)`;
+      description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get ${ident}-${i.sequence_id} --full)`;
     }
     const row: IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] } = {
-      id: `HT-${i.sequence_id}`,
+      id: `${ident}-${i.sequence_id}`,
       title: String(i.name),
       state: sm[i.state] ?? `state:${String(i.state).slice(0, 8)}`,
       priority: i.priority === "none" ? null : i.priority ?? null,
@@ -302,9 +382,9 @@ export class Plane {
     return row;
   }
 
-  async comments(uuid: string): Promise<Array<{ n: number; author: string; date: string; id: string; text: string }>> {
+  async comments(uuid: string, projectId: string = this.projectId()): Promise<Array<{ n: number; author: string; date: string; id: string; text: string }>> {
     const [raw, names] = await Promise.all([
-      this.request("GET", `${this.projectPath()}/issues/${uuid}/comments/`) as Promise<Raw>,
+      this.request("GET", `${this.projectPathFor(projectId)}/issues/${uuid}/comments/`) as Promise<Raw>,
       this.memberNames(),
     ]);
     const list = ((raw.results ?? raw) as Raw[]).slice().sort((a, b) => a.created_at.localeCompare(b.created_at));
@@ -317,14 +397,14 @@ export class Plane {
     }));
   }
 
-  postComment(uuid: string, html: string, parent?: string): Promise<Raw> {
+  postComment(uuid: string, html: string, parent?: string, projectId: string = this.projectId()): Promise<Raw> {
     const body: Raw = { comment_html: html };
     if (parent) body.parent = parent;
-    return this.request("POST", `${this.projectPath()}/issues/${uuid}/comments/`, body) as Promise<Raw>;
+    return this.request("POST", `${this.projectPathFor(projectId)}/issues/${uuid}/comments/`, body) as Promise<Raw>;
   }
 
-  patchIssue(uuid: string, body: Raw): Promise<Raw> {
-    return this.request("PATCH", `${this.projectPath()}/issues/${uuid}/`, body) as Promise<Raw>;
+  patchIssue(uuid: string, body: Raw, projectId: string = this.projectId()): Promise<Raw> {
+    return this.request("PATCH", `${this.projectPathFor(projectId)}/issues/${uuid}/`, body) as Promise<Raw>;
   }
 
   /** Native blocking edges (Plane stores one row: issue=blocked, related=blocker,
@@ -332,8 +412,8 @@ export class Plane {
    *  Only the work-items prefix exposes /relations/ on current instances.
    *  Entry shape varies by install: bare uuid strings (commercial trial),
    *  {issue_id} (community), {id} (upstream master) — accept all three. */
-  async relations(uuid: string): Promise<IssueRelations> {
-    const raw = (await this.request("GET", `${this.projectPath()}/work-items/${uuid}/relations/`)) as Raw;
+  async relations(uuid: string, projectId: string = this.projectId()): Promise<IssueRelations> {
+    const raw = (await this.request("GET", `${this.projectPathFor(projectId)}/work-items/${uuid}/relations/`)) as Raw;
     const ids = (v: unknown): string[] =>
       Array.isArray(v)
         ? v
@@ -343,11 +423,11 @@ export class Plane {
     return { blockers: ids(raw.blocked_by), blocks: ids(raw.blocking) };
   }
 
-  async relationsCached(uuid: string): Promise<IssueRelations> {
+  async relationsCached(uuid: string, projectId: string = this.projectId()): Promise<IssueRelations> {
     const map = this.cache.fresh("relmap") as RelMap | undefined;
     const hit = map?.[uuid];
     if (hit) return { blockers: hit.b, blocks: hit.f };
-    const rels = await this.relations(uuid);
+    const rels = await this.relations(uuid, projectId);
     this.cacheRel(uuid, rels);
     return rels;
   }
@@ -358,15 +438,15 @@ export class Plane {
     this.cache.set("relmap", map);
   }
 
-  setBlockEdge(blockerUuid: string, blockedUuid: string): Promise<Raw> {
-    return this.request("POST", `${this.projectPath()}/work-items/${blockerUuid}/relations/`, {
+  setBlockEdge(blockerUuid: string, blockedUuid: string, projectId: string = this.projectId()): Promise<Raw> {
+    return this.request("POST", `${this.projectPathFor(projectId)}/work-items/${blockerUuid}/relations/`, {
       relation_type: "blocking",
       issues: [blockedUuid],
     }) as Promise<Raw>;
   }
 
-  removeBlockEdge(blockerUuid: string, blockedUuid: string): Promise<Raw> {
-    return this.request("DELETE", `${this.projectPath()}/work-items/${blockerUuid}/relations/${blockedUuid}/`) as Promise<Raw>;
+  removeBlockEdge(blockerUuid: string, blockedUuid: string, projectId: string = this.projectId()): Promise<Raw> {
+    return this.request("DELETE", `${this.projectPathFor(projectId)}/work-items/${blockerUuid}/relations/${blockedUuid}/`) as Promise<Raw>;
   }
 }
 
