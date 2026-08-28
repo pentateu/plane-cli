@@ -9,13 +9,14 @@ describe("parseTicketRef", () => {
     expect(formatTicketRef(parseTicketRef("ht-66"))).toBe("HT-66");
   });
 
-  test("TEAMCTL- and INFRA- prefixes parse and round-trip", () => {
-    expect(parseTicketRef("TEAMCTL-16")).toEqual({ ident: "TEAMCTL", seq: 16 });
-    expect(parseTicketRef("teamctl-16")).toEqual({ ident: "TEAMCTL", seq: 16 });
-    expect(formatTicketRef(parseTicketRef("TEAMCTL-16"))).toBe("TEAMCTL-16");
-    expect(formatTicketRef(parseTicketRef("teamctl-16"))).toBe("TEAMCTL-16");
-    expect(parseTicketRef("INFRA-3")).toEqual({ ident: "INFRA", seq: 3 });
-    expect(formatTicketRef(parseTicketRef("INFRA-3"))).toBe("INFRA-3");
+  test("every real workspace identifier parses and round-trips case-insensitively", () => {
+    for (const ref of ["TC-16", "XT-2", "EGG-5", "ACCT-4", "IOT-9", "INFRA-3"]) {
+      const [ident, seq] = ref.split("-") as [string, number & string];
+      expect(parseTicketRef(ref)).toEqual({ ident, seq: Number(seq) });
+      expect(parseTicketRef(ref.toLowerCase())).toEqual({ ident, seq: Number(seq) });
+      expect(formatTicketRef(parseTicketRef(ref))).toBe(ref);
+      expect(formatTicketRef(parseTicketRef(ref.toLowerCase()))).toBe(ref);
+    }
   });
 
   test("bare numbers parse with no ident (default project) and format as HT", () => {

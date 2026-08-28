@@ -1034,10 +1034,16 @@ describe("identifier-aware refs (TC-17)", () => {
   const EGG_ISSUES = [
     { id: "eg-5", sequence_id: 5, name: "egg farm ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>eg5</p>" },
   ];
+  const ACCT_ISSUES = [
+    { id: "ac-4", sequence_id: 4, name: "accounting ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>ac4</p>" },
+  ];
+  const IOT_ISSUES = [
+    { id: "io-9", sequence_id: 9, name: "iot ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>io9</p>" },
+  ];
 
   function useProjectsRouter() {
     router = (_m, path, b) => {
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }, { id: "pr-2", name: "Teamctl", identifier: "TC" }, { id: "pr-3", name: "Infra", identifier: "INFRA" }, { id: "pr-4", name: "X Tools", identifier: "XT" }, { id: "pr-5", name: "FreshFarmEggs", identifier: "EGG" }], next_page_results: false } };
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }, { id: "pr-2", name: "Teamctl", identifier: "TC" }, { id: "pr-3", name: "Infra", identifier: "INFRA" }, { id: "pr-4", name: "X Tools", identifier: "XT" }, { id: "pr-5", name: "FreshFarmEggs", identifier: "EGG" }, { id: "pr-6", name: "Accounting", identifier: "ACCT" }, { id: "pr-7", name: "IoT Platform", identifier: "IOT" }], next_page_results: false } };
       if (path === "/members/") return { status: 200, json: MEMBERS };
       if (path.endsWith("/states/")) return { status: 200, json: { results: path.includes("pr-2") ? TC_STATES : STATES } };
       if (path.endsWith("/labels/")) return { status: 200, json: { results: path.includes("pr-2") ? TC_LABELS : LABELS } };
@@ -1048,9 +1054,11 @@ describe("identifier-aware refs (TC-17)", () => {
       if (/\/projects\/pr-3\/issues\/$/.test(path)) return { status: 200, json: { results: INFRA_ISSUES, next_page_results: false } };
       if (/\/projects\/pr-4\/issues\/$/.test(path)) return { status: 200, json: { results: XT_ISSUES, next_page_results: false } };
       if (/\/projects\/pr-5\/issues\/$/.test(path)) return { status: 200, json: { results: EGG_ISSUES, next_page_results: false } };
+      if (/\/projects\/pr-6\/issues\/$/.test(path)) return { status: 200, json: { results: ACCT_ISSUES, next_page_results: false } };
+      if (/\/projects\/pr-7\/issues\/$/.test(path)) return { status: 200, json: { results: IOT_ISSUES, next_page_results: false } };
       const issueHit = path.match(/\/projects\/([^/]+)\/issues\/([^/]+)\/$/);
       if (issueHit) {
-        const pool = issueHit[1] === "pr-2" ? TC_ISSUES : issueHit[1] === "pr-3" ? INFRA_ISSUES : issueHit[1] === "pr-4" ? XT_ISSUES : issueHit[1] === "pr-5" ? EGG_ISSUES : ISSUES;
+        const pool = issueHit[1] === "pr-2" ? TC_ISSUES : issueHit[1] === "pr-3" ? INFRA_ISSUES : issueHit[1] === "pr-4" ? XT_ISSUES : issueHit[1] === "pr-5" ? EGG_ISSUES : issueHit[1] === "pr-6" ? ACCT_ISSUES : issueHit[1] === "pr-7" ? IOT_ISSUES : ISSUES;
         const issue = pool.find((i: any) => i.id === issueHit[2]);
         if (!issue) return { status: 404 };
         return { status: 200, json: { ...issue, ...(globalThis.__patchBody ?? {}) } };
@@ -1071,6 +1079,8 @@ describe("identifier-aware refs (TC-17)", () => {
       { name: "Infra", identifier: "INFRA", id: "pr-3" },
       { name: "X Tools", identifier: "XT", id: "pr-4" },
       { name: "FreshFarmEggs", identifier: "EGG", id: "pr-5" },
+      { name: "Accounting", identifier: "ACCT", id: "pr-6" },
+      { name: "IoT Platform", identifier: "IOT", id: "pr-7" },
     ]);
   });
 
@@ -1078,7 +1088,7 @@ describe("identifier-aware refs (TC-17)", () => {
     useProjectsRouter();
     process.env.PLANE_PROJECT_NAME = "Bogus";
     const d = (await run(["projects"])) as any;
-    expect(d.projects).toHaveLength(5);
+    expect(d.projects).toHaveLength(7);
   });
 
   test("get TC-16 resolves the identifier to its project and shapes the id", async () => {
@@ -1112,8 +1122,24 @@ describe("identifier-aware refs (TC-17)", () => {
       caught = e;
     }
     expect(caught.kind).toBe("not-found");
-    expect(caught.valid).toEqual(["EGG", "HT", "INFRA", "TC", "XT"]);
+    expect(caught.valid).toEqual(["ACCT", "EGG", "HT", "INFRA", "IOT", "TC", "XT"]);
     expect(String(caught.suggestion)).toContain("plane projects");
+  });
+
+  test("get ACCT-4 resolves the Accounting project", async () => {
+    useProjectsRouter();
+    const d = (await run(["get", "ACCT-4", "--fields", "id,title"])) as any;
+    expect(d.id).toBe("ACCT-4");
+    expect(d.title).toBe("accounting ticket");
+    expect(calls.some((c) => c.path === "/projects/pr-6/issues/ac-4/")).toBeTrue();
+  });
+
+  test("get IOT-9 resolves the IoT Platform project", async () => {
+    useProjectsRouter();
+    const d = (await run(["get", "IOT-9", "--fields", "id,title"])) as any;
+    expect(d.id).toBe("IOT-9");
+    expect(d.title).toBe("iot ticket");
+    expect(calls.some((c) => c.path === "/projects/pr-7/issues/io-9/")).toBeTrue();
   });
 
   test("get XT-2 resolves the X Tools project", async () => {
