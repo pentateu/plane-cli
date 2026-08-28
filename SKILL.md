@@ -1,6 +1,6 @@
 ---
 name: plane-cli
-description: Use when reading or writing Ai Tutor tickets on Plane (https://rafael-linux.tail8a19c.ts.net) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
+description: Use when reading or writing tickets across the workspace's projects on Plane (https://rafael-linux.tail8a19c.ts.net) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
 ---
 
 # plane-cli
@@ -18,6 +18,12 @@ bun ~/Development/plane-cli/src/cli.ts <verb> …
 `plane help` is the canonical contract text (I/O streams, exit taxonomy,
 handles, flag rules). Do not restate it here — trust `help`, and if this file
 ever disagrees with `help`, `help` wins.
+
+Handles are `<IDENT>-<seq>` across ALL workspace projects — `HT-17`, `TC-17`,
+`XT-2`, `EGG-5`, … each resolves to its own project. `HT-<seq>` and bare
+`<seq>` always mean the default project, and any other identifier must be one
+the registry has seen; never guess an identifier — `plane projects` lists the
+live ones (identifiers are renamed on the board from time to time).
 
 ## Auth
 
@@ -96,7 +102,9 @@ The admin bootstrap token is never used implicitly.
   someone else renames states/labels on the board. Board drift otherwise fails
   LOUD (missing state/label → exit 3 + `plane sync then retry`), never silently.
   `sync` also refreshes blocking edges into the cache so short-handle rendering
-  works offline.
+  works offline. Project-identifier renames surface the same way: the registry
+  refresh lives in the same cache — a stale identifier fails loud telling you
+  to `plane projects` and re-check.
 - `unblocks` requires the plane-fork relation-DELETE patch: stock Plane's
   public API exposes relations as GET+POST only, so removal fails loud (exit 1)
   with guidance until the instance is patched. Creating/reading edges works on

@@ -1006,7 +1006,7 @@ describe("parser contract", () => {
   });
 });
 
-describe("identifier-aware refs (TEAMCTL-17)", () => {
+describe("identifier-aware refs (TC-17)", () => {
   const TC_STATES = [
     { id: "st2-backlog", name: "Backlog" },
     { id: "st2-todo", name: "Todo" },
@@ -1023,15 +1023,21 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
   ];
   const TC_ISSUES = [
     { id: "tc-16", sequence_id: 16, name: "fleet ticket", state: "st2-todo", priority: "low", assignees: [], labels: ["lb2-plan"], parent: null, description_html: "<p>tc16</p>" },
-    { id: "tc-17", sequence_id: 17, name: "the TEAMCTL-17 subject", state: "st2-todo", priority: "urgent", assignees: [], labels: ["lb2-bug"], parent: null, description_html: "<p>tc17</p>" },
+    { id: "tc-17", sequence_id: 17, name: "the TC-17 subject", state: "st2-todo", priority: "urgent", assignees: [], labels: ["lb2-bug"], parent: null, description_html: "<p>tc17</p>" },
   ];
   const INFRA_ISSUES = [
     { id: "in-3", sequence_id: 3, name: "infra ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>in3</p>" },
   ];
+  const XT_ISSUES = [
+    { id: "xt-2", sequence_id: 2, name: "x tools ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>xt2</p>" },
+  ];
+  const EGG_ISSUES = [
+    { id: "eg-5", sequence_id: 5, name: "egg farm ticket", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>eg5</p>" },
+  ];
 
   function useProjectsRouter() {
     router = (_m, path, b) => {
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }, { id: "pr-2", name: "Teamctl", identifier: "TEAMCTL" }, { id: "pr-3", name: "Infra", identifier: "INFRA" }], next_page_results: false } };
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }, { id: "pr-2", name: "Teamctl", identifier: "TC" }, { id: "pr-3", name: "Infra", identifier: "INFRA" }, { id: "pr-4", name: "X Tools", identifier: "XT" }, { id: "pr-5", name: "FreshFarmEggs", identifier: "EGG" }], next_page_results: false } };
       if (path === "/members/") return { status: 200, json: MEMBERS };
       if (path.endsWith("/states/")) return { status: 200, json: { results: path.includes("pr-2") ? TC_STATES : STATES } };
       if (path.endsWith("/labels/")) return { status: 200, json: { results: path.includes("pr-2") ? TC_LABELS : LABELS } };
@@ -1040,9 +1046,11 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
       if (/\/projects\/pr-2\/issues\/$/.test(path) && _m === "POST") return { status: 200, json: { ...(b as any), id: "tc-18", sequence_id: 18 } };
       if (/\/projects\/pr-2\/issues\/$/.test(path)) return { status: 200, json: { results: TC_ISSUES, next_page_results: false } };
       if (/\/projects\/pr-3\/issues\/$/.test(path)) return { status: 200, json: { results: INFRA_ISSUES, next_page_results: false } };
+      if (/\/projects\/pr-4\/issues\/$/.test(path)) return { status: 200, json: { results: XT_ISSUES, next_page_results: false } };
+      if (/\/projects\/pr-5\/issues\/$/.test(path)) return { status: 200, json: { results: EGG_ISSUES, next_page_results: false } };
       const issueHit = path.match(/\/projects\/([^/]+)\/issues\/([^/]+)\/$/);
       if (issueHit) {
-        const pool = issueHit[1] === "pr-2" ? TC_ISSUES : issueHit[1] === "pr-3" ? INFRA_ISSUES : ISSUES;
+        const pool = issueHit[1] === "pr-2" ? TC_ISSUES : issueHit[1] === "pr-3" ? INFRA_ISSUES : issueHit[1] === "pr-4" ? XT_ISSUES : issueHit[1] === "pr-5" ? EGG_ISSUES : ISSUES;
         const issue = pool.find((i: any) => i.id === issueHit[2]);
         if (!issue) return { status: 404 };
         return { status: 200, json: { ...issue, ...(globalThis.__patchBody ?? {}) } };
@@ -1059,8 +1067,10 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
     const d = (await run(["projects"])) as any;
     expect(d.projects).toEqual([
       { name: "Ai Tutor", identifier: "HT", id: "pr-1" },
-      { name: "Teamctl", identifier: "TEAMCTL", id: "pr-2" },
+      { name: "Teamctl", identifier: "TC", id: "pr-2" },
       { name: "Infra", identifier: "INFRA", id: "pr-3" },
+      { name: "X Tools", identifier: "XT", id: "pr-4" },
+      { name: "FreshFarmEggs", identifier: "EGG", id: "pr-5" },
     ]);
   });
 
@@ -1068,22 +1078,22 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
     useProjectsRouter();
     process.env.PLANE_PROJECT_NAME = "Bogus";
     const d = (await run(["projects"])) as any;
-    expect(d.projects).toHaveLength(3);
+    expect(d.projects).toHaveLength(5);
   });
 
-  test("get TEAMCTL-16 resolves the identifier to its project and shapes the id", async () => {
+  test("get TC-16 resolves the identifier to its project and shapes the id", async () => {
     useProjectsRouter();
-    const d = (await run(["get", "TEAMCTL-16"])) as any;
-    expect(d.id).toBe("TEAMCTL-16");
+    const d = (await run(["get", "TC-16"])) as any;
+    expect(d.id).toBe("TC-16");
     expect(d.title).toBe("fleet ticket");
     expect(calls.some((c) => c.path === "/projects/pr-2/issues/tc-16/")).toBeTrue();
     expect(calls.some((c) => c.path === "/projects/pr-1/issues/tc-16/")).toBeFalse();
   });
 
-  test("get teamctl-16 (lowercase) resolves identically", async () => {
+  test("get tc-16 (lowercase) resolves identically", async () => {
     useProjectsRouter();
-    const d = (await run(["get", "teamctl-16", "--fields", "id"])) as any;
-    expect(d.id).toBe("TEAMCTL-16");
+    const d = (await run(["get", "tc-16", "--fields", "id"])) as any;
+    expect(d.id).toBe("TC-16");
   });
 
   test("get INFRA-3 resolves a third project", async () => {
@@ -1102,90 +1112,115 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
       caught = e;
     }
     expect(caught.kind).toBe("not-found");
-    expect(caught.valid).toEqual(["HT", "INFRA", "TEAMCTL"]);
+    expect(caught.valid).toEqual(["EGG", "HT", "INFRA", "TC", "XT"]);
     expect(String(caught.suggestion)).toContain("plane projects");
+  });
+
+  test("get XT-2 resolves the X Tools project", async () => {
+    useProjectsRouter();
+    const d = (await run(["get", "XT-2", "--fields", "id,title"])) as any;
+    expect(d.id).toBe("XT-2");
+    expect(d.title).toBe("x tools ticket");
+    expect(calls.some((c) => c.path === "/projects/pr-4/issues/xt-2/")).toBeTrue();
+  });
+
+  test("get EGG-5 resolves the FreshFarmEggs project", async () => {
+    useProjectsRouter();
+    const d = (await run(["get", "EGG-5", "--fields", "id,title"])) as any;
+    expect(d.id).toBe("EGG-5");
+    expect(d.title).toBe("egg farm ticket");
+    expect(calls.some((c) => c.path === "/projects/pr-5/issues/eg-5/")).toBeTrue();
+  });
+
+  test("blocks EGG-5 XT-2 posts to the blocker's project with real idents", async () => {
+    useProjectsRouter();
+    const d = (await run(["blocks", "EGG-5", "XT-2"])) as any;
+    expect(d).toMatchObject({ ok: true, edge: "EGG-5->XT-2", changed: true });
+    const post = calls.find((c) => c.method === "POST" && c.path.includes("/relations/"))!;
+    expect(post.path).toContain("/projects/pr-5/work-items/eg-5/relations/");
+    expect(post.body).toEqual({ relation_type: "blocking", issues: ["xt-2"] });
   });
 
   test("missing ticket in another project suggests nearest matches with the right ident", async () => {
     useProjectsRouter();
     let caught: any;
     try {
-      await run(["get", "TEAMCTL-99"]);
+      await run(["get", "TC-99"]);
     } catch (e) {
       caught = e;
     }
     expect(caught.kind).toBe("not-found");
-    expect(caught.valid).toEqual(["TEAMCTL-17", "TEAMCTL-16"]);
-    expect(String(caught.message)).toContain("TEAMCTL-99 not found");
+    expect(caught.valid).toEqual(["TC-17", "TC-16"]);
+    expect(String(caught.message)).toContain("TC-99 not found");
   });
 
-  test("state TEAMCTL-17 verify patches the owning project with its own state ids", async () => {
+  test("state TC-17 verify patches the owning project with its own state ids", async () => {
     useProjectsRouter();
-    const d = (await run(["state", "TEAMCTL-17", "verify"])) as any;
+    const d = (await run(["state", "TC-17", "verify"])) as any;
     const patch = calls.find((c) => c.method === "PATCH")!;
     expect(patch.path).toBe("/projects/pr-2/issues/tc-17/");
     expect(patch.body).toEqual({ state: "st2-verify" });
-    expect(d).toMatchObject({ id: "TEAMCTL-17", state: "verify", changed: true });
+    expect(d).toMatchObject({ id: "TC-17", state: "verify", changed: true });
   });
 
-  test("claim TEAMCTL-17 routes to the owning project and renders the ident", async () => {
+  test("claim TC-17 routes to the owning project and renders the ident", async () => {
     useProjectsRouter();
-    const d = (await run(["claim", "TEAMCTL-17", "--comment", "on it"])) as any;
+    const d = (await run(["claim", "TC-17", "--comment", "on it"])) as any;
     const patch = calls.find((c) => c.method === "PATCH")!;
     expect(patch.path).toBe("/projects/pr-2/issues/tc-17/");
     expect(patch.body).toMatchObject({ state: "st2-progress", assignees: ["mb-dev1"] });
-    expect(d).toMatchObject({ id: "TEAMCTL-17", changed: true });
+    expect(d).toMatchObject({ id: "TC-17", changed: true });
     const comment = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments/"))!;
     expect(comment.path).toContain("pr-2");
   });
 
-  test("comment TEAMCTL-16 posts to the owning project comments endpoint", async () => {
+  test("comment TC-16 posts to the owning project comments endpoint", async () => {
     useProjectsRouter();
-    await run(["comment", "TEAMCTL-16", "note"]);
+    await run(["comment", "TC-16", "note"]);
     const post = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments/"))!;
     expect(post.path).toBe("/projects/pr-2/issues/tc-16/comments/");
   });
 
-  test("reply TEAMCTL-16 c1 reads and writes the owning project's thread", async () => {
+  test("reply TC-16 c1 reads and writes the owning project's thread", async () => {
     useProjectsRouter();
     globalThis.__comments = [{ id: "cm-tc", created_at: "2026-08-27T01:00:00Z", comment_html: "<p>parent note</p>", actor: "mb-dev2" }];
-    await run(["reply", "TEAMCTL-16", "c1", "ack"]);
+    await run(["reply", "TC-16", "c1", "ack"]);
     expect(calls.some((c) => c.path === "/projects/pr-2/issues/tc-16/comments/")).toBeTrue();
     const post = calls.find((c) => c.method === "POST" && c.path.endsWith("/comments/"))!;
     expect(post.path).toBe("/projects/pr-2/issues/tc-16/comments/");
     expect(post.body).toMatchObject({ parent: "cm-tc" });
   });
 
-  test("sub TEAMCTL-16 creates the child in the parent's project with its states/labels", async () => {
+  test("sub TC-16 creates the child in the parent's project with its states/labels", async () => {
     useProjectsRouter();
-    const d = (await run(["sub", "TEAMCTL-16", "--title", "child", "--type", "ops", "--body", "<p>c</p>"])) as any;
+    const d = (await run(["sub", "TC-16", "--title", "child", "--type", "ops", "--body", "<p>c</p>"])) as any;
     const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
     expect(post.path).toBe("/projects/pr-2/issues/");
     expect(post.body).toMatchObject({ parent: "tc-16", state: "st2-todo", label_ids: ["lb2-ops"] });
-    expect(d.id).toBe("TEAMCTL-18");
+    expect(d.id).toBe("TC-18");
   });
 
-  test("blocks TEAMCTL-16 HT-66 names the edge with real idents and posts to the blocker project", async () => {
+  test("blocks TC-16 HT-66 names the edge with real idents and posts to the blocker project", async () => {
     useProjectsRouter();
-    const d = (await run(["blocks", "TEAMCTL-16", "HT-66"])) as any;
-    expect(d).toMatchObject({ ok: true, edge: "TEAMCTL-16->HT-66", changed: true });
+    const d = (await run(["blocks", "TC-16", "HT-66"])) as any;
+    expect(d).toMatchObject({ ok: true, edge: "TC-16->HT-66", changed: true });
     const post = calls.find((c) => c.method === "POST" && c.path.includes("/relations/"))!;
     expect(post.path).toContain("/projects/pr-2/work-items/tc-16/relations/");
     expect(post.body).toEqual({ relation_type: "blocking", issues: ["is-66"] });
   });
 
-  test("blocks HT-66 TEAMCTL-16 posts to the blocker's (default) project", async () => {
+  test("blocks HT-66 TC-16 posts to the blocker's (default) project", async () => {
     useProjectsRouter();
-    const d = (await run(["blocks", "HT-66", "TEAMCTL-16"])) as any;
-    expect(d).toMatchObject({ edge: "HT-66->TEAMCTL-16" });
+    const d = (await run(["blocks", "HT-66", "TC-16"])) as any;
+    expect(d).toMatchObject({ edge: "HT-66->TC-16" });
     const post = calls.find((c) => c.method === "POST" && c.path.includes("/relations/"))!;
     expect(post.path).toContain("/projects/pr-1/work-items/is-66/relations/");
     expect(post.body).toEqual({ relation_type: "blocking", issues: ["tc-16"] });
   });
 
-  test("list --blocked-by TEAMCTL-16 reads relations from the owning project", async () => {
+  test("list --blocked-by TC-16 reads relations from the owning project", async () => {
     useProjectsRouter();
-    const d = (await run(["list", "--blocked-by", "TEAMCTL-16"])) as any;
+    const d = (await run(["list", "--blocked-by", "TC-16"])) as any;
     expect(calls.some((c) => c.path === "/projects/pr-2/work-items/tc-16/relations/")).toBeTrue();
     expect(d.total).toBe(0);
   });
@@ -1194,7 +1229,7 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
     useProjectsRouter();
     let caught: any;
     try {
-      await run(["blocks", "TEAMCTL-16", "TEAMCTL-16"]);
+      await run(["blocks", "TC-16", "TC-16"]);
     } catch (e) {
       caught = e;
     }
@@ -1203,7 +1238,7 @@ describe("identifier-aware refs (TEAMCTL-17)", () => {
     expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
   });
 
-  test("same seq in another project is a distinct ticket: TEAMCTL-16 resolves while bare 16 does not", async () => {
+  test("same seq in another project is a distinct ticket: TC-16 resolves while bare 16 does not", async () => {
     useProjectsRouter();
     let caught: any;
     try {
