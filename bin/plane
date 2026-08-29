@@ -15,7 +15,7 @@ DIR="$(cd "$(dirname "$TARGET")" && pwd)"
 REPO="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || cd "$DIR/.." && pwd)"
 if [ "${PLANE_AUTO_PULL:-0}" == "1" ] && [ -d "$REPO/.git" ]; then
   if [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    git -C "$REPO" pull --ff-only -q origin development 2>/dev/null || true
+    git -C "$REPO" pull --ff-only -q origin main 2>/dev/null || true
   fi
 fi
 BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
