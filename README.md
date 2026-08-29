@@ -18,9 +18,9 @@ git clone git@github.com:pentateu/plane-cli.git ~/Development/plane-cli
 ln -s ~/Development/plane-cli/bin/plane ~/.local/bin/plane
 ```
 
-The shim resolves symlinks and fast-forward-pulls this repo before every run
-when the checkout is clean (skip with `PLANE_NO_PULL=1`) — PATH installs always
-execute latest main.
+The shim **never auto-pulls** (push-based, 2026-08-29). After you push
+`origin/main`, roll out with `scripts/deploy.sh` (see `outline-cli` for fleet
+pattern). Opt-in: `PLANE_AUTO_PULL=1 plane ...`. No network on normal runs.
 
 ## Auth — seats are PER-PROJECT identities
 
