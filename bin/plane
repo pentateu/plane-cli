@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 # plane — Plane ticket CLI shim (HomeTutor fleet).
 # Install (after merge to development): ln -s "$PWD/tools/plane-cli/bin/plane" ~/.local/bin/plane
-# Resolves through symlinks; fast-forward pulls AI_Tutor's development branch
-# before every run when the checkout is clean (skip with PLANE_NO_PULL=1).
+# Update policy (push-based, 2026-08-29): no auto-pull on run.
+# Run ./scripts/deploy.sh after pushing to origin/development to roll out.
+# Opt-in one-off pull: PLANE_AUTO_PULL=1 plane ...
 set -e
 SELF="$0"
 TARGET="$(readlink -f "$SELF" 2>/dev/null || realpath "$SELF" 2>/dev/null || true)"
@@ -12,7 +13,7 @@ if [ -z "$TARGET" ]; then
 fi
 DIR="$(cd "$(dirname "$TARGET")" && pwd)"
 REPO="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || cd "$DIR/.." && pwd)"
-if [ "${PLANE_NO_PULL:-0}" != "1" ] && [ -d "$REPO/.git" ]; then
+if [ "${PLANE_AUTO_PULL:-0}" == "1" ] && [ -d "$REPO/.git" ]; then
   if [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     git -C "$REPO" pull --ff-only -q origin development 2>/dev/null || true
   fi
