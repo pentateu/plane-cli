@@ -389,7 +389,8 @@ export async function run(argv: string[]): Promise<unknown> {
       const assigneeF = args.flags.assignee;
       if (typeof assigneeF === "string") {
         const wantedId = assigneeF === "me" ? await p.me() : await p.member(assigneeF);
-        items = items.filter((i: Record<string, unknown>) => ((i.assignees as string[]) ?? []).includes(wantedId));
+        const normAssignees = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string") : []);
+        items = items.filter((i: Record<string, unknown>) => normAssignees(i.assignees).includes(wantedId));
       }
       const parentF = args.flags.parent;
       if (typeof parentF === "string") {
@@ -433,7 +434,8 @@ export async function run(argv: string[]): Promise<unknown> {
         p.me(),
       ]);
       const progressId = requireStateId(sm, "progress");
-      const assignees = ((issue.assignees as string[]) ?? []).slice();
+      const normalizeIds = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string" && s.length > 0) : []);
+      const assignees = normalizeIds(issue.assignees).slice();
       const addMe = !assignees.includes(meId);
       if (addMe) assignees.push(meId);
       const stateChange = issue.state !== progressId;
@@ -450,10 +452,10 @@ export async function run(argv: string[]): Promise<unknown> {
         return { dryRun: true, requests: reqs };
       }
       if (Object.keys(patch).length) await p.patchIssue(ref.uuid, patch, ref.projectId);
-      let finalAssignees = addMe ? assignees : ((issue.assignees as string[]) ?? []);
+      let finalAssignees = addMe ? assignees : normalizeIds(issue.assignees);
       if (Object.keys(patch).length) {
         const after = (await p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`)) as Record<string, unknown>;
-        finalAssignees = (after.assignees as string[]) ?? finalAssignees;
+        finalAssignees = normalizeIds(after.assignees) ?? finalAssignees;
       }
       if (postComment) await p.postComment(ref.uuid, htmlEscape(commentText!), undefined, ref.projectId);
       return {

@@ -370,13 +370,15 @@ export class Plane {
       const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : 500);
       description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get ${ident}-${i.sequence_id} --full)`;
     }
+    const normAssignees = (v: unknown): string[] => (Array.isArray(v) ? (v as any[]).map((a) => (typeof a === "string" ? a : a?.id)).filter((s): s is string => typeof s === "string") : []);
+    const normLabels = (v: unknown): string[] => (Array.isArray(v) ? (v as any[]).map((a) => (typeof a === "string" ? a : a?.id)).filter((s): s is string => typeof s === "string") : []);
     const row: IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] } = {
       id: `${ident}-${i.sequence_id}`,
       title: String(i.name),
       state: sm[i.state] ?? `state:${String(i.state).slice(0, 8)}`,
       priority: i.priority === "none" ? null : i.priority ?? null,
-      assignees: ((i.assignees ?? []) as string[]).map((a) => names[a] ?? `member:${String(a).slice(0, 8)}`).sort(),
-      labels: ((i.labels ?? []) as string[]).map((l) => Object.entries(lm).find(([, v]) => v === l)?.[0] ?? `label:${String(l).slice(0, 8)}`),
+      assignees: normAssignees(i.assignees).map((a) => names[a] ?? `member:${String(a).slice(0, 8)}`).sort(),
+      labels: normLabels(i.labels).map((l) => Object.entries(lm).find(([, v]) => v === l)?.[0] ?? `label:${String(l).slice(0, 8)}`),
       parent: i.parent ? (seqByUuid[i.parent as string] ?? `page:${String(i.parent).slice(0, 8)}`) : null,
     };
     if (description !== undefined) row.description = description;
