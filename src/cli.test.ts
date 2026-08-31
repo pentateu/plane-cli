@@ -1006,6 +1006,69 @@ describe("parser contract", () => {
   });
 });
 
+describe("HT-313 object-shape assignees/labels (I-1 I-2)", () => {
+  test("get renders assignees/labels when Plane returns objects not ids", async () => {
+    const orig = ISSUES[0]!;
+    const savedAssignees = orig.assignees;
+    const savedLabels = orig.labels;
+    (orig as any).assignees = [{ id: "mb-dev1", display_name: "dev1" }];
+    (orig as any).labels = [{ id: "lb-plan" }];
+    try {
+      const d = (await run(["get", "HT-66", "--fields", "assignees,labels"])) as any;
+      expect(d.assignees).toEqual(["dev1"]);
+      expect(d.labels).toEqual(["type:plan"]);
+    } finally {
+      (orig as any).assignees = savedAssignees;
+      (orig as any).labels = savedLabels;
+    }
+  });
+
+  test("claim normalizes object assignees and avoids duplicate stringified objects (I-1)", async () => {
+    const orig = ISSUES.find((i) => i.id === "is-67")!;
+    const saved = orig.assignees;
+    (orig as any).assignees = [{ id: "mb-dev2", display_name: "dev2" }];
+    try {
+      const d = (await run(["claim", "67"])) as any;
+      const patch = calls.find((c) => c.method === "PATCH")!;
+      expect(patch.body).toEqual({ assignees: ["mb-dev2", "mb-dev1"], state: "st-progress" });
+      expect((patch.body as any).assignees).not.toContain("{");
+      expect(d.changed).toBe(true);
+    } finally {
+      (orig as any).assignees = saved;
+    }
+    (globalThis as any).__patchBody = undefined;
+    calls.length = 0;
+    (orig as any).assignees = [{ id: "mb-dev1" }];
+    try {
+      const d2 = (await run(["claim", "67"])) as any;
+      const patch2 = calls.find((c) => c.method === "PATCH")!;
+      expect(patch2.body).toEqual({ state: "st-progress" });
+      expect(d2.changed).toBe(true);
+    } finally {
+      (orig as any).assignees = saved;
+    }
+  });
+
+  test("list --label and --assignee filters handle object-shaped arrays (I-1)", async () => {
+    const orig = ISSUES[0]!;
+    const savedAssignees = orig.assignees;
+    const savedLabels = orig.labels;
+    (orig as any).assignees = [{ id: "mb-dev1" }];
+    (orig as any).labels = [{ id: "lb-plan" }];
+    try {
+      const d1 = (await run(["list", "--label", "type:plan"])) as any;
+      expect(d1.total).toBeGreaterThanOrEqual(1);
+      expect(d1.items.some((i: any) => i.id === "HT-66")).toBeTrue();
+      const d2 = (await run(["list", "--assignee", "dev1"])) as any;
+      expect(d2.total).toBeGreaterThanOrEqual(1);
+      expect(d2.items.some((i: any) => i.id === "HT-66")).toBeTrue();
+    } finally {
+      (orig as any).assignees = savedAssignees;
+      (orig as any).labels = savedLabels;
+    }
+  });
+});
+
 describe("identifier-aware refs (TC-17)", () => {
   const TC_STATES = [
     { id: "st2-backlog", name: "Backlog" },
