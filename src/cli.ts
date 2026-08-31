@@ -178,6 +178,11 @@ function htmlEscape(text: string): string {
     .join("");
 }
 
+function normalizeIdArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return (v as unknown[]).map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string" && s.length > 0);
+}
+
 const HELP = `plane — Ai Tutor ticket CLI (agent-only)
 
 CONTRACT
@@ -384,13 +389,12 @@ export async function run(argv: string[]): Promise<unknown> {
         const lid = lm[labelF];
         if (!lid)
           throw new UsageError("not-found", `unknown label '${labelF}'`, { valid: Object.keys(lm), suggestion: "plane sync then retry" });
-        items = items.filter((i: Record<string, unknown>) => ((i.labels as string[]) ?? []).includes(lid));
+        items = items.filter((i: Record<string, unknown>) => normalizeIdArray(i.labels).includes(lid));
       }
       const assigneeF = args.flags.assignee;
       if (typeof assigneeF === "string") {
         const wantedId = assigneeF === "me" ? await p.me() : await p.member(assigneeF);
-        const normAssignees = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string") : []);
-        items = items.filter((i: Record<string, unknown>) => normAssignees(i.assignees).includes(wantedId));
+        items = items.filter((i: Record<string, unknown>) => normalizeIdArray(i.assignees).includes(wantedId));
       }
       const parentF = args.flags.parent;
       if (typeof parentF === "string") {
@@ -434,8 +438,7 @@ export async function run(argv: string[]): Promise<unknown> {
         p.me(),
       ]);
       const progressId = requireStateId(sm, "progress");
-      const normalizeIds = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string" && s.length > 0) : []);
-      const assignees = normalizeIds(issue.assignees).slice();
+      const assignees = normalizeIdArray(issue.assignees).slice();
       const addMe = !assignees.includes(meId);
       if (addMe) assignees.push(meId);
       const stateChange = issue.state !== progressId;
@@ -452,10 +455,11 @@ export async function run(argv: string[]): Promise<unknown> {
         return { dryRun: true, requests: reqs };
       }
       if (Object.keys(patch).length) await p.patchIssue(ref.uuid, patch, ref.projectId);
-      let finalAssignees = addMe ? assignees : normalizeIds(issue.assignees);
+      let finalAssignees = addMe ? assignees : normalizeIdArray(issue.assignees);
       if (Object.keys(patch).length) {
         const after = (await p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`)) as Record<string, unknown>;
-        finalAssignees = normalizeIds(after.assignees) ?? finalAssignees;
+        finalAssignees = normalizeIdArray(after.assignees);
+        if (finalAssignees.length === 0) finalAssignees = normalizeIdArray(issue.assignees);
       }
       if (postComment) await p.postComment(ref.uuid, htmlEscape(commentText!), undefined, ref.projectId);
       return {
