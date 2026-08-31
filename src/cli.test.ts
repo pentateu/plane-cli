@@ -1036,10 +1036,12 @@ describe("HT-313 object-shape assignees/labels (I-1 I-2)", () => {
     } finally {
       (orig as any).assignees = saved;
     }
+    (globalThis as any).__patchBody = undefined;
+    calls.length = 0;
     (orig as any).assignees = [{ id: "mb-dev1" }];
     try {
       const d2 = (await run(["claim", "67"])) as any;
-      const patch2 = calls.filter((c) => c.method === "PATCH").at(-1)!;
+      const patch2 = calls.find((c) => c.method === "PATCH")!;
       expect(patch2.body).toEqual({ state: "st-progress" });
       expect(d2.changed).toBe(true);
     } finally {
