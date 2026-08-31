@@ -276,11 +276,11 @@ describe("PC4 — disk cache persists across invocations", () => {
   test("warm cache skips project/states/labels/member lookups entirely", async () => {
     const cache = new Cache(process.env.PLANE_CACHE!);
     cache.set(`project:Ai Tutor`, "pr-1");
-    cache.set("states", Object.fromEntries(STATES.map((s) => [s.name.toLowerCase().replace("in progress", "progress").replace("awaiting verification", "verify"), s.id])));
-    cache.set("labels", Object.fromEntries(LABELS.map((l) => [l.name, l.id])));
+    cache.set("states:pr-1", Object.fromEntries(STATES.map((s) => [s.name.toLowerCase().replace("in progress", "progress").replace("awaiting verification", "verify"), s.id])));
+    cache.set("labels:pr-1", Object.fromEntries(LABELS.map((l) => [l.name, l.id])));
     cache.set("members", Object.fromEntries(MEMBERS.map((m) => [m.id, m.display_name])));
     cache.set("member:dev1", "mb-dev1");
-    cache.set("seqmap", { "66": "is-66", "67": "is-67" });
+    cache.set("seqmap:pr-1", { "66": "is-66", "67": "is-67" });
     cache.set("relmap", { "is-66": { b: [], f: [] }, "is-67": { b: [], f: [] } });
     cache.save();
     const before = calls.length;
@@ -430,8 +430,8 @@ describe("get", () => {
     expect(JSON.stringify(d)).not.toMatch(/(is|mb|lb|st)-[0-9a-f]{6,}/);
 
     const cache = new Cache(process.env.PLANE_CACHE!);
-    cache.set("states", { todo: "st-todo" });
-    cache.set("seqmap", { "66": "is-66" });
+    cache.set("states:pr-1", { todo: "st-todo" });
+    cache.set("seqmap:pr-1", { "66": "is-66" });
     cache.save();
     const d2 = (await run(["get", "HT-66", "--fields", "state,parent"])) as Record<string, any>;
     expect(String(d2.state)).toMatch(/^state:/);
@@ -557,7 +557,7 @@ describe("state", () => {
     expect(d.changed).toBe(true);
 
     const cache = new Cache(process.env.PLANE_CACHE!);
-    cache.set("states", { todo: "st-todo", backlog: "st-backlog" });
+    cache.set("states:pr-1", { todo: "st-todo", backlog: "st-backlog" });
     cache.save();
     await expect(run(["state", "HT-67", "progress"])).rejects.toMatchObject({
       kind: "not-found",
@@ -856,7 +856,7 @@ describe("blocks / depends / unblocks", () => {
     await run(["blocks", "HT-66", "HT-67"]);
     const c = new Cache(process.env.PLANE_CACHE!);
     c.set("relmap", { "is-67": { b: ["is-66"], f: [] }, "is-66": { b: [], f: ["is-67"] } });
-    c.set("seqmap", { "66": "is-66", "67": "is-67" });
+    c.set("seqmap:pr-1", { "66": "is-66", "67": "is-67" });
     c.save();
     const g = (await run(["get", "HT-67", "--fields", "blockedBy"])) as Record<string, unknown>;
     expect(g.blockedBy).toEqual(["HT-66"]);

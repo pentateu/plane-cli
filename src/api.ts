@@ -224,7 +224,10 @@ export class Plane {
   }
 
   async stateMap(projectId: string = this.projectId()): Promise<Record<string, string>> {
-    const key = projectId === this.projectId() ? "states" : `states:${projectId}`;
+    // Key MUST include the project UUID: one host cache file serves multiple
+    // project checkouts (HT + HTC dirs), and a global "states" key made dir B
+    // read dir A's state UUIDs -> "State is not valid" on create.
+    const key = `states:${projectId}`;
     const cached = this.cache.fresh(key);
     if (cached) return cached as Record<string, string>;
     const page = (await this.request("GET", `${this.projectPathFor(projectId)}/states/`)) as Raw;
@@ -235,7 +238,8 @@ export class Plane {
   }
 
   async labelMap(projectId: string = this.projectId()): Promise<Record<string, string>> {
-    const key = projectId === this.projectId() ? "labels" : `labels:${projectId}`;
+    // Project-scoped — see stateMap comment (multi-project host cache).
+    const key = `labels:${projectId}`;
     const cached = this.cache.fresh(key);
     if (cached) return cached as Record<string, string>;
     const page = (await this.request("GET", `${this.projectPathFor(projectId)}/labels/`)) as Raw;
@@ -305,14 +309,16 @@ export class Plane {
     let ident: string;
     if (!ref.ident || ref.ident === "HT") {
       projectId = this.projectId();
-      ident = "HT";
+      ident = this.cfg.ident;
     } else {
       const proj = await this.resolveProjectByIdent(ref.ident);
       projectId = String(proj.id);
       ident = String(proj.identifier ?? ref.ident).toUpperCase();
     }
     const seq = ref.seq;
-    const mapKey = projectId === this.projectId() ? "seqmap" : `seqmap:${projectId}`;
+    // Project-scoped: sequence numbers restart per project (HT-1 and HTC-1 both
+    // exist), so a global seqmap misresolves refs across project dirs.
+    const mapKey = `seqmap:${projectId}`;
     const load = async (): Promise<Record<string, string>> => {
       const map: Record<string, string> = {};
       for (const i of await this.listIssues({}, 10, projectId)) map[String(i.sequence_id)] = i.id as string;
@@ -351,12 +357,12 @@ export class Plane {
   }
 
   async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations; ident?: string; projectId?: string }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
-    const ident = opts.ident ?? "HT";
+    const ident = opts.ident ?? this.cfg.ident;
     const names = opts.memberNames ?? (await this.memberNames());
     const lm = opts.labelNames ?? (await this.labelMap(opts.projectId));
     const sm = opts.stateTokens ?? inverse(await this.stateMap(opts.projectId));
     const seqByUuid: Record<string, string> = {};
-    const smKey = opts.projectId && opts.projectId !== this.projectId() ? `seqmap:${opts.projectId}` : "seqmap";
+    const smKey = `seqmap:${opts.projectId ?? this.projectId()}`;
     for (const [seq, uuid] of Object.entries(this.cache.stale(smKey) as Record<string, string> ?? {})) seqByUuid[uuid] = `${ident}-${seq}`;
     let description: string | undefined;
     if ("description_html" in i) {

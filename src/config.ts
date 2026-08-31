@@ -11,6 +11,10 @@ export type Config = {
   apiBase: string;
   workspace: string;
   projectName: string;
+  /** Ticket-prefix ident of the DEFAULT project (HT for Ai Tutor, HTC for
+   *  HomeTutor Company…). "HT-<seq>" and bare "<seq>" refs resolve against
+   *  the default project, so the ident must follow it per checkout. */
+  ident: string;
   projectId?: string;
 };
 
@@ -119,6 +123,7 @@ export function resolveConfig(opts: { seat?: string }): Config {
     apiBase,
     workspace: process.env.PLANE_WORKSPACE ?? env("HOMETUTOR_TICKETS_WORKSPACE") ?? "ai-tutor",
     projectName: process.env.PLANE_PROJECT_NAME ?? env("HOMETUTOR_TICKETS_PROJECT") ?? "Ai Tutor",
+    ident: process.env.PLANE_IDENT ?? env("HOMETUTOR_TICKETS_IDENT") ?? "HT",
     ...(projectId ? { projectId } : {}),
   };
 }

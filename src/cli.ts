@@ -306,12 +306,17 @@ export async function run(argv: string[]): Promise<unknown> {
       return { seat: cfg.seat, tokenSource: cfg.tokenSource, apiBase: cfg.apiBase, workspace: cfg.workspace, project: cfg.projectName, cache: Object.keys(cache.data) };
     }
     case "sync": {
+      // Capture the default project id BEFORE dropping `project:<name>` —
+      // projectId() resolves from that key when no explicit id is configured.
+      const pid = p.projectId();
       cache.drop(`project:${cfg.projectName}`);
-      cache.drop("states");
-      cache.drop("labels");
+      // Project-scoped map keys (multi-project host cache): drop only the
+      // current project's maps, never another checkout's.
+      cache.drop(`states:${pid}`);
+      cache.drop(`labels:${pid}`);
       cache.drop(`member:${cfg.seat}`);
       cache.drop("members");
-      cache.drop("seqmap");
+      cache.drop(`seqmap:${pid}`);
       await p.ensureProject();
       const [states, labels] = await Promise.all([p.stateMap(), p.labelMap()]);
       await p.member(cfg.seat);
@@ -567,15 +572,15 @@ export async function run(argv: string[]): Promise<unknown> {
       ];
       if (dryRun) return { dryRun: true, requests };
       const created = (await p.request("POST", `${p.projectPathFor(targetId)}/issues/`, payload)) as Record<string, unknown>;
-      cache.drop(projectId && projectId !== p.projectId() ? `seqmap:${projectId}` : "seqmap");
-      return { id: `${ident ?? "HT"}-${created.sequence_id}` };
+      cache.drop(`seqmap:${targetId}`);
+      return { id: `${ident ?? cfg.ident}-${created.sequence_id}` };
     }
   }
 }
 
 async function fetchAll(p: Plane, search: string): Promise<{ raw: Array<Record<string, unknown>> }> {
   const outArr = await p.listIssues(search ? { search } : {});
-  p.cache.set("seqmap", Object.fromEntries(outArr.map((i) => [String(i.sequence_id), i.id as string])));
+  p.cache.set(`seqmap:${p.projectId()}`, Object.fromEntries(outArr.map((i) => [String(i.sequence_id), i.id as string])));
   return { raw: outArr };
 }
 
