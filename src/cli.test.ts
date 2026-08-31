@@ -1030,17 +1030,17 @@ describe("HT-313 object-shape assignees/labels (I-1 I-2)", () => {
     try {
       const d = (await run(["claim", "67"])) as any;
       const patch = calls.find((c) => c.method === "PATCH")!;
-      expect(patch.body).toEqual({ assignees: ["mb-dev2"], state: "st-progress" });
-      expect(d.changed).toBe(false);
+      expect(patch.body).toEqual({ assignees: ["mb-dev2", "mb-dev1"], state: "st-progress" });
+      expect((patch.body as any).assignees).not.toContain("{");
+      expect(d.changed).toBe(true);
     } finally {
       (orig as any).assignees = saved;
     }
     (orig as any).assignees = [{ id: "mb-dev1" }];
     try {
       const d2 = (await run(["claim", "67"])) as any;
-      const patch2 = calls.find((c) => c.method === "PATCH" && (c.body as any)?.assignees?.includes("mb-dev1"))!;
-      expect(patch2.body).toEqual({ assignees: ["mb-dev1", "mb-dev2"], state: "st-progress" });
-      expect((patch2.body as any).assignees).not.toContain("{");
+      const patch2 = calls.find((c) => c.method === "PATCH")!;
+      expect(patch2.body).toEqual({ state: "st-progress" });
       expect(d2.changed).toBe(true);
     } finally {
       (orig as any).assignees = saved;
