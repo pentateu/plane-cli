@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { homedir } from "node:os";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
@@ -184,15 +185,17 @@ function normalizeIdArray(v: unknown): string[] {
 }
 
 async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
-  const platformTokenPath = process.env.PLATFORM_TOKEN_PATH ?? "/run/agenix/platform-token";
+  const platformTokenPath = process.env.PLATFORM_TOKEN_PATH ?? "";
   let platformToken = process.env.PLATFORM_TOKEN ?? "";
   if (!platformToken) {
-    try {
-      platformToken = (await Bun.file(platformTokenPath).text()).trim();
-    } catch {
-      throw new UsageError("auth", `PLATFORM_TOKEN not found: set PLATFORM_TOKEN env or have ${platformTokenPath} 0400`);
+    for (const p of [platformTokenPath, "/run/agenix/platform-token", `${homedir()}/.config/platform-token`].filter(Boolean)) {
+      try {
+        const t = (await Bun.file(p).text()).trim();
+        if (t) { platformToken = t; break; }
+      } catch { /* try next */ }
     }
   }
+  if (!platformToken) throw new UsageError("auth", "PLATFORM_TOKEN not found: set PLATFORM_TOKEN env or have /run/agenix/platform-token or ~/.config/platform-token 0400");
   if (!platformToken) throw new UsageError("auth", "PLATFORM_TOKEN empty");
   const email = asSubject.includes("@") ? asSubject : `${asSubject}@iswe.co.nz`;
   const issuerBase = "https://auth.iswe.co.nz";
