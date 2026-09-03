@@ -12,7 +12,7 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments"]);
 
 type Args = {
@@ -183,6 +183,63 @@ function normalizeIdArray(v: unknown): string[] {
   return (v as unknown[]).map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string" && s.length > 0);
 }
 
+async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
+  const platformTokenPath = process.env.PLATFORM_TOKEN_PATH ?? "/run/agenix/platform-token";
+  let platformToken = process.env.PLATFORM_TOKEN ?? "";
+  if (!platformToken) {
+    try {
+      platformToken = (await Bun.file(platformTokenPath).text()).trim();
+    } catch {
+      throw new UsageError("auth", `PLATFORM_TOKEN not found: set PLATFORM_TOKEN env or have ${platformTokenPath} 0400`);
+    }
+  }
+  if (!platformToken) throw new UsageError("auth", "PLATFORM_TOKEN empty");
+  const email = asSubject.includes("@") ? asSubject : `${asSubject}@iswe.co.nz`;
+  const issuerBase = "https://auth.iswe.co.nz";
+  const ccRes = await fetch(`${issuerBase}/application/o/token/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: "platform",
+      client_secret: platformToken,
+      scope: "openid profile email",
+    }),
+  });
+  if (!ccRes.ok) throw new UsageError("auth", `platform client_credentials failed ${ccRes.status}`);
+  const ccJson: any = await ccRes.json();
+  const platformJwt = ccJson.access_token as string;
+  if (!platformJwt) throw new UsageError("auth", "platform JWT missing");
+  const exRes = await fetch(`${issuerBase}/application/o/token/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      client_id: "platform",
+      client_secret: platformToken,
+      subject_token: platformJwt,
+      subject_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      requested_token_type: "urn:ietf:params:oauth:token-type:access_token",
+      requested_subject: email,
+      scope: "openid profile email",
+      aud,
+      audience: aud,
+    }),
+  });
+  if (!exRes.ok) {
+    const txt = await exRes.text().catch(() => "");
+    throw new UsageError("auth", `token-exchange for ${email} aud=${aud} failed ${exRes.status} ${txt.slice(0, 200)}`);
+  }
+  const exJson: any = await exRes.json();
+  const devJwt = exJson.access_token as string;
+  if (!devJwt) throw new UsageError("auth", "dev JWT missing");
+  try {
+    const payload = JSON.parse(Buffer.from(devJwt.split(".")[1], "base64url").toString());
+    console.error(JSON.stringify({ jwt: { sub: payload.sub, aud: payload.aud, exp: payload.exp, iss: payload.iss } }));
+  } catch { /* ignore */ }
+  return devJwt;
+}
+
 const HELP = `plane — Ai Tutor ticket CLI (agent-only)
 
 CONTRACT
@@ -203,9 +260,9 @@ CONTRACT
   edge => changed:false, zero writes)
   claim --comment posts ONLY when something changed (retry-safe); state --comment always posts
   (it IS the payload, e.g. close-out notes) and reports commentPosted:true
-  auth: --seat > $PLANE_SEAT; token from project-scoped .plane-seats (walks up from
-        cwd, gitignored, keys HOMETUTOR_TICKETS_TOKEN_<SEAT>) > legacy
-        ~/.config/plane/seats.env > $PLANE_TOKEN / exported env var
+   auth: --seat > $PLANE_SEAT; --as dev1 uses PLATFORM_TOKEN 0400 -> dev1 JWT aud=plane via token-exchange (INFRA-SSO-2, no password); token from project-scoped .plane-seats (walks up from
+         cwd, gitignored, keys HOMETUTOR_TICKETS_TOKEN_<SEAT>) > legacy
+         ~/.config/plane/seats.env > $PLANE_TOKEN / exported env var
 
 VERBS
   whoami                          resolve seat -> workspace member
@@ -248,7 +305,17 @@ EXAMPLES
   plane blocks HT-151 HT-184 && plane list --blocked-by HT-151`;
 
 export async function run(argv: string[]): Promise<unknown> {
-  const args = parseArgs(argv);
+  // INFRA-SSO-2: handle --as as global flag before verb (ot style) — plane verb is argv[0] but --as may precede it
+  let asFlag: string | undefined;
+  const filtered: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--as" && i + 1 < argv.length) { asFlag = argv[++i]; continue; }
+    if (a.startsWith("--as=")) { asFlag = a.slice(5); continue; }
+    filtered.push(a);
+  }
+  const args = parseArgs(filtered);
+  if (asFlag) args.flags.as = asFlag;
   if (args.verb === "help") {
     process.stdout.write(HELP + "\n");
     process.exit(0);
@@ -257,7 +324,13 @@ export async function run(argv: string[]): Promise<unknown> {
     throw new UsageError("validation", `unknown verb '${args.verb}'`, { valid: [...VERBS], suggestion: "plane help" });
   }
 
-  const cfg: Config = resolveConfig({ seat: typeof args.flags.seat === "string" ? args.flags.seat : undefined });
+  let cfg: Config = resolveConfig({ seat: typeof args.flags.seat === "string" ? args.flags.seat : typeof args.flags.as === "string" ? args.flags.as : undefined });
+  if (typeof args.flags.as === "string") {
+    const asSub = String(args.flags.as);
+    const aud = "plane";
+    const devJwt = await resolveAsToken(asSub, aud);
+    cfg = { ...cfg, token: devJwt, seat: asSub.includes("@") ? asSub.split("@")[0] : asSub } as Config;
+  }
   const cache = new Cache(process.env.PLANE_CACHE ?? `${process.env.HOME}/.config/plane/cache.json`);
   activeCache = cache;
   const p = new Plane(cfg, cache);
