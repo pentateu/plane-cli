@@ -104,7 +104,7 @@ export class Plane {
       try {
         return await fetch(`${this.cfg.apiBase}${path}`, {
           method,
-          headers: { "X-Api-Key": this.cfg.token, "Content-Type": "application/json" },
+          headers: { "X-Api-Key": this.cfg.token, ...(this.cfg.token.split(".").length === 3 ? { Authorization: `Bearer ${this.cfg.token}` } : {}), "Content-Type": "application/json" },
           body: body === undefined ? undefined : JSON.stringify(body),
           signal: AbortSignal.timeout(15_000),
         });
