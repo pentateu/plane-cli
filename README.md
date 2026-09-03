@@ -1,6 +1,6 @@
 # plane-cli
 
-Agent-only CLI for the Ai Tutor workspace's Plane tracker (https://rafael-linux.tail8a19c.ts.net) — tickets across all workspace projects, addressed by `<IDENT>-<seq>` handles (`HT-17`, `TC-17`, `XT-2`, …; `plane projects` lists live identifiers).
+Agent-only CLI for the Ai Tutor workspace's Plane tracker (https://tools-small.tail8a19c.ts.net) — tickets across all workspace projects, addressed by `<IDENT>-<seq>` handles (`HT-17`, `TC-17`, `XT-2`, …; `plane projects` lists live identifiers).
 Companion to `outline-cli` (`ot`). Process owner: `docs/REQUESTS.md` in
 pentateu/AI_Tutor; full usage doc: `docs/ops/PLANE_CLI.md` there.
 

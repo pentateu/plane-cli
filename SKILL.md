@@ -1,6 +1,6 @@
 ---
 name: plane-cli
-description: Use when reading or writing tickets across the workspace's projects on Plane (https://rafael-linux.tail8a19c.ts.net) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
+description: Use when reading or writing tickets across the workspace's projects on Plane (https://tools-small.tail8a19c.ts.net) — claiming work, filing bugs/features/ops tasks, moving states, commenting, or replying to review comments. Replaces raw curl against the Plane API.
 ---
 
 # plane-cli

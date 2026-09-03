@@ -8,7 +8,7 @@
 # Usage:
 #   ./scripts/deploy.sh              # pull locally, then push to fleet
 #   ./scripts/deploy.sh --local-only # only pull locally, don't ssh
-#   FLEET="alpha vps-test" ./scripts/deploy.sh  # subset
+#   FLEET="alpha tools-small" ./scripts/deploy.sh  # subset
 #
 # Fleet is defined in Infra/README.md; tailscale names are primary, LAN IPs fallback.
 # The repo is expected at ~/Development/plane-cli on each host on that host).
@@ -43,11 +43,12 @@ fi
 # Primary via tailscale, fallback via LAN IP. Add/remove hosts here when fleet changes.
 # Keep in sync with Infra/README.md and Infra/linux-note/INVENTORY.md
 # Uses plain function for bash 3.2 (macOS) compat — no associative arrays.
-ALL_HOSTS="alpha vps-test jon-vps plexypi"
+ALL_HOSTS="alpha tools-small jon-vps plexypi"
 get_candidates() {
   case "$1" in
-    alpha) echo "rafael@rafael-linux.tail8a19c.ts.net rafael@rafael-linux.local rafael@192.168.0.53" ;;
-    vps-test) echo "root@vps-test.tail8a19c.ts.net root@192.168.0.10" ;;
+    alpha) echo "rafael@aorus-server.tail8a19c.ts.net rafael@aorus-server.local rafael@192.168.0.162" ;;
+    tools-small) echo "root@tools-small.tail8a19c.ts.net root@192.168.0.10" ;;
+    vps-test) echo "root@tools-small.tail8a19c.ts.net root@192.168.0.10" ;;
     jon-vps) echo "root@jon-vps.tail8a19c.ts.net root@167.86.84.230" ;;
     plexypi) echo "rafael@plexypi.tail8a19c.ts.net rafael@plexypi.local" ;;
     macos-vm) echo "rafael@macos-vm.tail8a19c.ts.net rafael@100.67.238.71" ;;
@@ -55,7 +56,7 @@ get_candidates() {
   esac
 }
 is_known_host() {
-  case "$1" in alpha|vps-test|jon-vps|plexypi|macos-vm) return 0;; *) return 1;; esac
+  case "$1" in alpha|tools-small|vps-test|jon-vps|plexypi|macos-vm) return 0;; *) return 1;; esac
 }
 
 # Allow FLEET env to filter: "alpha vps-test" etc.
