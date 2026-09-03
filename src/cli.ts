@@ -324,12 +324,24 @@ export async function run(argv: string[]): Promise<unknown> {
     throw new UsageError("validation", `unknown verb '${args.verb}'`, { valid: [...VERBS], suggestion: "plane help" });
   }
 
-  let cfg: Config = resolveConfig({ seat: typeof args.flags.seat === "string" ? args.flags.seat : typeof args.flags.as === "string" ? args.flags.as : undefined });
+  let cfg: Config;
   if (typeof args.flags.as === "string") {
     const asSub = String(args.flags.as);
     const aud = "plane";
     const devJwt = await resolveAsToken(asSub, aud);
-    cfg = { ...cfg, token: devJwt, seat: asSub.includes("@") ? asSub.split("@")[0] : asSub } as Config;
+    const url = process.env.PLANE_URL;
+    const apiBase = (process.env.PLANE_API_BASE ?? (url ? `${url.replace(/\/$/, "")}/api/v1` : "https://tools-small.tail8a19c.ts.net/api/v1")).replace(/\/$/, "");
+    cfg = {
+      seat: asSub.includes("@") ? asSub.split("@")[0] : asSub,
+      token: devJwt,
+      tokenSource: "env",
+      apiBase,
+      workspace: process.env.PLANE_WORKSPACE ?? "ai-tutor",
+      projectName: process.env.PLANE_PROJECT_NAME ?? "Ai Tutor",
+      ident: process.env.PLANE_IDENT ?? "HT",
+    } as Config;
+  } else {
+    cfg = resolveConfig({ seat: typeof args.flags.seat === "string" ? args.flags.seat : undefined });
   }
   const cache = new Cache(process.env.PLANE_CACHE ?? `${process.env.HOME}/.config/plane/cache.json`);
   activeCache = cache;
