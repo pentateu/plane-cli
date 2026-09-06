@@ -674,6 +674,61 @@ describe("create / sub", () => {
   });
 });
 
+describe("uncomment", () => {
+  function useHygieneRouter() {
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+      const cd = path.match(/\/issues\/(is-\d+)\/comments\/(.+)\/$/);
+      if (cd && _m === "DELETE") {
+        globalThis.__comments = (globalThis.__comments ?? []).filter((c: any) => c.id !== cd[2]);
+        return { status: 204 };
+      }
+      const cm = path.match(/\/issues\/(is-\d+)\/comments\/$/);
+      if (cm) return { status: 200, json: { results: globalThis.__comments } };
+      const id = path.match(/\/issues\/(is-\d+)\/$/);
+      if (id) return { status: 200, json: ISSUES.find((i) => i.id === id[1])! };
+      return { status: 404 };
+    };
+  }
+
+  test("uncomment deletes the numbered comment behind --yes (INFRA-53)", async () => {
+    useHygieneRouter();
+    const d = (await run(["uncomment", "HT-66", "c1", "--yes"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-66", n: "c1", deleted: true });
+    expect(calls.some((c) => c.method === "DELETE" && /\/comments\/cm-0\/$/.test(c.path))).toBeTrue();
+  });
+
+  test("uncomment without --yes refuses with a confirm hint (INFRA-53)", async () => {
+    useHygieneRouter();
+    let caught: any;
+    try {
+      await run(["uncomment", "HT-66", "c1"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.suggestion)).toContain("--yes");
+    expect(calls.some((c) => c.method === "DELETE")).toBeFalse();
+  });
+
+  test("uncomment of a missing handle lists live handles (INFRA-53)", async () => {
+    useHygieneRouter();
+    let caught: any;
+    try {
+      await run(["uncomment", "HT-66", "c9", "--yes"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+    expect(caught.valid).toEqual(["c1", "c2"]);
+  });
+});
+
 describe("states / labels / modules lookups (PC5)", () => {
   test("states lists tokens with ids", async () => {
     const d = (await run(["states"])) as Record<string, any>;

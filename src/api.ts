@@ -404,6 +404,10 @@ export class Plane {
     }));
   }
 
+  async deleteComment(uuid: string, commentId: string, projectId: string = this.projectId()): Promise<void> {
+    await this.request("DELETE", `${this.projectPathFor(projectId)}/issues/${uuid}/comments/${commentId}/`);
+  }
+
   postComment(uuid: string, html: string, parent?: string, projectId: string = this.projectId()): Promise<Raw> {
     const body: Raw = { comment_html: html };
     if (parent) body.parent = parent;

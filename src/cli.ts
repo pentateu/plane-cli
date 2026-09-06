@@ -11,10 +11,10 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
 
 type Args = {
   verb: string;
@@ -237,7 +237,7 @@ async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
   const devJwt = exJson.access_token as string;
   if (!devJwt) throw new UsageError("auth", "dev JWT missing");
   try {
-    const payload = JSON.parse(Buffer.from(devJwt.split(".")[1], "base64url").toString());
+    const payload = JSON.parse(Buffer.from(devJwt.split(".")[1] ?? "", "base64url").toString());
     console.error(JSON.stringify({ jwt: { sub: payload.sub, aud: payload.aud, exp: payload.exp, iss: payload.iss } }));
   } catch { /* ignore */ }
   return devJwt;
@@ -285,6 +285,7 @@ VERBS
   comments HT-N                   numbered thread c1,c2,… oldest first
   reply HT-N cM "text"            threaded answer to comment cM (review-loop close-out)
   comment HT-N "text"             top-level comment ('--file -' reads stdin)
+  uncomment HT-N cM --yes       delete comment cM (destructive, needs --yes)
   blocks HT-A HT-B                edge: A blocks B — persisted natively on Plane
   depends HT-B HT-A               same edge spelled from the dependent side
   unblocks HT-A HT-B              remove that edge
@@ -572,7 +573,7 @@ export async function run(argv: string[]): Promise<unknown> {
       // Same member index claim uses (roster-local short seats); full mail also matches email exactly.
       let targetId = "";
       try {
-        targetId = await p.member(target.includes("@") ? target.split("@")[0] : target);
+        targetId = await p.member(target.includes("@") ? (target.split("@")[0] ?? target) : target);
       } catch {
         targetId = "";
       }
@@ -680,6 +681,24 @@ export async function run(argv: string[]): Promise<unknown> {
       await p.postComment(ref.uuid, html, parentId, ref.projectId);
       const listAfter = await p.comments(ref.uuid, ref.projectId);
       return { id: `${ref.ident}-${ref.seq}`, ...(replyTo ? { replyTo } : {}), n: `c${listAfter.length}` };
+    }
+    case "uncomment": {
+      const ref = await p.issueRef(requireTicket(args.positionals));
+      const handle = String(args.positionals[1] ?? "");
+      const m = handle.match(/^c(\d+)$/);
+      if (!m) throw new UsageError("validation", `invalid comment handle '${handle}'`, { valid: ["c<N>"], suggestion: `plane comments ${positional} to re-list` });
+      if (args.flags.yes !== true)
+        throw new UsageError("validation", "uncomment is destructive — re-run with --yes to confirm", { suggestion: `plane uncomment ${positional} ${handle} --yes` });
+      const list = await p.comments(ref.uuid, ref.projectId);
+      const target = list.find((c) => c.n === Number(m[1]));
+      if (!target)
+        throw new UsageError("not-found", `comment ${handle} not found on ${positional}`, {
+          valid: list.map((c) => `c${c.n}`),
+          suggestion: `plane comments ${positional} to re-list`,
+        });
+      if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/${target.id}/` }] };
+      await p.deleteComment(ref.uuid, target.id, ref.projectId);
+      return { id: `${ref.ident}-${ref.seq}`, n: handle, deleted: true };
     }
     case "create":
     case "sub": {
