@@ -1339,3 +1339,50 @@ describe("identifier-aware refs (TC-17)", () => {
     expect(String(caught.message)).toContain("HT-16 not found");
   });
 });
+
+describe("assign", () => {
+  test("dry-run shows PATCH with the target member UUID and sends nothing", async () => {
+    const d = (await run(["assign", "HT-66", "rafael", "--dry-run"])) as Record<string, any>;
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+    expect(d.requests[0]).toEqual({
+      method: "PATCH",
+      url: expect.stringContaining("/issues/is-66/"),
+      body: { assignees: ["mb-rafael"] },
+    });
+  });
+
+  test("assigns + posts once; repeat returns changed:false with no dup comment", async () => {
+    const d = (await run(["assign", "67", "rafael", "--comment", "needs your call"])) as Record<string, any>;
+    expect(calls.find((c) => c.method === "PATCH")!.body).toEqual({ assignees: ["mb-rafael"] });
+    expect(d).toMatchObject({ id: "HT-67", assignee: "rafael", changed: true, commentPosted: true });
+    const postsAfterFirst = calls.filter((c) => c.path.endsWith("/comments/")).length;
+    const d2 = (await run(["assign", "67", "rafael", "--comment", "needs your call"])) as Record<string, any>;
+    expect(d2.changed).toBe(false);
+    expect(d2.commentPosted).toBe(false);
+    expect(calls.filter((c) => c.path.endsWith("/comments/")).length).toBe(postsAfterFirst);
+  });
+
+  test("full mail resolves to the same member", async () => {
+    const d = (await run(["assign", "HT-66", "rafael@x", "--dry-run"])) as Record<string, any>;
+    expect(d.requests[0].body).toEqual({ assignees: ["mb-rafael"] });
+  });
+
+  test("unknown ticket -> not-found; unknown seat -> validation with valid list", async () => {
+    await expect(run(["assign", "HT-999", "rafael"])).rejects.toMatchObject({ kind: "not-found" });
+    let caught: any;
+    try {
+      await run(["assign", "HT-66", "nosuchseat"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(caught.exitCode).toBe(4);
+    expect(caught.valid).toContain("rafael");
+  });
+
+  test("missing seat is a loud usage error and sends nothing", async () => {
+    const before = calls.filter((c) => c.method !== "GET").length;
+    await expect(run(["assign", "HT-66"])).rejects.toMatchObject({ kind: "validation" });
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(before);
+  });
+});

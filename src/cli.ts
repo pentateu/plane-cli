@@ -11,7 +11,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments"]);
@@ -279,6 +279,8 @@ VERBS
        [--search q] [--page N]    --blocked-by = the "what can start now" query:
                                   tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
+  assign HT-N <seat|member-mail> [--comment "…"]
+                                  assign another seat/member (single assignee replace)
   state HT-N <state> [--comment "…"]
   comments HT-N                   numbered thread c1,c2,… oldest first
   reply HT-N cM "text"            threaded answer to comment cM (review-loop close-out)
@@ -301,6 +303,7 @@ ENV
 
 EXAMPLES
   plane claim HT-66 --comment "starting impl"
+  plane assign HT-66 rafael --comment "needs your call"
   plane get HT-66 --comments --fields id,state,description
   plane reply HT-66 c3 "fixed in a925b68 — guard added, tests green"
   plane state HT-66 verify --comment "branch feature/x @ sha"
@@ -556,6 +559,53 @@ export async function run(argv: string[]): Promise<unknown> {
         changed,
         ...(commentText ? { commentPosted: postComment } : {}),
         assignees: (await p.memberNamesPublic(finalAssignees)).sort(),
+      };
+    }
+    case "assign": {
+      const target = args.positionals[1];
+      if (!target)
+        throw new UsageError("validation", "assign needs a seat or member mail", {
+          valid: ["plane assign HT-N <seat|member-mail>"],
+          suggestion: "plane assign HT-66 rafael",
+        });
+      const ref = await p.issueRef(requireTicket(args.positionals));
+      // Same member index claim uses (roster-local short seats); full mail also matches email exactly.
+      let targetId = "";
+      try {
+        targetId = await p.member(target.includes("@") ? target.split("@")[0] : target);
+      } catch {
+        targetId = "";
+      }
+      if (!targetId) {
+        const members = (await p.request("GET", `${p.base()}/members/`)) as Array<Record<string, string>>;
+        if (target.includes("@")) targetId = members.find((x) => x.email === target)?.id ?? "";
+        if (!targetId)
+          throw new UsageError("validation", `unknown seat '${target}'`, {
+            valid: members.map((x) => String(x.display_name ?? x.email)),
+            suggestion: "plane sync then retry",
+          });
+      }
+      const issue = (await p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`)) as Record<string, unknown>;
+      const current = normalizeIdArray(issue.assignees);
+      const changed = !(current.length === 1 && current[0] === targetId);
+      const commentText = typeof args.flags.comment === "string" ? args.flags.comment : undefined;
+      const postComment = Boolean(commentText) && changed;
+      if (dryRun) {
+        const reqs: Array<Record<string, unknown>> = [];
+        if (changed)
+          reqs.push({ method: "PATCH", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`, body: { assignees: [targetId] } });
+        if (postComment)
+          reqs.push({ method: "POST", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText!) } });
+        return { dryRun: true, requests: reqs };
+      }
+      if (changed) await p.patchIssue(ref.uuid, { assignees: [targetId] }, ref.projectId);
+      if (postComment) await p.postComment(ref.uuid, htmlEscape(commentText!), undefined, ref.projectId);
+      const names = await p.memberNamesPublic([targetId]);
+      return {
+        id: `${ref.ident}-${ref.seq}`,
+        assignee: names[0],
+        changed,
+        ...(commentText ? { commentPosted: postComment } : {}),
       };
     }
     case "state": {
