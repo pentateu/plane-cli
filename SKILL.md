@@ -27,10 +27,16 @@ live ones (identifiers are renamed on the board from time to time).
 
 ## Auth
 
-Seats are PER-PROJECT identities — `dev1` here and `dev1` in another project
-are different accounts; this repo's `.plane-seats` holds THIS project's fleet
-tokens only. Seat resolution: `--seat <name>` > `$PLANE_SEAT`. Token
-resolution, in order:
+Two paths:
+
+1. **SSO (preferred, 2026-09):** `plane --as <seat>` — one `PLATFORM_TOKEN`
+   (0400 at `/run/agenix/platform-token`, or `~/.config/platform-token`, or
+   `$PLATFORM_TOKEN`) is exchanged at `auth.iswe.co.nz` for a 5m JWT with
+   `aud=plane` and `sub <seat>@iswe.co.nz`. No `.plane-seats` token needed.
+2. **Legacy:** seats are PER-PROJECT identities — `dev1` here and `dev1` in
+   another project are different accounts; this repo's `.plane-seats` holds
+   THIS project's fleet tokens only. Seat resolution: `--seat <name>` >
+   `$PLANE_SEAT`. Token resolution, in order:
 
 1. **Project-scoped `.plane-seats`** — walks up from your current directory
    (gitignored, chmod 600, at the repo root). Keys:
@@ -38,8 +44,9 @@ resolution, in order:
 2. Legacy `~/.config/plane/seats.env` (same keys).
 3. `$PLANE_TOKEN` or an exported `$HOMETUTOR_TICKETS_TOKEN_<SEAT>`.
 
-Always use YOUR OWN seat — attribution lands on the board. If the token is
-missing, `plane` exits 2 telling you exactly which key to add to `.plane-seats`.
+Always use YOUR OWN seat (`--as dev1` or `--seat dev1`) — attribution lands
+on the board. If the token is missing, `plane` exits 2 telling you exactly
+which key to add to `.plane-seats`.
 The admin bootstrap token is never used implicitly.
 
 ## Decision trees
