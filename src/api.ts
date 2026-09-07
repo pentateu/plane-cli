@@ -219,6 +219,7 @@ export class Plane {
     if (!proj)
       throw new ApiError("not-found", `project '${this.cfg.projectName}' not found in workspace '${this.cfg.workspace}'`, {
         valid: list.map((p) => p.name),
+        suggestion: "plane projects to list available projects",
       });
     this.cache.set(key, proj.id);
   }

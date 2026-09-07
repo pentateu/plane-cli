@@ -292,6 +292,18 @@ describe("auth & config", () => {
     }
   });
 
+  test("unknown project suggests the projects listing (INFRA-58)", async () => {
+    process.env.PLANE_PROJECT_NAME = "No Such Project";
+    let caught: any;
+    try {
+      await run(["get", "HT-66"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+    expect(String(caught.suggestion)).toContain("plane projects");
+  });
+
   test("whoami resolves exact seat member", async () => {
     capture(console, "log");
     const d = (await run(["whoami"])) as Record<string, unknown>;
