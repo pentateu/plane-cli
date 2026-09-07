@@ -11,7 +11,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
@@ -279,6 +279,7 @@ VERBS
        [--search q] [--page N]    --blocked-by = the "what can start now" query:
                                   tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
+  unclaim HT-N                   remove self from assignees (idempotent)
   assign HT-N <seat|member-mail> [--comment "…"]
                                   assign another seat/member (single assignee replace)
   state HT-N <state> [--comment "…"]
@@ -708,6 +709,26 @@ export async function run(argv: string[]): Promise<unknown> {
       if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/` }] };
       await p.deleteIssue(ref.uuid, ref.projectId);
       return { id: `${ref.ident}-${ref.seq}`, deleted: true };
+    }
+    case "unclaim": {
+      const ref = await p.issueRef(requireTicket(args.positionals));
+      const [issue, meId] = await Promise.all([
+        p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>,
+        p.me(),
+      ]);
+      const assignees = normalizeIdArray(issue.assignees).slice();
+      const changed = assignees.includes(meId);
+      const commentText = typeof args.flags.comment === "string" ? args.flags.comment : undefined;
+      if (dryRun) {
+        const reqs: Array<Record<string, unknown>> = [];
+        if (changed)
+          reqs.push({ method: "PATCH", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`, body: { assignees: assignees.filter((a) => a !== meId) } });
+        if (commentText && changed)
+          reqs.push({ method: "POST", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/`, body: { comment_html: htmlEscape(commentText!) } });
+        return { dryRun: true, requests: reqs };
+      }
+      if (changed) await p.patchIssue(ref.uuid, { assignees: assignees.filter((a) => a !== meId) }, ref.projectId);
+      return { id: `${ref.ident}-${ref.seq}`, changed };
     }
     case "create":
     case "sub": {

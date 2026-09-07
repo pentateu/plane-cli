@@ -784,6 +784,23 @@ describe("delete", () => {
   });
 });
 
+describe("unclaim", () => {
+  test("unclaim removes self and reports changed (INFRA-55)", async () => {
+    useWriteRouter();
+    const d = (await run(["unclaim", "HT-66"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-66", changed: true });
+    const patch = calls.find((c) => c.method === "PATCH");
+    expect(patch!.body).toEqual({ assignees: [] });
+  });
+
+  test("unclaim when absent is idempotent with zero writes (INFRA-55)", async () => {
+    useWriteRouter();
+    const d = (await run(["unclaim", "HT-67"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-67", changed: false });
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+  });
+});
+
 describe("states / labels / modules lookups (PC5)", () => {
   test("states lists tokens with ids", async () => {
     const d = (await run(["states"])) as Record<string, any>;
