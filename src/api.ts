@@ -303,7 +303,7 @@ export class Plane {
     return out;
   }
 
-  async issueRef(input: string): Promise<{ uuid: string; seq: number; ident: string; projectId: string }> {
+  async issueRef(input: string, opts: { fresh?: boolean } = {}): Promise<{ uuid: string; seq: number; ident: string; projectId: string }> {
     const ref = parseTicketRef(input);
     let projectId: string;
     let ident: string;
@@ -325,9 +325,16 @@ export class Plane {
       this.cache.set(mapKey, map);
       return map;
     };
-    let map = (this.cache.fresh(mapKey) ?? (await load())) as Record<string, string>;
+    // Mutating verbs pass { fresh: true } so a 300s-stale seqmap can never
+    // aim a write at a deleted uuid (INFRA-56). Reads keep the cached map.
+    let map: Record<string, string>;
+    if (opts.fresh) {
+      map = await load();
+    } else {
+      map = (this.cache.fresh(mapKey) ?? (await load())) as Record<string, string>;
+    }
     let uuid = map[String(seq)];
-    if (!uuid) {
+    if (!uuid && !opts.fresh) {
       map = await load();
       uuid = map[String(seq)];
     }

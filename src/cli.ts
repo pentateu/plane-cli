@@ -102,7 +102,7 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
   // "depends HT-B HT-A" is the same directed edge as "blocks HT-A HT-B"
   const [blockerRef, blockedRef] = args.verb === "depends" ? ([rawB, rawA] as const) : ([rawA, rawB] as const);
 
-  const [blocker, blocked] = await Promise.all([p.issueRef(blockerRef), p.issueRef(blockedRef)]);
+  const [blocker, blocked] = await Promise.all([p.issueRef(blockerRef, { fresh: true }), p.issueRef(blockedRef, { fresh: true })]);
   if (blocker.uuid === blocked.uuid)
     throw new UsageError("validation", `self-edge rejected — both refs resolve to ${blocker.ident}-${blocker.seq}`, { valid: ["two distinct tickets"] });
 
@@ -525,7 +525,7 @@ export async function run(argv: string[]): Promise<unknown> {
       return { items: rows, total: items.length, page, nextPage: page * pageSize < items.length ? page + 1 : null };
     }
     case "claim": {
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const [issue, sm, meId] = await Promise.all([
         p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>,
         p.stateMap(ref.projectId),
@@ -571,7 +571,7 @@ export async function run(argv: string[]): Promise<unknown> {
           valid: ["plane assign HT-N <seat|member-mail>"],
           suggestion: "plane assign HT-66 rafael",
         });
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       // Same member index claim uses (roster-local short seats); full mail also matches email exactly.
       let targetId = "";
       try {
@@ -616,7 +616,7 @@ export async function run(argv: string[]): Promise<unknown> {
       if (!VALID_STATES.includes(target)) {
         throw new UsageError("validation", `invalid state '${target}'`, { valid: VALID_STATES });
       }
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const [sm, issue] = await Promise.all([p.stateMap(ref.projectId), p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>]);
       const targetId = requireStateId(sm, target);
       const sameState = issue.state === targetId;
@@ -648,7 +648,7 @@ export async function run(argv: string[]): Promise<unknown> {
     case "reply":
     case "comment": {
       const isReply = args.verb === "reply";
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const textArg = args.positionals.slice(isReply ? 2 : 1).join(" ");
       let html: string;
       if (typeof args.flags.file === "string" && args.flags.file === "-") html = htmlEscape(await readStdin());
@@ -685,7 +685,7 @@ export async function run(argv: string[]): Promise<unknown> {
       return { id: `${ref.ident}-${ref.seq}`, ...(replyTo ? { replyTo } : {}), n: `c${listAfter.length}` };
     }
     case "uncomment": {
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const handle = String(args.positionals[1] ?? "");
       const m = handle.match(/^c(\d+)$/);
       if (!m) throw new UsageError("validation", `invalid comment handle '${handle}'`, { valid: ["c<N>"], suggestion: `plane comments ${positional} to re-list` });
@@ -703,7 +703,7 @@ export async function run(argv: string[]): Promise<unknown> {
       return { id: `${ref.ident}-${ref.seq}`, n: handle, deleted: true };
     }
     case "delete": {
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       if (args.flags.yes !== true)
         throw new UsageError("validation", "delete is destructive — re-run with --yes to confirm", { suggestion: `plane delete ${positional} --yes` });
       if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/` }] };
@@ -711,7 +711,7 @@ export async function run(argv: string[]): Promise<unknown> {
       return { id: `${ref.ident}-${ref.seq}`, deleted: true };
     }
     case "unclaim": {
-      const ref = await p.issueRef(requireTicket(args.positionals));
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const [issue, meId] = await Promise.all([
         p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`) as Promise<Record<string, unknown>>,
         p.me(),
@@ -741,7 +741,7 @@ export async function run(argv: string[]): Promise<unknown> {
         throw new UsageError("validation", `invalid --priority '${prio}'`, { valid: ["urgent", "high", "medium", "low"] });
       const html = await bodyText(args.flags);
       let parentRef: { uuid: string; seq: number; ident: string; projectId: string } | undefined;
-      if (args.verb === "sub") parentRef = await p.issueRef(requireTicket(args.positionals));
+      if (args.verb === "sub") parentRef = await p.issueRef(requireTicket(args.positionals), { fresh: true });
       const projectId = parentRef?.projectId;
       const ident = parentRef?.ident;
       const [lm, sm] = await Promise.all([p.labelMap(projectId), p.stateMap(projectId)]);

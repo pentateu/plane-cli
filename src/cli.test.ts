@@ -708,6 +708,32 @@ function useWriteRouter() {
   };
 }
 
+describe("fresh resolve for writes", () => {
+  test("mutating verbs reload the seqmap on a warm cache (INFRA-56)", async () => {
+    const cache = new Cache(process.env.PLANE_CACHE!);
+    cache.set(`project:Ai Tutor`, "pr-1");
+    cache.set("states:pr-1", Object.fromEntries(STATES.map((s) => [s.name.toLowerCase().replace("in progress", "progress").replace("awaiting verification", "verify"), s.id])));
+    cache.set("labels:pr-1", Object.fromEntries(LABELS.map((l) => [l.name, l.id])));
+    cache.set("member:dev1", "mb-dev1");
+    cache.set("seqmap:pr-1", { "66": "is-66", "67": "is-67" });
+    cache.save();
+    const before = calls.length;
+    await run(["claim", "HT-66"]);
+    expect(calls.slice(before).some((c) => c.method === "GET" && c.path === "/projects/pr-1/issues/")).toBeTrue();
+  });
+
+  test("reads still resolve from a warm cache with zero list fetches (INFRA-56)", async () => {
+    const cache = new Cache(process.env.PLANE_CACHE!);
+    cache.set(`project:Ai Tutor`, "pr-1");
+    cache.set("seqmap:pr-1", { "66": "is-66", "67": "is-67" });
+    cache.save();
+    const before = calls.length;
+    const d = (await run(["get", "HT-66", "--fields", "id"])) as Record<string, unknown>;
+    expect(d.id).toBe("HT-66");
+    expect(calls.slice(before).some((c) => c.path === "/projects/pr-1/issues/")).toBeFalse();
+  });
+});
+
 describe("uncomment", () => {
   function useHygieneRouter() {
     router = (_m, path) => {
