@@ -76,7 +76,7 @@ function fail(e: unknown): never {
 
 function requireTicket(positionals: string[]): string {
   const t = positionals[0];
-  if (!t) throw new UsageError("validation", "missing ticket ref", { valid: ["HT-<number>", "<IDENT>-<number>", "<number>"], suggestion: "plane get HT-66" });
+  if (!t) throw new UsageError("validation", "missing ticket ref", { valid: ["HT-<number>", "<IDENT>-<number>", "<number>", "<IDENT>-<number>@<id-prefix>"], suggestion: "plane get HT-66" });
   return t;
 }
 
@@ -86,12 +86,12 @@ async function runEdgeVerb(args: Args, p: Plane, cfg: Config, dryRun: boolean): 
   const remove = args.verb === ("unblocks" as EdgeVerbs);
   if (args.positionals.length < 2)
     throw new UsageError("validation", `${args.verb} needs exactly two ticket refs`, {
-      valid: ["HT-<number>", "<IDENT>-<number>"],
+      valid: ["HT-<number>", "<IDENT>-<number>", "<IDENT>-<number>@<id-prefix>"],
       suggestion: `plane ${args.verb} HT-151 HT-184`,
     });
   if (args.positionals.length > 2)
     throw new UsageError("validation", `ambiguous — ${args.verb} takes exactly two refs (got ${args.positionals.length})`, {
-      valid: ["HT-<number>", "<IDENT>-<number>"],
+      valid: ["HT-<number>", "<IDENT>-<number>", "<IDENT>-<number>@<id-prefix>"],
       suggestion: `plane ${args.verb} HT-151 HT-184`,
     });
   const [rawA, rawB] = args.positionals as [string, string];
@@ -246,7 +246,8 @@ CONTRACT
   failure -> one JSON error on stderr, exit 1 api|network · 2 auth · 3 not-found · 4 validation · 5 rate-limit
   errors carry code/message/valid/suggestion — fix per 'valid'/'suggestion', retry once, never loop
   handles are short names everywhere: <IDENT>-<seq> (HT-<seq> and bare <seq> are the default
-  project), states todo|progress|verify|done|cancelled|backlog,
+  project); duplicate sequence numbers fail closed — re-run as <IDENT>-<seq>@<id-prefix>,
+  states todo|progress|verify|done|cancelled|backlog,
   labels type:bug|type:feature|type:ops|type:plan, seats dev1.. — UUIDs never appear in data fields
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only
   surfaces that can show native payloads)

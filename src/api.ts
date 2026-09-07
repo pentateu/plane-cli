@@ -38,19 +38,34 @@ const STATE_TOKENS: Record<string, string> = {
 export const VALID_STATES = ["todo", "progress", "verify", "done", "cancelled"];
 export const VALID_LABELS = ["type:bug", "type:feature", "type:ops", "type:plan"];
 
-export type TicketRef = { ident?: string; seq: number };
+export type TicketRef = { ident?: string; seq: number; idPrefix?: string };
 
-/** Single source for ticket-ref grammar: `<IDENT>-<n>`, `HT-<n>`, bare `<n>`.
+/** Single source for ticket-ref grammar: `<IDENT>-<n>[@<id-prefix>]`, `HT-<n>`, bare `<n>`.
  *  Identifiers normalize to uppercase; a missing ident means the default
- *  project (display prefix HT). Invalid refs fail loud with the grammar. */
+ *  project (display prefix HT). The optional @ form disambiguates duplicate
+ *  sequence numbers (fail-closed refs, INFRA-52): `<IDENT>-<n>@<uuid-prefix>`.
+ *  Invalid refs fail loud with the grammar. */
 export function parseTicketRef(input: string): TicketRef {
   const s = input.trim();
-  let m = s.match(/^(\d+)$/);
-  if (m) return { seq: Number(m[1]) };
-  m = s.match(/^([A-Za-z][A-Za-z0-9]*)-(\d+)$/);
-  if (m) return { ident: m[1]!.toUpperCase(), seq: Number(m[2]) };
+  const at = s.indexOf("@");
+  const head = at === -1 ? s : s.slice(0, at);
+  const tail = at === -1 ? undefined : s.slice(at + 1);
+  let idPrefix: string | undefined;
+  if (tail !== undefined) {
+    if (!/^[0-9A-Za-z-]{1,36}$/.test(tail))
+      throw new ApiError("validation", `invalid id prefix '@${tail}'`, {
+        valid: ["<IDENT>-<number>@<uuid-prefix>", "e.g. TC-16@eef615ca"],
+        suggestion: "use the leading characters of the issue id, e.g. TC-16@eef615ca",
+      });
+    idPrefix = tail.toLowerCase();
+  }
+  const withPrefix = idPrefix === undefined ? {} : { idPrefix };
+  let m = head.match(/^(\d+)$/);
+  if (m) return { seq: Number(m[1]), ...withPrefix };
+  m = head.match(/^([A-Za-z][A-Za-z0-9]*)-(\d+)$/);
+  if (m) return { ident: m[1]!.toUpperCase(), seq: Number(m[2]), ...withPrefix };
   throw new ApiError("validation", `invalid ticket ref '${input}'`, {
-    valid: ["HT-<number>", "<IDENT>-<number>", "<number>"],
+    valid: ["HT-<number>", "<IDENT>-<number>", "<number>", "<IDENT>-<number>@<id-prefix>"],
     suggestion: "prefix the number with its project identifier, e.g. HT-66",
   });
 }
@@ -319,24 +334,59 @@ export class Plane {
     const seq = ref.seq;
     // Project-scoped: sequence numbers restart per project (HT-1 and HTC-1 both
     // exist), so a global seqmap misresolves refs across project dirs.
+    // Resolution is fail-closed on duplicate sequence numbers (INFRA-52):
+    // twins throw unless the caller disambiguates with IDENT-seq@id-prefix.
+    // Mutating verbs pass { fresh: true } so a 300s-stale seqmap can never aim
+    // a write at a deleted uuid or the wrong twin (INFRA-56).
     const mapKey = `seqmap:${projectId}`;
-    const load = async (): Promise<Record<string, string>> => {
+    const load = async (): Promise<{ map: Record<string, string>; dupes: Record<string, Array<{ id: string; title: string }>> }> => {
       const map: Record<string, string> = {};
-      for (const i of await this.listIssues({}, 10, projectId)) map[String(i.sequence_id)] = i.id as string;
+      const dupes: Record<string, Array<{ id: string; title: string }>> = {};
+      for (const i of await this.listIssues({}, 10, projectId)) {
+        const k = String(i.sequence_id);
+        map[k] = i.id as string;
+        (dupes[k] ??= []).push({ id: i.id as string, title: String(i.name ?? "") });
+      }
       this.cache.set(mapKey, map);
-      return map;
+      return { map, dupes };
     };
-    // Mutating verbs pass { fresh: true } so a 300s-stale seqmap can never
-    // aim a write at a deleted uuid (INFRA-56). Reads keep the cached map.
     let map: Record<string, string>;
+    let dupes: Record<string, Array<{ id: string; title: string }>>;
     if (opts.fresh) {
-      map = await load();
+      ({ map, dupes } = await load());
     } else {
-      map = (this.cache.fresh(mapKey) ?? (await load())) as Record<string, string>;
+      const hit = this.cache.fresh(mapKey) as Record<string, string> | undefined;
+      if (hit) {
+        map = hit;
+        dupes = {};
+      } else {
+        ({ map, dupes } = await load());
+      }
     }
+    const checkTwins = (twins: Array<{ id: string; title: string }>): string | undefined => {
+      if (twins.length <= 1) return undefined;
+      const matches = ref.idPrefix ? twins.filter((t) => t.id.toLowerCase().startsWith(ref.idPrefix!)) : [];
+      if (ref.idPrefix && matches.length === 1) return matches[0]!.id;
+      const cands = twins.map((t) => `${ident}-${seq}@${t.id.slice(0, 8)} ${t.title.slice(0, 60)}`);
+      throw new ApiError("validation", `ambiguous ref '${ident}-${seq}': ${twins.length} issues share sequence ${seq}`, {
+        valid: cands,
+        suggestion: ref.idPrefix
+          ? "prefix matched zero or several twins — copy a longer id prefix from the list above"
+          : `re-run with an id prefix, e.g. ${ident}-${seq}@${twins[0]!.id.slice(0, 8)}`,
+      });
+    };
+    // Confirm suspected duplicates against a fresh list: a stale cache must
+    // never fail closed on twins the board no longer has.
+    let twins = dupes[String(seq)] ?? [];
+    if (twins.length > 1 && !opts.fresh) {
+      ({ map, dupes } = await load());
+      twins = dupes[String(seq)] ?? [];
+    }
+    const twinHit = checkTwins(twins);
+    if (twinHit) return { uuid: twinHit, seq, ident, projectId };
     let uuid = map[String(seq)];
     if (!uuid && !opts.fresh) {
-      map = await load();
+      ({ map, dupes } = await load());
       uuid = map[String(seq)];
     }
     if (!uuid) {
@@ -351,6 +401,11 @@ export class Plane {
         suggestion: near.length ? "pick the nearest match or re-check the number" : "plane sync then retry",
       });
     }
+    if (ref.idPrefix && !uuid.toLowerCase().startsWith(ref.idPrefix))
+      throw new ApiError("validation", `id prefix '@${ref.idPrefix}' does not match ${ident}-${seq}`, {
+        valid: [`${ident}-${seq}@${uuid.slice(0, 8)}`],
+        suggestion: "drop the @ prefix or copy the id prefix from the error above",
+      });
     return { uuid, seq, ident, projectId };
   }
 

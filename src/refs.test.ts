@@ -29,6 +29,24 @@ describe("parseTicketRef", () => {
     expect(formatTicketRef(parseTicketRef("A1-9"))).toBe("A1-9");
   });
 
+  test("@id-prefix disambiguates twins and normalizes to lowercase (INFRA-52)", () => {
+    expect(parseTicketRef("TC-16@eef615ca")).toEqual({ ident: "TC", seq: 16, idPrefix: "eef615ca" });
+    expect(parseTicketRef("tc-16@EEF615CA")).toEqual({ ident: "TC", seq: 16, idPrefix: "eef615ca" });
+    expect(parseTicketRef("66@is-66b")).toEqual({ seq: 66, idPrefix: "is-66b" });
+  });
+
+  test("bad @ prefixes fail loud", () => {
+    for (const bad of ["HT-66@", "HT-66@!", "HT-66@e e", "HT-66@toolongprefix-12345678901234567890123456789012345"]) {
+      let caught: any;
+      try {
+        parseTicketRef(bad);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught?.kind).toBe("validation");
+    }
+  });
+
   test("invalid refs loud-error with kind validation, exit 4, and the valid grammar", () => {
     for (const bad of ["", "  ", "HT-six", "TEAMCTL", "TEAM-CTL-16", "-16", "HT-", "16-", "HT_66", "HT--66", "-66", "66-"]) {
       let caught: any;

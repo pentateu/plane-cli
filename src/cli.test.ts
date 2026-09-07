@@ -725,6 +725,26 @@ describe("create / sub", () => {
   });
 });
 
+const TWINS = [
+  { id: "is-66a", sequence_id: 66, name: "twin A", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>a</p>" },
+  { id: "is-66b", sequence_id: 66, name: "twin B", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>b</p>" },
+];
+
+function useTwinsRouter() {
+  router = (_m, path) => {
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path === "/members/") return { status: 200, json: MEMBERS };
+    if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+    if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+    if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
+    if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: TWINS, next_page_results: false } };
+    const m = path.match(/\/issues\/(is-[0-9a-z]+)\/$/);
+    if (m) return { status: 200, json: TWINS.find((i) => i.id === m[1])! };
+    if (path.endsWith("/comments/")) return { status: 200, json: { results: [] } };
+    return { status: 404 };
+  };
+}
+
 function useWriteRouter() {
   router = (_m, path) => {
     if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
@@ -863,6 +883,41 @@ describe("unclaim", () => {
     const d = (await run(["unclaim", "HT-67"])) as Record<string, unknown>;
     expect(d).toMatchObject({ id: "HT-67", changed: false });
     expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+  });
+});
+
+describe("ambiguous refs fail closed", () => {
+  test("duplicate sequence numbers fail closed listing candidates (INFRA-52)", async () => {
+    useTwinsRouter();
+    let caught: any;
+    try {
+      await run(["get", "HT-66"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("ambiguous ref");
+    expect(caught.valid).toEqual(["HT-66@is-66a twin A", "HT-66@is-66b twin B"]);
+    expect(String(caught.suggestion)).toContain("HT-66@is-66a");
+    expect(calls.some((c) => c.method !== "GET")).toBeFalse();
+  });
+
+  test("id-prefix disambiguates twins (INFRA-52)", async () => {
+    useTwinsRouter();
+    const d = (await run(["get", "HT-66@is-66b"])) as Record<string, any>;
+    expect(d.title).toBe("twin B");
+  });
+
+  test("wrong id-prefix fails loud instead of resolving (INFRA-52)", async () => {
+    useTwinsRouter();
+    let caught: any;
+    try {
+      await run(["get", "HT-66@zzzz"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(calls.some((c) => c.method !== "GET")).toBeFalse();
   });
 });
 
