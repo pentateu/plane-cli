@@ -612,6 +612,18 @@ describe("comments / reply / comment", () => {
   });
 });
 
+describe("comment read cap", () => {
+  test("--full returns the whole comment, default stays capped", async () => {
+    globalThis.__comments = [
+      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"y".repeat(600)}</p>`, actor: "mb-dev1" },
+    ];
+    const d = (await run(["comments", "HT-66"])) as Record<string, any>;
+    expect(String(d.comments[0].text).length).toBeLessThanOrEqual(300);
+    const f = (await run(["comments", "HT-66", "--full"])) as Record<string, any>;
+    expect(String(f.comments[0].text).length).toBe(600);
+  });
+});
+
 describe("create / sub", () => {
   test("posts exact typed payload with state key and real label id", async () => {
     const d = (await run(["create", "--title", "[ops] x", "--type", "bug", "--priority", "high", "--body", "<p>b</p>"])) as Record<string, unknown>;

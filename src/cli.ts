@@ -457,7 +457,7 @@ export async function run(argv: string[]): Promise<unknown> {
       const wantComments = args.flags.comments === true;
       const [rawIssue, comments, rels] = await Promise.all([
         p.request("GET", `${p.projectPathFor(projectId)}/issues/${uuid}/`) as Promise<Record<string, unknown>>,
-        wantComments ? p.comments(uuid, projectId) : Promise.resolve([]),
+        wantComments ? p.comments(uuid, projectId, { full }) : Promise.resolve([]),
         p.relationsCached(uuid, projectId),
       ]);
       const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels, ident, projectId });
@@ -639,7 +639,7 @@ export async function run(argv: string[]): Promise<unknown> {
     }
     case "comments": {
       const ref = await p.issueRef(requireTicket(args.positionals));
-      const list = await p.comments(ref.uuid, ref.projectId);
+      const list = await p.comments(ref.uuid, ref.projectId, { full });
       const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : truncateText(c.text, 300) }));
       return pickFields({ id: `${ref.ident}-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
     }

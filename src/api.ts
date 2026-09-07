@@ -389,7 +389,7 @@ export class Plane {
     return row;
   }
 
-  async comments(uuid: string, projectId: string = this.projectId()): Promise<Array<{ n: number; author: string; date: string; id: string; text: string }>> {
+  async comments(uuid: string, projectId: string = this.projectId(), opts: { full?: boolean } = {}): Promise<Array<{ n: number; author: string; date: string; id: string; text: string }>> {
     const [raw, names] = await Promise.all([
       this.request("GET", `${this.projectPathFor(projectId)}/issues/${uuid}/comments/`) as Promise<Raw>,
       this.memberNames(),
@@ -400,7 +400,10 @@ export class Plane {
       author: names[c.actor] ?? c.actor,
       date: String(c.created_at).slice(0, 10),
       id: c.id,
-      text: htmlToText(String(c.comment_html ?? "")).replace(/\s+/g, " ").slice(0, 400),
+      text: (() => {
+      const t = htmlToText(String(c.comment_html ?? "")).replace(/\s+/g, " ");
+      return opts.full ? t : t.slice(0, 400);
+    })(),
     }));
   }
 
