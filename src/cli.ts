@@ -11,7 +11,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
@@ -286,6 +286,7 @@ VERBS
   reply HT-N cM "text"            threaded answer to comment cM (review-loop close-out)
   comment HT-N "text"             top-level comment ('--file -' reads stdin)
   uncomment HT-N cM --yes       delete comment cM (destructive, needs --yes)
+  delete HT-N --yes             delete the ticket (destructive, needs --yes)
   blocks HT-A HT-B                edge: A blocks B — persisted natively on Plane
   depends HT-B HT-A               same edge spelled from the dependent side
   unblocks HT-A HT-B              remove that edge
@@ -699,6 +700,14 @@ export async function run(argv: string[]): Promise<unknown> {
       if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/comments/${target.id}/` }] };
       await p.deleteComment(ref.uuid, target.id, ref.projectId);
       return { id: `${ref.ident}-${ref.seq}`, n: handle, deleted: true };
+    }
+    case "delete": {
+      const ref = await p.issueRef(requireTicket(args.positionals));
+      if (args.flags.yes !== true)
+        throw new UsageError("validation", "delete is destructive — re-run with --yes to confirm", { suggestion: `plane delete ${positional} --yes` });
+      if (dryRun) return { dryRun: true, requests: [{ method: "DELETE", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/` }] };
+      await p.deleteIssue(ref.uuid, ref.projectId);
+      return { id: `${ref.ident}-${ref.seq}`, deleted: true };
     }
     case "create":
     case "sub": {

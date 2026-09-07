@@ -686,6 +686,28 @@ describe("create / sub", () => {
   });
 });
 
+function useWriteRouter() {
+  router = (_m, path) => {
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path === "/members/") return { status: 200, json: MEMBERS };
+    if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+    if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+    if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
+    if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+    const cd = path.match(/\/issues\/(is-\d+)\/comments\/(.+)\/$/);
+    if (cd && _m === "DELETE") {
+      globalThis.__comments = (globalThis.__comments ?? []).filter((c: any) => c.id !== cd[2]);
+      return { status: 204 };
+    }
+    const cm = path.match(/\/issues\/(is-\d+)\/comments\/$/);
+    if (cm) return { status: 200, json: { results: globalThis.__comments } };
+    const id = path.match(/\/issues\/(is-\d+)\/$/);
+    if (id && _m === "DELETE") return { status: 204 };
+    if (id) return { status: 200, json: ISSUES.find((i) => i.id === id[1])! };
+    return { status: 404 };
+  };
+}
+
 describe("uncomment", () => {
   function useHygieneRouter() {
     router = (_m, path) => {
@@ -738,6 +760,27 @@ describe("uncomment", () => {
     }
     expect(caught.kind).toBe("not-found");
     expect(caught.valid).toEqual(["c1", "c2"]);
+  });
+});
+
+describe("delete", () => {
+  test("delete removes the ticket behind --yes (INFRA-54)", async () => {
+    useWriteRouter();
+    const d = (await run(["delete", "HT-66", "--yes"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-66", deleted: true });
+    expect(calls.some((c) => c.method === "DELETE" && /\/issues\/is-66\/$/.test(c.path))).toBeTrue();
+  });
+
+  test("delete without --yes refuses with a confirm hint (INFRA-54)", async () => {
+    useWriteRouter();
+    let caught: any;
+    try {
+      await run(["delete", "HT-66"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(calls.some((c) => c.method === "DELETE")).toBeFalse();
   });
 });
 
