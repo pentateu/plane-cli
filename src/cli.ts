@@ -184,7 +184,7 @@ function normalizeIdArray(v: unknown): string[] {
   return (v as unknown[]).map((a) => (typeof a === "string" ? a : (a as any)?.id)).filter((s): s is string => typeof s === "string" && s.length > 0);
 }
 
-async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
+export async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
   const platformTokenPath = process.env.PLATFORM_TOKEN_PATH ?? "";
   let platformToken = process.env.PLATFORM_TOKEN ?? "";
   if (!platformToken) {
@@ -236,10 +236,6 @@ async function resolveAsToken(asSubject: string, aud: string): Promise<string> {
   const exJson: any = await exRes.json();
   const devJwt = exJson.access_token as string;
   if (!devJwt) throw new UsageError("auth", "dev JWT missing");
-  try {
-    const payload = JSON.parse(Buffer.from(devJwt.split(".")[1] ?? "", "base64url").toString());
-    console.error(JSON.stringify({ jwt: { sub: payload.sub, aud: payload.aud, exp: payload.exp, iss: payload.iss } }));
-  } catch { /* ignore */ }
   return devJwt;
 }
 

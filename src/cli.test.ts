@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cache } from "./cache.ts";
-import { run, peekCache } from "./cli.ts";
+import { resolveAsToken, run, peekCache } from "./cli.ts";
 
 type Call = { method: string; path: string; body?: unknown };
 let calls: Call[] = [];
@@ -263,6 +263,33 @@ describe("auth & config", () => {
     const d = (await run(["config"])) as Record<string, unknown>;
     expect(JSON.stringify(d)).not.toContain("test-token");
     expect(d.project).toBe("Ai Tutor");
+  });
+
+  test("--as exchange stays silent on stderr (INFRA-57)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "plane-pt-"));
+    tmpDirs.push(dir);
+    const pf = join(dir, "platform-token");
+    await Bun.write(pf, "platform-secret");
+    const ambToken = process.env.PLATFORM_TOKEN;
+    const ambPath = process.env.PLATFORM_TOKEN_PATH;
+    delete process.env.PLATFORM_TOKEN;
+    process.env.PLATFORM_TOKEN_PATH = pf;
+    fetchSpy.mockImplementation((async (url: any, init: any) => {
+      const body = String(init?.body ?? "");
+      const tok = body.includes("token-exchange") ? "dev.jwt.here" : "plat.jwt.here";
+      return new Response(JSON.stringify({ access_token: tok }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as any);
+    try {
+      const errSpy = capture(console, "error") as unknown as { mock: { calls: unknown[][] } };
+      const jwt = await resolveAsToken("dev1", "plane");
+      expect(jwt).toBe("dev.jwt.here");
+      expect(errSpy.mock.calls.length).toBe(0);
+    } finally {
+      if (ambToken === undefined) delete process.env.PLATFORM_TOKEN;
+      else process.env.PLATFORM_TOKEN = ambToken;
+      if (ambPath === undefined) delete process.env.PLATFORM_TOKEN_PATH;
+      else process.env.PLATFORM_TOKEN_PATH = ambPath;
+    }
   });
 
   test("whoami resolves exact seat member", async () => {
