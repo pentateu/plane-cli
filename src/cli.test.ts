@@ -917,6 +917,29 @@ describe("explicit idents hit their own project", () => {
   });
 });
 
+describe("list display identifier", () => {
+  test("list renders the registry identifier, not a stale cfg ident (INFRA-63)", async () => {
+    process.env.PLANE_PROJECT_NAME = "Teamctl";
+    const tcIssue = { id: "is-tc5", sequence_id: 5, name: "tc five", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>t</p>" };
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [
+        { id: "pr-1", name: "Ai Tutor", identifier: "HT" },
+        { id: "pr-tc", name: "Teamctl", identifier: "TC" },
+      ] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (path === "/projects/pr-tc/issues/") return { status: 200, json: { results: [tcIssue], next_page_results: false } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+      if (path.endsWith("/comments/")) return { status: 200, json: { results: [] } };
+      return { status: 404 };
+    };
+    const d = (await run(["list"])) as Record<string, any>;
+    expect(d.items).toHaveLength(1);
+    expect(d.items[0].id).toBe("TC-5");
+  });
+});
+
 describe("ambiguous refs fail closed", () => {
   test("duplicate sequence numbers fail closed listing candidates (INFRA-52)", async () => {
     useTwinsRouter();

@@ -509,7 +509,7 @@ export async function run(argv: string[]): Promise<unknown> {
       const slice = items.slice((page - 1) * pageSize, page * pageSize);
       const rows = [];
       for (const i of slice) {
-        const s = await p.shapeIssue(i as never, {});
+        const s = await p.shapeIssue(i as never, { ident: all.ident });
         rows.push({
           id: s.id,
           title: s.title.length > 100 ? `${s.title.slice(0, 99)}…` : s.title,
@@ -769,10 +769,10 @@ export async function run(argv: string[]): Promise<unknown> {
   }
 }
 
-async function fetchAll(p: Plane, search: string): Promise<{ raw: Array<Record<string, unknown>> }> {
+async function fetchAll(p: Plane, search: string): Promise<{ raw: Array<Record<string, unknown>>; ident: string }> {
   const outArr = await p.listIssues(search ? { search } : {});
   p.cache.set(`seqmap:${p.projectId()}`, Object.fromEntries(outArr.map((i) => [String(i.sequence_id), i.id as string])));
-  return { raw: outArr };
+  return { raw: outArr, ident: await p.defaultIdent() };
 }
 
 function truncateText(text: string, cap: number): string {

@@ -170,6 +170,15 @@ export class Plane {
     return this.projectPathFor(this.projectId());
   }
 
+  /** Display identifier of the DEFAULT project (what bare refs and list rows
+   *  render). Derived from the registry, never trusted from config (INFRA-63):
+   *  an unpinned checkout renders TC rows as HT-N otherwise. */
+  async defaultIdent(): Promise<string> {
+    const pid = this.projectId();
+    const list = await this.projects();
+    return String(list.find((p) => String(p.id) === pid)?.identifier ?? this.cfg.ident).toUpperCase();
+  }
+
   projectPathFor(projectId: string): string {
     return `${this.base()}/projects/${projectId}`;
   }
