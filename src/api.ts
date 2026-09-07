@@ -212,6 +212,9 @@ export class Plane {
 
   async resolveProjectByIdent(ident: string): Promise<Raw> {
     const want = ident.toUpperCase();
+    const identKey = `project-ident:${want}`;
+    const identHit = this.cache.fresh(identKey) as Raw | undefined;
+    if (identHit) return identHit;
     const list = await this.projects();
     const found = list.find((p) => String(p.identifier ?? "").toUpperCase() === want);
     if (!found)
@@ -219,6 +222,7 @@ export class Plane {
         valid: list.map((p) => String(p.identifier ?? "")).filter(Boolean).sort(),
         suggestion: "plane projects to list available projects",
       });
+    this.cache.set(identKey, found);
     return found;
   }
 
@@ -323,7 +327,7 @@ export class Plane {
     const ref = parseTicketRef(input);
     let projectId: string;
     let ident: string;
-    if (!ref.ident || ref.ident === "HT") {
+    if (!ref.ident) {
       projectId = this.projectId();
       ident = this.cfg.ident;
     } else {
@@ -348,6 +352,9 @@ export class Plane {
         (dupes[k] ??= []).push({ id: i.id as string, title: String(i.name ?? "") });
       }
       this.cache.set(mapKey, map);
+      const dupOnly: Record<string, Array<{ id: string; title: string }>> = {};
+      for (const [k, v] of Object.entries(dupes)) if (v.length > 1) dupOnly[k] = v;
+      this.cache.set(`seqdups:${projectId}`, dupOnly);
       return { map, dupes };
     };
     let map: Record<string, string>;
@@ -358,7 +365,7 @@ export class Plane {
       const hit = this.cache.fresh(mapKey) as Record<string, string> | undefined;
       if (hit) {
         map = hit;
-        dupes = {};
+        dupes = (this.cache.stale(`seqdups:${projectId}`) as Record<string, Array<{ id: string; title: string }>> | undefined) ?? {};
       } else {
         ({ map, dupes } = await load());
       }
@@ -376,9 +383,10 @@ export class Plane {
       });
     };
     // Confirm suspected duplicates against a fresh list: a stale cache must
-    // never fail closed on twins the board no longer has.
+    // never fail closed on twins the board no longer has. An id prefix
+    // always forces the confirming load — twin sets are only known fresh.
     let twins = dupes[String(seq)] ?? [];
-    if (twins.length > 1 && !opts.fresh) {
+    if ((twins.length > 1 || ref.idPrefix) && !opts.fresh) {
       ({ map, dupes } = await load());
       twins = dupes[String(seq)] ?? [];
     }

@@ -245,8 +245,9 @@ CONTRACT
   success -> one JSON line on stdout, exit 0
   failure -> one JSON error on stderr, exit 1 api|network · 2 auth · 3 not-found · 4 validation · 5 rate-limit
   errors carry code/message/valid/suggestion — fix per 'valid'/'suggestion', retry once, never loop
-  handles are short names everywhere: <IDENT>-<seq> (HT-<seq> and bare <seq> are the default
-  project); duplicate sequence numbers fail closed — re-run as <IDENT>-<seq>@<id-prefix>,
+  handles are short names everywhere: <IDENT>-<seq> names that project via the registry
+  (bare <seq> alone means the default project); duplicate sequence numbers fail
+  closed — re-run as <IDENT>-<seq>@<id-prefix>,
   states todo|progress|verify|done|cancelled|backlog,
   labels type:bug|type:feature|type:ops|type:plan, seats dev1.. — UUIDs never appear in data fields
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only

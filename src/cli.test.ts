@@ -48,7 +48,7 @@ function relationEntry(uuid: string): Record<string, unknown> {
 /** Minimal router serving one issue + a relations payload in any wire shape. */
 function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p: string) => { status: number; json?: any } {
   return (_m, path) => {
-    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
     if (path === "/members/") return { status: 200, json: MEMBERS };
     if (/\/work-items\/([^/]+)\/relations\/$/.test(path)) return { status: 200, json: relations };
     if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
@@ -124,7 +124,7 @@ const ISSUES = [
 function useDefaultRouter() {
   const ISSUE_RE = /\/projects\/[^/]+\/issues\/(is-\d+)\/$/;
   router = (_m, path, b) => {
-    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
     if (path === "/members/") return { status: 200, json: MEMBERS };
     if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
     if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
@@ -319,6 +319,7 @@ describe("PC4 — disk cache persists across invocations", () => {
     cache.set("labels:pr-1", Object.fromEntries(LABELS.map((l) => [l.name, l.id])));
     cache.set("members", Object.fromEntries(MEMBERS.map((m) => [m.id, m.display_name])));
     cache.set("member:dev1", "mb-dev1");
+    cache.set("project-ident:HT", { id: "pr-1", name: "Ai Tutor", identifier: "HT" });
     cache.set("seqmap:pr-1", { "66": "is-66", "67": "is-67" });
     cache.set("relmap", { "is-66": { b: [], f: [] }, "is-67": { b: [], f: [] } });
     cache.save();
@@ -345,7 +346,7 @@ describe("PC4 — disk cache persists across invocations", () => {
         const path = rel.split("?")[0]!;
         seen.push(path);
         const j = (data: unknown) => new Response(JSON.stringify({ ok: true, data }), { headers: { "Content-Type": "application/json" } });
-        if (path === "/projects/") return j({ results: [{ id: "pr-1", name: "Ai Tutor" }] });
+        if (path === "/projects/") return j({ results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] });
         if (path === "/members/") return j(MEMBERS);
         if (path.endsWith("/states/")) return j({ results: STATES });
         if (path.endsWith("/labels/")) return j({ results: LABELS });
@@ -395,7 +396,7 @@ describe("PC4 — disk cache persists across invocations", () => {
   test("HOMETUTOR_TICKETS_PROJECT_ID skips project discovery entirely", async () => {
     process.env.HOMETUTOR_TICKETS_PROJECT_ID = "pr-explicit";
     const before = calls.length;
-    await run(["get", "HT-66", "--fields", "id"]);
+    await run(["get", "66", "--fields", "id"]);
     expect(calls.slice(before).some((c) => c.path === "/projects/")).toBeFalse();
   });
 });
@@ -486,7 +487,7 @@ describe("list", () => {
     // (hostile: duplicate rows + next_cursor), call 2 = cursor page 2.
     let issueListCalls = 0;
     router = (_m, path) => {
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
       if (path === "/members/") return { status: 200, json: MEMBERS };
       if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
       if (/\/projects\/[^/]+\/issues\/$/.test(path)) {
@@ -732,7 +733,7 @@ const TWINS = [
 
 function useTwinsRouter() {
   router = (_m, path) => {
-    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
     if (path === "/members/") return { status: 200, json: MEMBERS };
     if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
     if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
@@ -747,7 +748,7 @@ function useTwinsRouter() {
 
 function useWriteRouter() {
   router = (_m, path) => {
-    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+    if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
     if (path === "/members/") return { status: 200, json: MEMBERS };
     if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
     if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
@@ -796,7 +797,7 @@ describe("fresh resolve for writes", () => {
 describe("uncomment", () => {
   function useHygieneRouter() {
     router = (_m, path) => {
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
       if (path === "/members/") return { status: 200, json: MEMBERS };
       if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
       if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
@@ -886,6 +887,36 @@ describe("unclaim", () => {
   });
 });
 
+describe("explicit idents hit their own project", () => {
+  test("HT- refs resolve via registry when the default is another project (INFRA-62)", async () => {
+    process.env.PLANE_PROJECT_NAME = "Teamctl";
+    const tcIssue = { id: "is-tc66", sequence_id: 66, name: "tc issue", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>t</p>" };
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [
+        { id: "pr-1", name: "Ai Tutor", identifier: "HT" },
+        { id: "pr-tc", name: "Teamctl", identifier: "TC" },
+      ] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (/\/work-items\/[^/]+\/relations\/$/.test(path)) return { status: 200, json: { blocking: [], blocked_by: [] } };
+      if (path === "/projects/pr-tc/issues/") return { status: 200, json: { results: [tcIssue], next_page_results: false } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
+      if (path === "/projects/pr-tc/issues/is-tc66/") return { status: 200, json: tcIssue };
+      const m = path.match(/\/issues\/(is-\d+)\/$/);
+      if (m) return { status: 200, json: ISSUES.find((i) => i.id === m[1])! };
+      if (path.endsWith("/comments/")) return { status: 200, json: { results: [] } };
+      return { status: 404 };
+    };
+    const ht = (await run(["get", "HT-66", "--fields", "title"])) as Record<string, any>;
+    expect(ht.title).toBe("[impl] personal tutor coherence");
+    expect(calls.some((c) => c.method === "GET" && c.path === "/projects/pr-1/issues/is-66/")).toBeTrue();
+    const bare = (await run(["get", "66", "--fields", "title"])) as Record<string, any>;
+    expect(bare.title).toBe("tc issue");
+    expect(calls.some((c) => c.method === "GET" && c.path === "/projects/pr-tc/issues/is-tc66/")).toBeTrue();
+  });
+});
+
 describe("ambiguous refs fail closed", () => {
   test("duplicate sequence numbers fail closed listing candidates (INFRA-52)", async () => {
     useTwinsRouter();
@@ -906,6 +937,35 @@ describe("ambiguous refs fail closed", () => {
     useTwinsRouter();
     const d = (await run(["get", "HT-66@is-66b"])) as Record<string, any>;
     expect(d.title).toBe("twin B");
+  });
+
+  test("id-prefix forces a confirming load when warm cache points at the other twin", async () => {
+    useTwinsRouter();
+    const cache = new Cache(process.env.PLANE_CACHE!);
+    cache.set(`project:Ai Tutor`, "pr-1");
+    cache.set("project-ident:HT", { id: "pr-1", name: "Ai Tutor", identifier: "HT" });
+    cache.set("seqmap:pr-1", { "66": "is-66a" });
+    cache.save();
+    const d = (await run(["get", "HT-66@is-66b", "--fields", "title"])) as Record<string, any>;
+    expect(d.title).toBe("twin B");
+  });
+
+  test("cached twin sets fail closed on a warm map hit (INFRA-52)", async () => {
+    useTwinsRouter();
+    const cache = new Cache(process.env.PLANE_CACHE!);
+    cache.set(`project:Ai Tutor`, "pr-1");
+    cache.set("project-ident:HT", { id: "pr-1", name: "Ai Tutor", identifier: "HT" });
+    cache.set("seqmap:pr-1", { "66": "is-66a" });
+    cache.set("seqdups:pr-1", { "66": [{ id: "is-66a", title: "twin A" }, { id: "is-66b", title: "twin B" }] });
+    cache.save();
+    let caught: any;
+    try {
+      await run(["get", "HT-66"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("ambiguous ref");
   });
 
   test("wrong id-prefix fails loud instead of resolving (INFRA-52)", async () => {
@@ -970,7 +1030,7 @@ describe("sync", () => {
         if (path.includes("is-67")) return { status: 200, json: { blocking: ["is-66"], blocked_by: [] } };
         return { status: 429 };
       }
-      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "AITUT" }] } };
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
       if (path === "/members/") return { status: 200, json: MEMBERS };
       if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: ISSUES, next_page_results: false } };
       if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
