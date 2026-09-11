@@ -747,6 +747,17 @@ describe("O-7 server-side fetch filters", () => {
     expect(q).toContain("priority=high");
     expect(q).toContain("per_page=1");
   });
+
+  test("--search narrows client-side when the instance ignores the fetch param", async () => {
+    const d = (await run(["list", "--search", "overshoot"])) as Record<string, any>;
+    expect(d.total).toBe(1);
+    expect(d.items[0]!.id).toBe("HT-67");
+    const byId = (await run(["list", "--search", "HT-66"])) as Record<string, any>;
+    expect(byId.total).toBe(1);
+    expect(byId.items[0]!.id).toBe("HT-66");
+    const none = (await run(["list", "--search", "zzzz-nothing"])) as Record<string, any>;
+    expect(none.total).toBe(0);
+  });
 });
 
 describe("O-12 help is contract", () => {

@@ -486,6 +486,7 @@ export async function run(argv: string[]): Promise<unknown> {
       const limit = limitF === undefined ? undefined : parsePositiveInt(limitF, "--limit");
       const lm = await p.labelMap();
       const search = typeof args.flags.search === "string" ? args.flags.search : "";
+      const ident = await p.defaultIdent();
       // Server-side filter params (best-effort; some Plane instances ignore list
       // filter params) plus a bounded walk: a narrow query never pays a full dump.
       const fetchParams: Record<string, string> = {};
@@ -495,6 +496,13 @@ export async function run(argv: string[]): Promise<unknown> {
       const match = (i: Record<string, unknown>): boolean => {
         if (stateList.length && !stateList.some((s) => i.state === forwardStates[s])) return false;
         if (prioF !== undefined && i.priority !== prioF) return false;
+        // O-7 search fallback (R-1): instances that ignore the `search` fetch
+        // param would otherwise return the unfiltered dump with no signal.
+        if (search) {
+          const ql = search.toLowerCase();
+          const hay = [`${ident}-${i.sequence_id}`, String(i.name ?? ""), htmlToText(String(i.description_html ?? ""))].join("\n").toLowerCase();
+          if (!hay.includes(ql)) return false;
+        }
         return true;
       };
       const all = await fetchAll(p, fetchParams, { limit, match });
