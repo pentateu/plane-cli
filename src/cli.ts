@@ -13,13 +13,14 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "limit", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
+const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
   verb: string;
   positionals: string[];
-  flags: Record<string, string | boolean>;
+  flags: Record<string, string | boolean | string[]>;
 };
 
 function parseArgs(argv: string[]): Args {
@@ -52,7 +53,12 @@ function parseArgs(argv: string[]): Args {
       value = argv[++i];
       if (value === undefined) throw new UsageError("validation", `flag '--${name}' needs a value`, { suggestion: `--${name} <value>` });
     }
-    flags[name] = value;
+    if (REPEATABLE_FLAGS.has(name) && flags[name] !== undefined) {
+      const existing = flags[name];
+      flags[name] = Array.isArray(existing) ? [...existing, value] : [existing, value];
+    } else {
+      flags[name] = value;
+    }
   }
   return { verb: verb.toLowerCase(), positionals, flags };
 }
@@ -239,7 +245,7 @@ export async function resolveAsToken(asSubject: string, aud: string): Promise<st
   return devJwt;
 }
 
-const HELP = `plane — Ai Tutor ticket CLI (agent-only)
+export const HELP = `plane — Ai Tutor ticket CLI (agent-only)
 
 CONTRACT
   success -> one JSON line on stdout, exit 0
@@ -252,8 +258,8 @@ CONTRACT
   labels type:bug|type:feature|type:ops|type:plan, seats dev1.. — UUIDs never appear in data fields
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only
   surfaces that can show native payloads)
-  output is minimal by default; widen with --fields a,b · deepen with --full (comments stay capped at
-  their upstream 300/400 chars) · native payload with --raw
+  output is minimal by default; widen with --fields a,b · deepen with --full (comments capped at
+  300 chars with a labeled marker, never a bare …; --full returns the full text) · native payload with --raw
   boolean flags are bare; inline values ('--yes=false') are rejected with exit 4
   every mutating verb accepts --dry-run (prints exactly what execution would send, changes nothing)
   claim/state are idempotent: re-applying returns changed:false, exit 0 — safe retries.
@@ -273,9 +279,10 @@ VERBS
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
                                   who holds HT-N up, what HT-N holds up
-  list [--state s] [--label l] [--assignee me|name] [--parent HT-N] [--blocked-by HT-N]
-       [--search q] [--page N]    --blocked-by = the "what can start now" query:
-                                  tickets held up by HT-N
+  list [--state s]… [--priority p] [--label l] [--assignee me|name] [--parent HT-N]
+       [--blocked-by HT-N] [--search q] [--limit N] [--page N]
+                                  --state is repeatable (multi-state); --blocked-by =
+                                  the "what can start now" query: tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
   unclaim HT-N                   remove self from assignees (idempotent)
   assign HT-N <seat|member-mail> [--comment "…"]
@@ -461,21 +468,45 @@ export async function run(argv: string[]): Promise<unknown> {
         p.relationsCached(uuid, projectId),
       ]);
       const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels, ident, projectId });
-      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text })) } : {}) };
+      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text: full ? text : labeledCut(text, 300, "--full for all") })) } : {}) };
       return pickFields(obj as Record<string, unknown>, fields);
     }
     case "list": {
-      const all = await fetchAll(p, typeof args.flags.search === "string" ? args.flags.search : "");
-      const forwardStates = await p.stateMap();
-      const lm = await p.labelMap();
-      let items = all.raw;
+      // O-7: --priority / multi --state / --limit constrain the FETCH (R-3).
       const stateF = args.flags.state;
-      if (typeof stateF === "string") {
-        if (!VALID_STATES.concat("backlog").includes(stateF))
-          throw new UsageError("validation", `invalid state '${stateF}'`, { valid: [...VALID_STATES, "backlog"] });
-        const sid = forwardStates[stateF];
-        items = items.filter((i: Record<string, unknown>) => i.state === sid);
-      }
+      const stateList = stateF === undefined ? [] : (Array.isArray(stateF) ? stateF : [stateF]);
+      const forwardStates = await p.stateMap();
+      for (const s of stateList)
+        if (!VALID_STATES.concat("backlog").includes(s))
+          throw new UsageError("validation", `invalid state '${s}'`, { valid: [...VALID_STATES, "backlog"] });
+      const prioF = typeof args.flags.priority === "string" ? args.flags.priority : undefined;
+      if (prioF !== undefined && !["urgent", "high", "medium", "low", "none"].includes(prioF))
+        throw new UsageError("validation", `invalid --priority '${prioF}'`, { valid: ["urgent", "high", "medium", "low", "none"] });
+      const limitF = typeof args.flags.limit === "string" ? args.flags.limit : undefined;
+      const limit = limitF === undefined ? undefined : parsePositiveInt(limitF, "--limit");
+      const lm = await p.labelMap();
+      const search = typeof args.flags.search === "string" ? args.flags.search : "";
+      const ident = await p.defaultIdent();
+      // Server-side filter params (best-effort; some Plane instances ignore list
+      // filter params) plus a bounded walk: a narrow query never pays a full dump.
+      const fetchParams: Record<string, string> = {};
+      if (search) fetchParams.search = search;
+      if (stateList.length) fetchParams.states = stateList.map((s) => forwardStates[s]).join(",");
+      if (prioF !== undefined) fetchParams.priority = prioF;
+      const match = (i: Record<string, unknown>): boolean => {
+        if (stateList.length && !stateList.some((s) => i.state === forwardStates[s])) return false;
+        if (prioF !== undefined && i.priority !== prioF) return false;
+        // O-7 search fallback (R-1): instances that ignore the `search` fetch
+        // param would otherwise return the unfiltered dump with no signal.
+        if (search) {
+          const ql = search.toLowerCase();
+          const hay = [`${ident}-${i.sequence_id}`, String(i.name ?? ""), htmlToText(String(i.description_html ?? ""))].join("\n").toLowerCase();
+          if (!hay.includes(ql)) return false;
+        }
+        return true;
+      };
+      const all = await fetchAll(p, fetchParams, { limit, match });
+      let items = all.raw;
       const labelF = args.flags.label;
       if (typeof labelF === "string") {
         const lid = lm[labelF];
@@ -506,13 +537,19 @@ export async function run(argv: string[]): Promise<unknown> {
       if (!Number.isInteger(page) || page < 1)
         throw new UsageError("validation", `--page must be a positive integer (got '${args.flags.page}')`);
       const pageSize = 25;
+      // O-5: never empty-silence an over-page (R-2).
+      const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+      if (items.length > 0 && page > totalPages)
+        throw new UsageError("validation", `page ${page} of ${totalPages} (${items.length} items)`, {
+          suggestion: `retry with --page ${totalPages}`,
+        });
       const slice = items.slice((page - 1) * pageSize, page * pageSize);
       const rows = [];
       for (const i of slice) {
         const s = await p.shapeIssue(i as never, { ident: all.ident });
         rows.push({
           id: s.id,
-          title: s.title.length > 100 ? `${s.title.slice(0, 99)}…` : s.title,
+          title: labeledCut(s.title, 100, `plane get ${s.id} --full`),
           state: s.state,
           priority: s.priority,
           assignee: s.assignees[0] ?? null,
@@ -520,7 +557,10 @@ export async function run(argv: string[]): Promise<unknown> {
           ...(fields?.includes("parent") ? { parent: s.parent } : {}),
         });
       }
-      return { items: rows, total: items.length, page, nextPage: page * pageSize < items.length ? page + 1 : null };
+      const hasMore = page * pageSize < items.length;
+      const nextPage = hasMore ? page + 1 : null;
+      const nextCommand = hasMore ? listCommand(args, nextPage!) : null;
+      return { items: rows, total: items.length, returned: rows.length, page, hasMore, nextPage, nextCommand };
     }
     case "claim": {
       const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
@@ -640,7 +680,7 @@ export async function run(argv: string[]): Promise<unknown> {
     case "comments": {
       const ref = await p.issueRef(requireTicket(args.positionals));
       const list = await p.comments(ref.uuid, ref.projectId, { full });
-      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : truncateText(c.text, 300) }));
+      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : labeledCut(c.text, 300, "--full for all") }));
       return pickFields({ id: `${ref.ident}-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
     }
     case "reply":
@@ -769,14 +809,38 @@ export async function run(argv: string[]): Promise<unknown> {
   }
 }
 
-async function fetchAll(p: Plane, search: string): Promise<{ raw: Array<Record<string, unknown>>; ident: string }> {
-  const outArr = await p.listIssues(search ? { search } : {});
+async function fetchAll(p: Plane, params: Record<string, string> | string, opts: { limit?: number; match?: (i: Record<string, unknown>) => boolean } = {}): Promise<{ raw: Array<Record<string, unknown>>; ident: string }> {
+  const q = typeof params === "string" ? (params ? { search: params } : {}) : params;
+  const outArr = await p.listIssues(q, 10, p.projectId(), opts);
   p.cache.set(`seqmap:${p.projectId()}`, Object.fromEntries(outArr.map((i) => [String(i.sequence_id), i.id as string])));
   return { raw: outArr, ident: await p.defaultIdent() };
 }
 
-function truncateText(text: string, cap: number): string {
-  return text.length <= cap ? text : `${text.slice(0, cap - 1)}…`;
+/** R-2: next-fetch command with the applied filters re-encoded. */
+function listCommand(argv: Args, nextPage: number): string {
+  const parts = ["plane", "list"];
+  const add = (name: string, v: string | boolean | string[] | undefined): void => {
+    if (v === undefined) return;
+    const vals = Array.isArray(v) ? v : [v];
+    for (const x of vals) parts.push(`--${name}`, String(x));
+  };
+  for (const f of ["state", "label", "assignee", "parent", "blocked-by", "search", "priority", "limit"] as const) add(f, argv.flags[f]);
+  parts.push("--page", String(nextPage));
+  return parts.join(" ");
+}
+
+function parsePositiveInt(value: string, flag: string): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1)
+    throw new UsageError("validation", `${flag} must be a positive integer (got '${value}')`);
+  return n;
+}
+
+/** R-1 labeled cut: never a bare "…" — names the count and the resume command. */
+function labeledCut(text: string, cap: number, resume: string): string {
+  if (text.length <= cap) return text;
+  const rest = text.length - cap;
+  return `${text.slice(0, cap)}…[truncated ${rest} chars — ${resume}]`;
 }
 
 export function main(argv: string[]): void {
