@@ -309,22 +309,29 @@ export class Plane {
 
   /** Walk the project's issue list. Current instances are CURSOR-paginated
    *  (next_cursor/next_page_results) and ignore the legacy offset `page` param —
-   *  following `page=N` would re-fetch page 1 forever. Dedupes defensively. */
-  async listIssues(params: Record<string, string> = {}, maxPages = 10, projectId: string = this.projectId()): Promise<Raw[]> {
+   *  following `page=N` would re-fetch page 1 forever. Dedupes defensively.
+   *  `opts.limit` bounds the walk (R-3): the fetch stops once `limit` matching
+   *  issues are collected, and `per_page` shrinks to the limit when smaller.
+   *  `opts.match` applies cheap sync filters during the walk so a narrow
+   *  query never pays a full-dump fetch. */
+  async listIssues(params: Record<string, string> = {}, maxPages = 10, projectId: string = this.projectId(), opts: { limit?: number; match?: (i: Raw) => boolean } = {}): Promise<Raw[]> {
     const out: Raw[] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
+    const perPage = opts.limit !== undefined && opts.limit < 100 ? String(opts.limit) : "100";
     for (let i = 0; i < maxPages; i++) {
-      const q = new URLSearchParams({ per_page: "100", ...params });
+      const q = new URLSearchParams({ per_page: perPage, ...params });
       if (cursor) q.set("cursor", cursor);
       const page = (await this.request("GET", `${this.projectPathFor(projectId)}/issues/?${q}`)) as Raw;
       for (const r of (page.results as Raw[]) ?? []) {
         const key = String(r.id);
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push(r);
-        }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (opts.match && !opts.match(r)) continue;
+        out.push(r);
+        if (opts.limit !== undefined && out.length >= opts.limit) break;
       }
+      if (opts.limit !== undefined && out.length >= opts.limit) break;
       if (!(page.next_page_results ?? false)) break;
       cursor = String(page.next_cursor ?? "");
       if (!cursor) break;
@@ -480,10 +487,8 @@ export class Plane {
       author: names[c.actor] ?? c.actor,
       date: String(c.created_at).slice(0, 10),
       id: c.id,
-      text: (() => {
-      const t = htmlToText(String(c.comment_html ?? "")).replace(/\s+/g, " ");
-      return opts.full ? t : t.slice(0, 400);
-    })(),
+      // Persist full text (R-1): truncation happens at render only, labeled.
+      text: htmlToText(String(c.comment_html ?? "")).replace(/\s+/g, " "),
     }));
   }
 

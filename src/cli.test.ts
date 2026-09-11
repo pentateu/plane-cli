@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cache } from "./cache.ts";
-import { resolveAsToken, run, peekCache } from "./cli.ts";
+import { resolveAsToken, run, peekCache, HELP } from "./cli.ts";
 
 type Call = { method: string; path: string; body?: unknown };
 let calls: Call[] = [];
@@ -218,7 +218,7 @@ beforeEach(() => {
     if (init?.method === "PATCH") globalThis.__patchBody = body as Record<string, unknown>;
     if (init?.method === "POST" && rel.endsWith("/comments/")) globalThis.__comments = [...(globalThis.__comments ?? []), { id: `cm-new-${globalThis.__comments.length}`, created_at: new Date(Date.now() + globalThis.__comments.length * 1000).toISOString(), comment_html: (body as any)?.comment_html ?? "", actor: "mb-dev1", parent: (body as any)?.parent ?? null }];
     if (init?.method === "POST" && rel === "/issues/") globalThis.__postBody = body as Record<string, unknown>;
-    calls.push({ method: init?.method ?? "POST", path: rel, body });
+    calls.push({ method: init?.method ?? "POST", path: rel, body, query: u.search });
     const r = router(init?.method ?? "POST", rel, body);
     const payload = r.status === 204 ? null : JSON.stringify(r.json ?? { ok: true, data: null });
     return new Response(payload, { status: r.status, headers: { "Content-Type": "application/json" } });
@@ -652,15 +652,107 @@ describe("comments / reply / comment", () => {
   });
 });
 
-describe("comment read cap", () => {
-  test("--full returns the whole comment, default stays capped", async () => {
+describe("comment read cap (O-3)", () => {
+  test("default truncates with a labeled marker; --full returns the whole comment", async () => {
     globalThis.__comments = [
       { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"y".repeat(600)}</p>`, actor: "mb-dev1" },
     ];
     const d = (await run(["comments", "HT-66"])) as Record<string, any>;
-    expect(String(d.comments[0].text).length).toBeLessThanOrEqual(300);
+    expect(String(d.comments[0].text)).toContain("…[truncated");
+    expect(String(d.comments[0].text)).toContain("--full for all");
+    expect(String(d.comments[0].text).length).toBe(339); // 300 + "…[truncated 300 chars — --full for all]"
     const f = (await run(["comments", "HT-66", "--full"])) as Record<string, any>;
     expect(String(f.comments[0].text).length).toBe(600);
+  });
+
+  test("get --comments uses the same labeled cap", async () => {
+    globalThis.__comments = [
+      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"z".repeat(400)}</p>`, actor: "mb-dev1" },
+    ];
+    const d = (await run(["get", "HT-66", "--comments"])) as Record<string, any>;
+    expect(String(d.comments[0].text)).toContain("…[truncated");
+    expect(String(d.comments[0].text)).toContain("--full for all");
+  });
+});
+
+describe("O-5 list pagination contract", () => {
+  const list30Router = (count: number, state = "st-todo", prio: string | null = "none") => {
+    const row = (n: number) => ({ id: `is-${n}`, sequence_id: n, name: `t${n}`, state, priority: prio, assignees: [], labels: [], parent: null });
+    return { items: Array.from({ length: count }, (_, i) => row(i + 200)) };
+  };
+  const useListRouter = (items: Array<Record<string, unknown>>) => {
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) return { status: 200, json: { results: items, next_page_results: false } };
+      return { status: 404 };
+    };
+  };
+
+  test("emits nextCommand that round-trips; over-page refuses with a hint", async () => {
+    useListRouter(list30Router(30).items);
+    const p1 = (await run(["list"])) as Record<string, any>;
+    expect(p1.total).toBe(30);
+    expect(p1.returned).toBe(25);
+    expect(p1.hasMore).toBe(true);
+    expect(p1.nextPage).toBe(2);
+    expect(p1.nextCommand).toBe("plane list --page 2");
+    const p2 = (await run(["list", "--page", "2"])) as Record<string, any>;
+    expect(p2.items.length).toBe(5);
+    expect(p2.hasMore).toBe(false);
+    expect(p2.nextCommand).toBeNull();
+    await expect(run(["list", "--page", "99"])).rejects.toMatchObject({ kind: "validation", suggestion: "retry with --page 2" });
+  });
+
+  test("nextCommand re-encodes filters", async () => {
+    useListRouter(list30Router(30, "st-todo", "high").items);
+    const p1 = (await run(["list", "--state", "todo", "--priority", "high"])) as Record<string, any>;
+    expect(p1.total).toBe(30);
+    expect(p1.nextCommand).toBe("plane list --state todo --priority high --page 2");
+  });
+
+  test("O-13: long title shows marker + resume", async () => {
+    useListRouter([{ id: "is-300", sequence_id: 300, name: "x".repeat(120), state: "st-todo", priority: "none", assignees: [], labels: [], parent: null }]);
+    const d = (await run(["list"])) as Record<string, any>;
+    expect(String(d.items[0].title)).toContain("…[truncated");
+    expect(String(d.items[0].title)).toContain("plane get HT-300 --full");
+  });
+});
+
+describe("O-7 server-side fetch filters", () => {
+  test("multi --state + --priority + --limit bound the walk and encode the query", async () => {
+    const row = (n: number, state: string, prio: string) => ({ id: `is-${n}`, sequence_id: n, name: `t${n}`, state, priority: prio, assignees: [], labels: [], parent: null });
+    let issueListCalls = 0;
+    router = (_m, path) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: [{ id: "pr-1", name: "Ai Tutor", identifier: "HT" }] } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: LABELS } };
+      if (/\/projects\/[^/]+\/issues\/$/.test(path)) {
+        issueListCalls++;
+        return { status: 200, json: { results: [row(1, "st-todo", "low"), row(2, "st-progress", "high"), row(3, "st-todo", "high")], next_page_results: true, next_cursor: "x:1:0" } };
+      }
+      return { status: 404 };
+    };
+    const d = (await run(["list", "--state", "todo", "--state", "progress", "--priority", "high", "--limit", "1"])) as Record<string, any>;
+    // bounded: the only match (is-2) arrives on page 1, so the walk stops there
+    expect(issueListCalls).toBe(1);
+    expect(d.total).toBe(1);
+    expect(d.items[0]!.id).toBe("HT-2");
+    const fetch = calls.find((c) => c.method === "GET" && /\/issues\/$/.test(c.path))!;
+    const q = decodeURIComponent(fetch.query);
+    expect(q).toContain("states=st-todo,st-progress");
+    expect(q).toContain("priority=high");
+    expect(q).toContain("per_page=1");
+  });
+});
+
+describe("O-12 help is contract", () => {
+  test("help matches the O-3 comment cap behavior", () => {
+    expect(HELP).toContain("labeled marker");
+    expect(HELP).not.toContain("stay capped at");
   });
 });
 
