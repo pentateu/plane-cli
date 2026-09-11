@@ -19,6 +19,13 @@ bun ~/Development/plane-cli/src/cli.ts <verb> …
 handles, flag rules). Do not restate it here — trust `help`, and if this file
 ever disagrees with `help`, `help` wins.
 
+`plane help` also carries the §19.7 PROCESS block (after VERBS, before ENV),
+generated from the shared `process-help.json` at the repo root (byte-identical
+across CLIs, `cli === "plane"` rows only). `plane help <verb>` shows a verb's
+usage plus a 3-line loop footer for spec rows tagged `perVerb: true`. A verb in
+the `VERBS` array missing its spec row fails the build (drift guard); do not
+hand-edit `process-help.json` — copy the canonical file wholesale.
+
 Handles are `<IDENT>-<seq>` across ALL workspace projects — `HT-17`, `TC-17`,
 `XT-2`, `EGG-5`, … each resolves to its own project. `HT-<seq>` and bare
 `<seq>` always mean the default project, and any other identifier must be one

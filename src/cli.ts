@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
+import { renderProcessBlock, renderVerbFooter, rowForVerb } from "./process-help.ts";
 
 let activeCache: Cache | undefined;
 
@@ -11,7 +12,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+export const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
@@ -311,6 +312,50 @@ EXAMPLES
   plane list --assignee me --state progress
   plane blocks HT-151 HT-184 && plane list --blocked-by HT-151`;
 
+const VERB_SET = new Set<string>(VERBS);
+
+/** Slice a verb's usage line(s) out of the VERBS section of HELP. A new entry
+ *  starts with two spaces + a known verb token; continuations are any other
+ *  indented line (e.g. `renders blockedBy[]…`, `[--body html …]`). */
+function usageForVerb(verb: string): string | undefined {
+  const lines = HELP.split("\n");
+  const verbsIdx = lines.indexOf("VERBS");
+  const envIdx = lines.indexOf("ENV");
+  if (verbsIdx === -1) return undefined;
+  const endBound = envIdx === -1 ? lines.length : envIdx;
+  const entryRe = new RegExp(`^ {2}${verb}(?:\\s|$)`);
+  for (let i = verbsIdx + 1; i < endBound; i++) {
+    const line = lines[i]!;
+    if (!entryRe.test(line)) continue;
+    let end = i + 1;
+    for (; end < endBound; end++) {
+      const l = lines[end]!;
+      if (l.trim() === "" || !l.startsWith(" ")) break;
+      if (VERB_SET.has(l.trim().split(/\s+/)[0] ?? "")) break;
+    }
+    return lines.slice(i, end).join("\n");
+  }
+  return undefined;
+}
+
+/** Full help text: feature text + PROCESS block, or per-verb usage + footer. */
+export function helpText(target?: string): string {
+  if (!target) {
+    const block = renderProcessBlock();
+    return HELP.replace(/\nENV\n/, `\n${block}\n\nENV\n`);
+  }
+  const usage = usageForVerb(target);
+  if (!rowForVerb(target) || !usage) {
+    throw new UsageError("validation", `no process spec row for verb '${target}'`, {
+      valid: [...VERBS],
+      suggestion: "plane help",
+      exitCode: 2,
+    });
+  }
+  const footer = renderVerbFooter(target);
+  return footer ? `${usage}\n\n${footer}` : usage;
+}
+
 export async function run(argv: string[]): Promise<unknown> {
   // INFRA-SSO-2: handle --as as global flag before verb (ot style) — plane verb is argv[0] but --as may precede it
   let asFlag: string | undefined;
@@ -324,7 +369,7 @@ export async function run(argv: string[]): Promise<unknown> {
   const args = parseArgs(filtered);
   if (asFlag) args.flags.as = asFlag;
   if (args.verb === "help") {
-    process.stdout.write(HELP + "\n");
+    process.stdout.write(helpText(args.positionals[0]) + "\n");
     process.exit(0);
   }
   if (!VERBS.includes(args.verb as (typeof VERBS)[number])) {
