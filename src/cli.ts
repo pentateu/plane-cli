@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
-import { readMounts, writeMounts } from "./sync.ts";
+import { readMounts, writeMounts, writeStatusFile } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
 import { countPending, pushTicket } from "./syncPush.ts";
 import { runSupervisor } from "./syncSupervisor.ts";
@@ -20,7 +20,7 @@ function finish(code: number): never {
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon", "no-wait"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon", "no-wait", "wait-all"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -285,6 +285,7 @@ VERBS
   sync <TC-N> --dir <path>        mount ticket↔folder mirror (blocks until pulled; --no-wait returns at once)
   sync <TC-N> --push-once          one-shot push of folder edits (bridge until the daemon loop lands)
   sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
+  sync --wait-all [--timeout N]   block until EVERY mount is pulled and drained (whole-handover gate)
   sync --daemon [--interval N]     run the supervisor (one worker process per project, poll N seconds)
   sync ls                         list active ticket↔folder mounts
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
@@ -499,7 +500,10 @@ export async function run(argv: string[]): Promise<unknown> {
           kids: [] as Array<{ rel: string; uuid: string; rev: string; bodySha: string }>,
         };
         writeMounts([...mounts, base]);
-        if (noWait) return { ticket: handle, dir: absDir, mounted: true, waiting: true };
+        if (noWait) {
+          writeStatusFile(absDir, { ticket: handle, ready: false, lastPoll: null, pending: 0, rev: null });
+          return { ticket: handle, dir: absDir, mounted: true, waiting: true };
+        }
         // Blocking default: initial pull so the folder is complete before
         // this returns.
         const pulled = await pullTicket(p, base);
@@ -508,6 +512,28 @@ export async function run(argv: string[]): Promise<unknown> {
           { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids },
         ]);
         return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
+      }
+      if (args.flags["wait-all"] === true) {
+        // Whole-handover gate: EVERY mount pulled (lastRev set) and drained
+        // (no pending events). start_ticket calls this once before handing
+        // over instead of one --wait per ticket. Zero mounts = vacuously
+        // ready. Unpulled mounts with no daemon running hit the timeout
+        // naming the stuck tickets (that names the real fault: start the
+        // daemon or mount without --no-wait).
+        const timeoutRaw = typeof args.flags.timeout === "string" ? Number(args.flags.timeout) : 120;
+        if (!Number.isFinite(timeoutRaw) || timeoutRaw <= 0)
+          throw new UsageError("validation", `invalid --timeout '${args.flags.timeout}'`, { valid: ["positive seconds"] });
+        const deadline = Date.now() + Math.round(timeoutRaw * 1000);
+        for (;;) {
+          const mounts = readMounts();
+          const open = mounts.filter((m) => m.lastRev === null || (m.pending ?? 0) !== 0 || countPending(m.dir) !== 0);
+          if (!open.length) return { ready: true, syncs: mounts.map((m) => m.ticket) };
+          if (Date.now() >= deadline)
+            throw new UsageError("validation", `sync --wait-all timed out (${open.length} open: ${open.map((m) => m.ticket).join(", ")})`, {
+              suggestion: "check the daemon is running, then retry",
+            });
+          await new Promise((r) => setTimeout(r, 500));
+        }
       }
       if (args.flags.wait === true || typeof args.flags.wait === "string") {
         // Handover gate: block until the mount is pulled (lastRev set) and

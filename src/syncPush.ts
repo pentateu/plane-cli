@@ -17,8 +17,12 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Plane, Raw } from "./api.ts";
-import { readMounts, writeMounts, type SyncMount } from "./sync.ts";
+import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, type SyncMount } from "./sync.ts";
 import { pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
+
+export function countPending(dir: string): number {
+  return countPendingEvents(dir);
+}
 
 export interface PushRefusal {
   refused: true;
@@ -107,9 +111,7 @@ function appendEvent(dir: string, e: SyncEvent): void {
 }
 
 function readEvents(dir: string): SyncEvent[] {
-  const f = join(dir, "comments.events.jsonl");
-  if (!existsSync(f)) return [];
-  return readFileSync(f, "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as SyncEvent);
+  return readEventsFile(dir) as SyncEvent[];
 }
 
 function writeEvents(dir: string, events: SyncEvent[]): void {
@@ -121,7 +123,7 @@ function writeEvents(dir: string, events: SyncEvent[]): void {
 }
 
 export function countPending(dir: string): number {
-  return readEvents(dir).filter((e) => e.status === "pending").length;
+  return countPendingEvents(dir);
 }
 
 /**
@@ -330,6 +332,9 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
   }
 
   const mounts = readMounts();
-  writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? { ...m, lastRev: r.rev, lastBodySha: r.bodySha, kids, lastPoll: new Date().toISOString(), pending: 0 } : m)));
+  const livePending = countPendingEvents(dir);
+  const next = { ...mounts.find((m) => m.ticket === mount.ticket)!, lastRev: r.rev, lastBodySha: r.bodySha, kids, lastPoll: new Date().toISOString(), pending: livePending };
+  writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
+  writeStatusFile(dir, { ticket: mount.ticket, ready: livePending === 0, lastPoll: next.lastPoll, pending: livePending, rev: next.lastRev });
   return { ticket: mount.ticket, pushed, comments, rev: r.rev };
 }

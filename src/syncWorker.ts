@@ -13,7 +13,7 @@
 import { Cache } from "./cache.ts";
 import { Plane } from "./api.ts";
 import { resolveConfig } from "./config.ts";
-import { readMounts, writeMounts } from "./sync.ts";
+import { readMounts, writeMounts, writeStatusFile } from "./sync.ts";
 import { countPending, pushTicket, reconcileEvents } from "./syncPush.ts";
 import { pullTicket } from "./syncPull.ts";
 
@@ -27,11 +27,9 @@ export async function workerCycle(projectId: string): Promise<Array<{ ticket: st
       // --no-wait mount: initial pull lands on the first worker cycle.
       const pulled = await pullTicket(p, mount);
       const mounts = readMounts();
-      writeMounts(mounts.map((m) =>
-        m.ticket === mount.ticket
-          ? { ...m, lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 }
-          : m,
-      ));
+      const next = { ...mount, lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 };
+      writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
+      writeStatusFile(mount.dir, { ticket: mount.ticket, ready: true, lastPoll: next.lastPoll, pending: 0, rev: next.lastRev });
       out.push({ ticket: mount.ticket, pushed: ["pulled"], comments: pulled.comments });
       continue;
     }
@@ -40,11 +38,9 @@ export async function workerCycle(projectId: string): Promise<Array<{ ticket: st
     const mounts = readMounts();
     const hit = mounts.find((m) => m.ticket === mount.ticket);
     if (hit) {
-      writeMounts(mounts.map((m) =>
-        m.ticket === mount.ticket
-          ? { ...m, lastPoll: new Date().toISOString(), pending: countPending(m.dir) }
-          : m,
-      ));
+      const next = { ...hit, lastPoll: new Date().toISOString(), pending: countPending(hit.dir) };
+      writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
+      writeStatusFile(hit.dir, { ticket: hit.ticket, ready: hit.lastRev !== null && next.pending === 0, lastPoll: next.lastPoll, pending: next.pending, rev: hit.lastRev });
     }
     out.push({ ticket: r.ticket, pushed: r.pushed, comments: r.comments });
   }

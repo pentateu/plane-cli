@@ -1600,6 +1600,71 @@ describe("sync daemon (TC-95 phase 4)", () => {
     expect(caught.kind).toBe("validation");
     expect(String(caught.message)).toContain("timed out");
   });
+
+  test("sync --wait-all returns ready when everything is pulled", async () => {
+    const d1 = daemonDir("r1");
+    const d2 = daemonDir("r2");
+    await run(["sync", "HT-66", "--dir", d1]);
+    await run(["sync", "HT-67", "--dir", d2]);
+    const d = (await run(["sync", "--wait-all"])) as Record<string, unknown>;
+    expect(d).toEqual({ ready: true, syncs: ["HT-66", "HT-67"] });
+  });
+
+  test("sync --wait-all with no mounts is vacuously ready", async () => {
+    const d = (await run(["sync", "--wait-all"])) as Record<string, unknown>;
+    expect(d).toEqual({ ready: true, syncs: [] });
+  });
+
+  test("sync --wait-all times out naming stuck tickets", async () => {
+    const d1 = daemonDir("s1");
+    const d2 = daemonDir("s2");
+    await run(["sync", "HT-66", "--dir", d1]);
+    await run(["sync", "HT-67", "--dir", d2, "--no-wait"]);
+    let caught: any;
+    try {
+      await run(["sync", "--wait-all", "--timeout", "1"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("HT-67");
+    expect(String(caught.message)).not.toContain("HT-66");
+  });
+
+  test("blocking mount writes a ready status file", async () => {
+    const dir = daemonDir("t");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const st = JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"));
+    expect(st).toMatchObject({ ticket: "HT-67", ready: true, pending: 0 });
+    expect(typeof st.rev).toBe("string");
+  });
+
+  test("--no-wait writes unready status; worker adopt flips it", async () => {
+    const { workerCycle } = await import("./syncWorker.ts");
+    const dir = daemonDir("u");
+    await run(["sync", "HT-67", "--dir", dir, "--no-wait"]);
+    expect(JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: false, rev: null });
+    await workerCycle("pr-1");
+    expect(JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: true });
+  });
+
+  test("re-pull preserves local pending rows", async () => {
+    const { pullTicket } = await import("./syncPull.ts");
+    const { Plane } = await import("./api.ts");
+    const { resolveConfig } = await import("./config.ts");
+    const dir = daemonDir("v");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const mine = { event: "add", op: "evt-keep-1", id: null, parent: null, author: "dev1", body: "unposted", body_sha: "sha256-k", at: "2026-09-12T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(mine) + "\n", { flag: "a" });
+    const cfg = resolveConfig({});
+    const p = new Plane(cfg, new Cache(process.env.PLANE_CACHE!));
+    const mounts = JSON.parse(readFileSync(process.env.PLANE_SYNC_STATE!, "utf8"));
+    await pullTicket(p, mounts[0]);
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.op === "evt-keep-1" && r.status === "pending")).toBeTrue();
+    // Server rows not duplicated (2 synced, same ops as the first pull).
+    expect(rows.filter((r: any) => r.status === "synced")).toHaveLength(2);
+  });
 });
 
 describe("blocks / depends / unblocks", () => {

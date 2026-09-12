@@ -17,7 +17,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { htmlToText, type Plane, type Raw } from "./api.ts";
-import type { SyncMount } from "./sync.ts";
+import { readEventsFile, writeStatusFile, type SyncMount } from "./sync.ts";
 
 export interface SyncEvent {
   event: "add" | "reply" | "resolve";
@@ -121,13 +121,20 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   const children = ctx.visited.size - 1;
 
   // Existing comments → synced events (server ids known) + derived snapshot.
+  // Local pending/conflict rows SURVIVE the rewrite (re-pull must never drop
+  // unposted work); server rows already present (by id) are not duplicated.
+  const prior = readEventsFile(mount.dir);
+  const kept = prior.filter((e) => e.status !== "synced");
+  const knownIds = new Set(prior.filter((e) => e.status === "synced" && e.id).map((e) => e.id as string));
+  const seatByMember = ctx.seatByMember;
   const list = (((rawComments as Raw).results ?? rawComments) as Raw[]).slice()
     .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-  const seatByMember = ctx.seatByMember;
-  const events: SyncEvent[] = list.map((c) => {
+  const fresh: SyncEvent[] = [];
+  for (const c of list) {
+    if (knownIds.has(String(c.id))) continue;
     const body = htmlToText(String(c.comment_html ?? ""));
     const actor = String(c.actor ?? "");
-    return {
+    fresh.push({
       event: c.parent ? "reply" : "add",
       op: randomUUID(),
       id: String(c.id),
@@ -137,12 +144,16 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
       body_sha: sha256(body),
       at: String(c.created_at ?? ""),
       status: "synced",
-    } as SyncEvent;
-  });
+    } as SyncEvent);
+  }
+  // Prior synced rows keep their ops (stable dedup keys); fresh server rows
+  // append in time order; local pending/conflict rows stay verbatim.
+  const events: SyncEvent[] = [...prior.filter((e) => e.status === "synced"), ...fresh, ...kept];
   writeFileSync(join(mount.dir, "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
   writeFileSync(
     join(mount.dir, "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
+  writeStatusFile(mount.dir, { ticket: mount.ticket, ready: kept.length === 0, lastPoll: new Date().toISOString(), pending: kept.length, rev });
   return { rev, bodySha, comments: events.length, children, kids: ctx.kids };
 }
