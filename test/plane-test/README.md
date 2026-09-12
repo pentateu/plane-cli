@@ -3,9 +3,58 @@
 Ephemeral, per-run infrastructure for plane CLI integration tests. Nothing
 here is long-lived: bring it up, run the suite, tear it down.
 
+## Local Plane TEST instance (primary — zero production contact)
+
+`docker-compose.yml` (`-p plane-test`) mirrors the prod plane-selfhost
+compose (`~/plane-selfhost/plane-app`): same images — backend fork
+`pentateu/plane-backend:v1.4.1-iswe` included — same service topology
+(`plane-db`, `plane-redis`, `plane-mq`, `plane-minio`, `migrator`, `api`,
+`worker`). Frontend services (`web`, `space`, `admin`, `live`, `proxy`) are
+absent on purpose: the CLI only talks to `/api/v1`, and the proxy's
+`8097`/`8443` binds stay with prod.
+
+- API: `http://127.0.0.1:3211` (host) → `8000` (container), bind
+  **127.0.0.1 only**; postgres `127.0.0.1:5455` → `5432`. No other service
+  publishes a host port. Override not needed — both were free at authoring
+  time and collide with nothing (prod `8097`/`8443`, ot-test `3111`/`5454`).
+- secrets are dummies inline; service names match prod defaults so no extra
+  env mapping was needed (`plane-db`, `plane-redis`, `plane-mq:5672/plane`,
+  minio `uploads` bucket).
+
+```sh
+docker compose -p plane-test up -d   # start all (migrator runs, then exits 0)
+./seed.sh                            # user + token + workspace + TEST project + type labels
+set -a; . ./.plane-test-env; set +a  # PLANE_API_BASE + seat + token + project + test-local cache
+plane whoami                         # {"seat":"test",...} — proves the stack answers
+docker compose -p plane-test down -v && rm -f .plane-test-env .plane-cache
+# teardown (removes containers + volumes; no port leaks — verify with ss -tln)
+```
+
+`seed.sh` is idempotent (re-runnable; existing user/token/workspace/project/
+labels are reused) and NEVER prints the token — it writes the gitignored
+`.plane-test-env` (`chmod 600`). Seed details:
+
+- user `test@iswe.co.nz`: the seat name MUST equal the member's email
+  local-part — that is how the CLI maps `--seat`/`PLANE_SEAT` to a roster
+  member. Any other seat name 403s/404s against this stack.
+- workspace `plane-cli-test` (shell-created; the v1 API the CLI speaks has
+  no workspace create — workspace list/create lives on the session-authed
+  `/api/` app router).
+- project `TEST` (v1 REST-created, so default states come from real code
+  paths) + the four CLI labels (`type:bug`, `type:feature`, `type:ops`,
+  `type:plan`; v1 project create does not provision labels).
+- verified 2026-09-12: full `create → comment → state → get → delete`
+  round-trip green (`TEST-1`, then deleted; final `list` empty).
+
+Cache warning (proven here): the CLI caches `labels:<projectId>` in
+`PLANE_CACHE` — seed (or create) labels AFTER a run cached the empty map and
+`create --type` fails until the cache is dropped. Always use the test-local
+`PLANE_CACHE` from `.plane-test-env` (never your dev cache), and `rm -f`
+it whenever the seed changes labels/states.
+
 ## NATS
 
-`compose.yaml` starts a single `nats:2.10-alpine` node (JetStream on),
+`nats/compose.yaml` starts a single `nats:2.10-alpine` node (JetStream on),
 following the TC-38 review/e2e pattern:
 
 - client port bound **127.0.0.1 only**, high-ephemeral default `24322`
@@ -14,9 +63,12 @@ following the TC-38 review/e2e pattern:
 - no port leaks: teardown removes the container and its data
 
 ```sh
-docker compose -p plane-test up -d          # start
-docker compose -p plane-test down -v        # teardown (removes container + volume)
+docker compose -f nats/compose.yaml -p plane-test-nats up -d       # start
+docker compose -f nats/compose.yaml -p plane-test-nats down -v     # teardown (removes container + volume)
 ```
+
+NOTE: run NATS under a DIFFERENT project name (`-p plane-test-nats`) — the
+bare `-p plane-test` name belongs to the Plane stack above.
 
 ## Plane TEST project (live instance)
 

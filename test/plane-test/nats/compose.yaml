@@ -6,13 +6,15 @@
 # Port 24322 was chosen free at the time of writing (checked with
 # `ss -tlnp`; avoids the occupied 15042, 14933, 14228, 4224, 8224, 14222).
 # If it collides on your host, override without editing this file:
-#   PLANE_TEST_NATS_PORT=25xxx docker compose -p plane-test up -d
+#   PLANE_TEST_NATS_PORT=25xxx docker compose -f nats/compose.yaml -p plane-test-nats up -d
+# (run from test/plane-test/; -p plane-test-nats avoids the plane-test name
+# owned by the local Plane stack in ../docker-compose.yml)
 #
-# Start:   docker compose -p plane-test up -d
-# Probe:   docker run --rm --network plane-test_nats natsio/nats-box \
+# Start:   docker compose -f nats/compose.yaml -p plane-test-nats up -d
+# Probe:   docker run --rm --network plane-test-nats_default natsio/nats-box \
 #            nats -s nats://nats:4222 pub probe ok
 # Teardown (removes container + volume):
-#          docker compose -p plane-test down -v
+#          docker compose -f nats/compose.yaml -p plane-test-nats down -v
 #
 # Test connection string from the host: nats://127.0.0.1:${PLANE_TEST_NATS_PORT:-24322}
 
