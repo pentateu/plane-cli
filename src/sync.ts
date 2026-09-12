@@ -23,6 +23,8 @@ export interface SyncMount {
   createdAt: string;
   lastPoll: string | null; // daemon fills; null until first poll
   pending: number; // daemon fills; events awaiting push
+  lastRev: string | null; // server updated_at at last pull/push (revision guard)
+  lastBodySha: string | null; // sha of ticket.md at last pull/push (change detect)
 }
 
 export function syncStatePath(): string {

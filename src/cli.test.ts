@@ -1335,7 +1335,7 @@ describe("sync", () => {
   });
 });
 
-describe("sync mounts (TC-95 phase 1 — registry only)", () => {
+describe("sync mounts + pull (TC-95 phases 1-2)", () => {
   function mountDir(name: string): string {
     const dir = mkdtempSync(join(tmpdir(), `plane-sync-${name}-`));
     tmpDirs.push(dir);
@@ -1353,7 +1353,7 @@ describe("sync mounts (TC-95 phase 1 — registry only)", () => {
     expect(d).toMatchObject({ ticket: "HT-66", dir, mounted: true });
     expect(existsSync(dir)).toBeTrue();
     const ls = (await run(["sync", "ls"])) as Record<string, any>;
-    expect(ls.syncs).toEqual([{ ticket: "HT-66", dir, lastPoll: null, pending: 0 }]);
+    expect(ls.syncs).toEqual([{ ticket: "HT-66", dir, lastPoll: expect.any(String), pending: 0 }]);
   });
 
   test("second mount of the same ticket refuses loud", async () => {
@@ -1414,6 +1414,29 @@ describe("sync mounts (TC-95 phase 1 — registry only)", () => {
     }
     expect(caught.kind).toBe("not-found");
     expect(String(caught.message)).toContain("no active sync mount");
+  });
+
+  test("mount pulls ticket.md with front-matter + synced comment events", async () => {
+    const dir = mountDir("e");
+    const d = (await run(["sync", "HT-67", "--dir", dir])) as Record<string, unknown>;
+    expect(d).toMatchObject({ ticket: "HT-67", comments: 2, children: 1 });
+    const md = readFileSync(join(dir, "ticket.md"), "utf8");
+    expect(md).toContain("---\nstate: todo\nassignee: dev2\nlabels: [type:bug]\npriority: none\n---\n# [bug] overshoot quota\n");
+    const events = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ event: "add", id: "cm-0", status: "synced" });
+    expect(events.every((e: any) => typeof e.op === "string" && typeof e.body_sha === "string")).toBeTrue();
+    const snap = JSON.parse(readFileSync(join(dir, "comments.json"), "utf8"));
+    expect(snap).toHaveLength(2);
+    expect(snap[0]).toEqual({ id: "cm-0", parent: null, author: expect.any(String), body: expect.any(String), at: expect.any(String), status: "synced" });
+  });
+
+  test("mount pulls sub-tickets recursively", async () => {
+    const dir = mountDir("f");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const kids = readFileSync(join(dir, "sub-tickets", "impl-personal-tutor-coherence", "ticket.md"), "utf8");
+    expect(kids).toContain("# [impl] personal tutor coherence");
+    expect(kids).toContain("state: progress");
   });
 });
 

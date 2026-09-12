@@ -6,6 +6,7 @@ import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 import { readMounts, writeMounts } from "./sync.ts";
+import { pullTicket } from "./syncPull.ts";
 
 let activeCache: Cache | undefined;
 
@@ -477,9 +478,30 @@ export async function run(argv: string[]): Promise<unknown> {
             createdAt: new Date().toISOString(),
             lastPoll: null,
             pending: 0,
+            lastRev: null,
+            lastBodySha: null,
           },
         ]);
-        return { ticket: handle, dir: absDir, mounted: true };
+        // Phase 2: initial pull so the folder is immediately usable.
+        const pulled = await pullTicket(p, { ticket: handle, projectId: ref.projectId, uuid: ref.uuid, seq: ref.seq, ident: ref.ident, dir: absDir, seat: cfg.seat, createdAt: "", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null });
+        writeMounts([
+          ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
+          {
+            ticket: handle,
+            projectId: ref.projectId,
+            uuid: ref.uuid,
+            seq: ref.seq,
+            ident: ref.ident,
+            dir: absDir,
+            seat: cfg.seat,
+            createdAt: new Date().toISOString(),
+            lastPoll: new Date().toISOString(),
+            pending: 0,
+            lastRev: pulled.rev,
+            lastBodySha: pulled.bodySha,
+          },
+        ]);
+        return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
       }
       if (sub !== undefined)
         throw new UsageError("validation", `sync ${sub} needs --dir <path>: plane sync ${sub} --dir <path>`, {
