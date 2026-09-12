@@ -1024,7 +1024,9 @@ export async function run(argv: string[]): Promise<unknown> {
         });
       const payload: Record<string, unknown> = {
         name: title,
-        description_html: html,
+        // Empty bodies are omitted: Plane 400s on "" ("Invalid HTML passed")
+        // and the server default (<p></p>) applies either way.
+        ...(html ? { description_html: html } : {}),
         state: requireStateId(sm, "todo"),
         labels: [labelId],
         ...(prio ? { priority: prio } : {}),

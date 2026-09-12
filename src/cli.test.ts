@@ -834,6 +834,13 @@ describe("create / sub", () => {
     expect(d.dryRun).toBe(true);
     expect(d.requests[0]!.method).toBe("POST");
   });
+
+  test("empty --body omits description_html (Plane 400s on empty)", async () => {
+    await run(["create", "--title", "nb", "--type", "bug", "--body", ""]);
+    const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
+    expect(post.body).toMatchObject({ name: "nb" });
+    expect("description_html" in (post.body as Record<string, unknown>)).toBeFalse();
+  });
 });
 
 describe("create --project (TC-81)", () => {
