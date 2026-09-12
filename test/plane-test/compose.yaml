@@ -1,0 +1,28 @@
+# TC-86: NATS test service for plane CLI integration tests.
+# TC-38 pattern: nats:2.10-alpine, client port bound high-ephemeral on
+# 127.0.0.1 only. Ephemeral per-run: start, run tests, tear down — the
+# teardown below removes the container and volume so nothing leaks.
+#
+# Port 24322 was chosen free at the time of writing (checked with
+# `ss -tlnp`; avoids the occupied 15042, 14933, 14228, 4224, 8224, 14222).
+# If it collides on your host, override without editing this file:
+#   PLANE_TEST_NATS_PORT=25xxx docker compose -p plane-test up -d
+#
+# Start:   docker compose -p plane-test up -d
+# Probe:   docker run --rm --network plane-test_nats natsio/nats-box \
+#            nats -s nats://nats:4222 pub probe ok
+# Teardown (removes container + volume):
+#          docker compose -p plane-test down -v
+#
+# Test connection string from the host: nats://127.0.0.1:${PLANE_TEST_NATS_PORT:-24322}
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: plane-test-nats
+    ports:
+      - "127.0.0.1:${PLANE_TEST_NATS_PORT:-24322}:4222"
+    command: ["-js"] # JetStream on, matching the TC-38 review/e2e containers
+    tmpfs:
+      - /data
+    restart: "no"

@@ -52,3 +52,9 @@ construction. Precedence: project `.plane-seats` > legacy
 Reference deployment: **pentateu/AI_Tutor** (Ai Tutor project).
 
 `plane help` is the canonical contract text.
+
+## Testing
+
+Plane CLI test target: the `TESTCLI` project on the live instance (smoke
+tests, zero production tickets touched) + ephemeral NATS test services —
+see `test/plane-test/README.md` and `test/plane-test/compose.yaml`.
