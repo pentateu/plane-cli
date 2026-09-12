@@ -7,7 +7,7 @@ import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, ty
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 import { readMounts, writeMounts } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
-import { pushTicket } from "./syncPush.ts";
+import { countPending, pushTicket } from "./syncPush.ts";
 import { runSupervisor } from "./syncSupervisor.ts";
 
 let activeCache: Cache | undefined;
@@ -19,8 +19,8 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "interval", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "limit", "body", "body-file", "body-md", "file", "comment"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon", "no-wait"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -282,8 +282,9 @@ VERBS
   config                          show resolved seat/apiBase/project/tokenSource/cache
   projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
-  sync <TC-N> --dir <path>        mount ticket↔folder mirror (TC-95 §29.8; daemon fills lastPoll/pending)
+  sync <TC-N> --dir <path>        mount ticket↔folder mirror (blocks until pulled; --no-wait returns at once)
   sync <TC-N> --push-once          one-shot push of folder edits (bridge until the daemon loop lands)
+  sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
   sync --daemon [--interval N]     run the supervisor (one worker process per project, poll N seconds)
   sync ls                         list active ticket↔folder mounts
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
@@ -477,44 +478,67 @@ export async function run(argv: string[]): Promise<unknown> {
             suggestion: "mount into an empty dir",
           });
         mkdirSync(absDir, { recursive: true });
-        writeMounts([
-          ...mounts,
-          {
-            ticket: handle,
-            projectId: ref.projectId,
-            uuid: ref.uuid,
-            seq: ref.seq,
-            ident: ref.ident,
-            dir: absDir,
-            seat: cfg.seat,
-            createdAt: new Date().toISOString(),
-            lastPoll: null,
-            pending: 0,
-            lastRev: null,
-            lastBodySha: null,
-          },
-        ]);
-        // Phase 2: initial pull so the folder is immediately usable.
-        const pulled = await pullTicket(p, { ticket: handle, projectId: ref.projectId, uuid: ref.uuid, seq: ref.seq, ident: ref.ident, dir: absDir, seat: cfg.seat, createdAt: "", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null, kids: [] });
+        // --no-wait: register now, pull later (daemon adopts unpulled mounts
+        // on its first cycle; `sync --wait` blocks until it lands). Default
+        // blocks: the folder is complete before this returns — the
+        // start_ticket pattern is mount --no-wait early, --wait at handover.
+        const noWait = args.flags["no-wait"] === true;
+        const base = {
+          ticket: handle,
+          projectId: ref.projectId,
+          uuid: ref.uuid,
+          seq: ref.seq,
+          ident: ref.ident,
+          dir: absDir,
+          seat: cfg.seat,
+          createdAt: new Date().toISOString(),
+          lastPoll: null as string | null,
+          pending: 0,
+          lastRev: null as string | null,
+          lastBodySha: null as string | null,
+          kids: [] as Array<{ rel: string; uuid: string; rev: string; bodySha: string }>,
+        };
+        writeMounts([...mounts, base]);
+        if (noWait) return { ticket: handle, dir: absDir, mounted: true, waiting: true };
+        // Blocking default: initial pull so the folder is complete before
+        // this returns.
+        const pulled = await pullTicket(p, base);
         writeMounts([
           ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
-          {
-            ticket: handle,
-            projectId: ref.projectId,
-            uuid: ref.uuid,
-            seq: ref.seq,
-            ident: ref.ident,
-            dir: absDir,
-            seat: cfg.seat,
-            createdAt: new Date().toISOString(),
-            lastPoll: new Date().toISOString(),
-            pending: 0,
-            lastRev: pulled.rev,
-            lastBodySha: pulled.bodySha,
-            kids: pulled.kids,
-          },
+          { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids },
         ]);
         return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
+      }
+      if (args.flags.wait === true || typeof args.flags.wait === "string") {
+        // Handover gate: block until the mount is pulled (lastRev set) and
+        // drained (no pending events). start_ticket calls this just before
+        // handing over to the agent.
+        const raw = typeof args.flags.wait === "string" ? args.flags.wait : sub;
+        if (!raw)
+          throw new UsageError("validation", "sync --wait needs a ticket: plane sync --wait TEST-1", {
+            suggestion: "plane sync ls to list active mounts",
+          });
+        const ref = await p.issueRef(raw, { fresh: true });
+        const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
+        const timeoutRaw = typeof args.flags.timeout === "string" ? Number(args.flags.timeout) : 120;
+        if (!Number.isFinite(timeoutRaw) || timeoutRaw <= 0)
+          throw new UsageError("validation", `invalid --timeout '${args.flags.timeout}'`, { valid: ["positive seconds"] });
+        const deadline = Date.now() + Math.round(timeoutRaw * 1000);
+        for (;;) {
+          const hit = readMounts().find((m) => m.ticket.toUpperCase() === handle);
+          if (!hit)
+            throw new UsageError("not-found", `no active sync mount for '${handle}'`, {
+              valid: readMounts().map((m) => m.ticket),
+              suggestion: "plane sync ls to list active mounts",
+            });
+          if (hit.lastRev !== null && (hit.pending ?? 0) === 0 && countPending(hit.dir) === 0)
+            return { ticket: handle, ready: true, dir: hit.dir };
+          if (Date.now() >= deadline)
+            throw new UsageError("validation", `sync --wait timed out on '${handle}' (still unpulled or draining)`, {
+              suggestion: "check the daemon is running, then retry",
+            });
+          await new Promise((r) => setTimeout(r, 500));
+        }
       }
       if (args.flags["push-once"] === true) {
         if (sub === undefined)

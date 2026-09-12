@@ -15,6 +15,7 @@ import { Plane } from "./api.ts";
 import { resolveConfig } from "./config.ts";
 import { readMounts, writeMounts } from "./sync.ts";
 import { countPending, pushTicket, reconcileEvents } from "./syncPush.ts";
+import { pullTicket } from "./syncPull.ts";
 
 export async function workerCycle(projectId: string): Promise<Array<{ ticket: string; pushed: string[]; comments: number }>> {
   const cfg = resolveConfig({});
@@ -22,6 +23,18 @@ export async function workerCycle(projectId: string): Promise<Array<{ ticket: st
   const p = new Plane(cfg, cache);
   const out: Array<{ ticket: string; pushed: string[]; comments: number }> = [];
   for (const mount of readMounts().filter((m) => m.projectId === projectId)) {
+    if (mount.lastRev === null) {
+      // --no-wait mount: initial pull lands on the first worker cycle.
+      const pulled = await pullTicket(p, mount);
+      const mounts = readMounts();
+      writeMounts(mounts.map((m) =>
+        m.ticket === mount.ticket
+          ? { ...m, lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 }
+          : m,
+      ));
+      out.push({ ticket: mount.ticket, pushed: ["pulled"], comments: pulled.comments });
+      continue;
+    }
     await reconcileEvents(p, mount);
     const r = await pushTicket(p, mount);
     const mounts = readMounts();

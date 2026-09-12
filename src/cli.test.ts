@@ -1499,6 +1499,12 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
 });
 
 describe("sync daemon (TC-95 phase 4)", () => {
+  function daemonDir(name: string): string {
+    const dir = mkdtempSync(join(tmpdir(), `plane-sync-${name}-`));
+    tmpDirs.push(dir);
+    return join(dir, "mount");
+  }
+
   test("projectsOf groups mounts by project", async () => {
     const { projectsOf } = await import("./syncSupervisor.ts");
     expect(projectsOf([{ projectId: "pr-1" }, { projectId: "pr-2" }, { projectId: "pr-1" }])).toEqual(["pr-1", "pr-2"]);
@@ -1547,6 +1553,52 @@ describe("sync daemon (TC-95 phase 4)", () => {
     }
     expect(caught.kind).toBe("validation");
     expect(String(caught.message)).toContain("invalid --interval");
+  });
+
+  test("mount --no-wait registers without pulling", async () => {
+    const dir = daemonDir("n");
+    const d = (await run(["sync", "HT-67", "--dir", dir, "--no-wait"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ ticket: "HT-67", mounted: true, waiting: true });
+    expect(existsSync(join(dir, "ticket.md"))).toBeFalse();
+  });
+
+  test("worker cycle adopts an unpulled mount", async () => {
+    const { workerCycle } = await import("./syncWorker.ts");
+    const dir = daemonDir("o");
+    await run(["sync", "HT-67", "--dir", dir, "--no-wait"]);
+    const r = await workerCycle("pr-1");
+    expect(r).toEqual([{ ticket: "HT-67", pushed: ["pulled"], comments: 2 }]);
+    expect(existsSync(join(dir, "ticket.md"))).toBeTrue();
+  });
+
+  test("sync --wait returns ready once pulled", async () => {
+    const dir = daemonDir("p");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const d = (await run(["sync", "--wait", "HT-67"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ ticket: "HT-67", ready: true, dir });
+  });
+
+  test("sync --wait on an unmounted ticket fails", async () => {
+    let caught: any;
+    try {
+      await run(["sync", "--wait", "HT-67"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+  });
+
+  test("sync --wait times out on an unpulled mount", async () => {
+    const dir = daemonDir("q");
+    await run(["sync", "HT-67", "--dir", dir, "--no-wait"]);
+    let caught: any;
+    try {
+      await run(["sync", "--wait", "HT-67", "--timeout", "1"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("timed out");
   });
 });
 
