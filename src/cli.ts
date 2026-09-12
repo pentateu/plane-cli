@@ -8,6 +8,7 @@ import { UsageError, availableSeats, resolveConfig, type Config } from "./config
 import { readMounts, writeMounts } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
 import { pushTicket } from "./syncPush.ts";
+import { runSupervisor } from "./syncSupervisor.ts";
 
 let activeCache: Cache | undefined;
 
@@ -18,8 +19,8 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "interval", "limit", "body", "body-file", "body-md", "file", "comment"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -283,6 +284,7 @@ VERBS
   sync                            force-refresh cached states/labels/member/ticket index
   sync <TC-N> --dir <path>        mount ticket↔folder mirror (TC-95 §29.8; daemon fills lastPoll/pending)
   sync <TC-N> --push-once          one-shot push of folder edits (bridge until the daemon loop lands)
+  sync --daemon [--interval N]     run the supervisor (one worker process per project, poll N seconds)
   sync ls                         list active ticket↔folder mounts
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
@@ -421,11 +423,19 @@ export async function run(argv: string[]): Promise<unknown> {
       return { seat: cfg.seat, tokenSource: cfg.tokenSource, apiBase: cfg.apiBase, workspace: cfg.workspace, project: cfg.projectName, cache: Object.keys(cache.data) };
     }
     case "sync": {
-      // TC-95 (§29.8, R-6): --dir / --stop / ls select the ticket↔folder
-      // mount surface; bare `sync` keeps the legacy cache-refresh below.
+      // TC-95 (§29.8, R-6): --dir / --stop / --daemon / ls select the
+      // ticket↔folder mount surface; bare `sync` keeps the legacy
+      // cache-refresh below.
       const dirF = typeof args.flags.dir === "string" ? args.flags.dir : undefined;
       const stopF = args.flags.stop;
       const sub = args.positionals[0];
+      if (args.flags.daemon === true) {
+        const raw = typeof args.flags.interval === "string" ? Number(args.flags.interval) : 5;
+        if (!Number.isFinite(raw) || raw <= 0)
+          throw new UsageError("validation", `invalid --interval '${args.flags.interval}'`, { valid: ["positive seconds"] });
+        await runSupervisor({ intervalMs: Math.round(raw * 1000) });
+        return { daemon: true };
+      }
       if (sub === "ls" && dirF === undefined && stopF === undefined) {
         const mounts = readMounts();
         return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })) };

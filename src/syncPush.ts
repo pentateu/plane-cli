@@ -120,6 +120,52 @@ function writeEvents(dir: string, events: SyncEvent[]): void {
   );
 }
 
+export function countPending(dir: string): number {
+  return readEvents(dir).filter((e) => e.status === "pending").length;
+}
+
+/**
+ * Restart reconcile (§29.6 durable pending-op): for every pending/conflict
+ * row, re-list server comments — id known and landed → adopt + synced;
+ * id unknown → match (author, parent, body_sha) → adopt; else leave pending
+ * for the push to post under the SAME op (never re-post landed, never lose
+ * unlanded).
+ */
+export async function reconcileEvents(p: Plane, mount: SyncMount): Promise<{ adopted: number; stillPending: number }> {
+  const dir = mount.dir;
+  const events = readEvents(dir);
+  if (!events.some((e) => e.status === "pending" || e.status === "conflict")) return { adopted: 0, stillPending: 0 };
+  const raw = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`)) as Raw;
+  const server = (((raw as Raw).results ?? raw) as Raw[]).map((c) => ({
+    id: String(c.id),
+    parent: c.parent ? String(c.parent) : null,
+    author: String(c.actor ?? ""),
+    body: String(c.comment_html ?? ""),
+  }));
+  let adopted = 0;
+  for (const e of events) {
+    if (e.status !== "pending" && e.status !== "conflict") continue;
+    if (e.id && server.some((c) => c.id === e.id)) {
+      e.status = "synced";
+      adopted++;
+      continue;
+    }
+    // Match by author display/seat? Server actor is a member id; event author
+    // is a seat. Match on parent + body text containment both ways is too
+    // loose — match parent + identical posted-HTML shape instead: the daemon
+    // posts `<p>${esc(body)}</p>`, so compare against that rendering.
+    const rendered = `<p>${e.body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`;
+    const hit = server.find((c) => (c.parent ?? null) === (e.parent ?? null) && c.body === rendered);
+    if (hit) {
+      e.id = hit.id;
+      e.status = "synced";
+      adopted++;
+    }
+  }
+  writeEvents(dir, events);
+  return { adopted, stillPending: events.filter((e) => e.status === "pending").length };
+}
+
 async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Promise<{ pushed: string[]; comments: number; rev: string; bodySha: string }> {
   const pushed: string[] = [];
   const md = readFileSync(join(dir, "ticket.md"), "utf8");

@@ -1498,6 +1498,58 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
   });
 });
 
+describe("sync daemon (TC-95 phase 4)", () => {
+  test("projectsOf groups mounts by project", async () => {
+    const { projectsOf } = await import("./syncSupervisor.ts");
+    expect(projectsOf([{ projectId: "pr-1" }, { projectId: "pr-2" }, { projectId: "pr-1" }])).toEqual(["pr-1", "pr-2"]);
+  });
+
+  test("worker cycle reconciles a landed pending op without re-posting", async () => {
+    const { workerCycle } = await import("./syncWorker.ts");
+    const dir = mkdtempSync(join(tmpdir(), "plane-sync-k-"));
+    tmpDirs.push(dir);
+    const mnt = join(dir, "mount");
+    await run(["sync", "HT-67", "--dir", mnt]);
+    // Crashed between post and id write: server HAS cm-0, row still pending.
+    const landed = { event: "add", op: "evt-landed-1", id: "cm-0", parent: null, author: "dev1", body: "x", body_sha: "sha256-x", at: "2026-09-12T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(mnt, "comments.events.jsonl"), JSON.stringify(landed) + "\n", { flag: "a" });
+    const postsBefore = calls.filter((c) => c.method === "POST" && /\/comments\/$/.test(c.path)).length;
+    await workerCycle("pr-1");
+    const postsAfter = calls.filter((c) => c.method === "POST" && /\/comments\/$/.test(c.path)).length;
+    expect(postsAfter).toBe(postsBefore); // adopted, never re-posted
+    const rows = readFileSync(join(mnt, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.find((r: any) => r.op === "evt-landed-1").status).toBe("synced");
+  });
+
+  test("worker cycle posts a truly unlanded pending op under the same op", async () => {
+    const { workerCycle } = await import("./syncWorker.ts");
+    const dir = mkdtempSync(join(tmpdir(), "plane-sync-m-"));
+    tmpDirs.push(dir);
+    const mnt = join(dir, "mount");
+    await run(["sync", "HT-67", "--dir", mnt]);
+    const fresh = { event: "add", op: "evt-fresh-1", id: null, parent: null, author: "dev1", body: "brand new", body_sha: "sha256-y", at: "2026-09-12T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(mnt, "comments.events.jsonl"), JSON.stringify(fresh) + "\n", { flag: "a" });
+    await workerCycle("pr-1");
+    expect(calls.some((c) => c.method === "POST" && /\/issues\/is-67\/comments\/$/.test(c.path))).toBeTrue();
+    const rows = readFileSync(join(mnt, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const mine = rows.find((r: any) => r.op === "evt-fresh-1");
+    expect(mine.status).toBe("synced");
+    // Same op retained (dedup key stable across the crash window).
+    expect(typeof mine.op).toBe("string");
+  });
+
+  test("sync --daemon rejects a bad interval", async () => {
+    let caught: any;
+    try {
+      await run(["sync", "--daemon", "--interval", "nope"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("invalid --interval");
+  });
+});
+
 describe("blocks / depends / unblocks", () => {
   async function kindOf(args: string[]): Promise<{ kind?: string; exitCode?: number; message?: string; valid?: string[]; suggestion?: string }> {
     try {
