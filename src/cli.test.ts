@@ -60,7 +60,7 @@ function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p
   };
 }
 
-const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "HOMETUTOR_TICKETS_PROJECT_ID"];
+const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "HOMETUTOR_TICKETS_PROJECT_ID"];
 
 function capture(obj: any, method: string): any {
   const s = spyOn(obj, method).mockImplementation(() => {});
@@ -207,6 +207,7 @@ beforeEach(() => {
   delete process.env.PLANE_PROJECT_ID;
   delete process.env.PLANE_IDENT;
   delete process.env.HOMETUTOR_TICKETS_TOKEN_TEST;
+  delete process.env.HOMETUTOR_TICKETS_PROJECT_ID;
   globalThis.__comments = [
     { id: "cm-1", created_at: "2026-08-24T02:00:00Z", comment_html: "<p>second posted</p>", actor: "mb-rafael" },
     { id: "cm-0", created_at: "2026-08-24T01:00:00Z", comment_html: "<p>first note &amp; more</p>", actor: "mb-rafael" },

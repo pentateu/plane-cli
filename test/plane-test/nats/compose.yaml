@@ -13,7 +13,7 @@
 # Start:   docker compose -f nats/compose.yaml -p plane-test-nats up -d
 # Probe:   docker run --rm --network plane-test-nats_default natsio/nats-box \
 #            nats -s nats://nats:4222 pub probe ok
-# Teardown (removes container + volume):
+# Teardown (removes the container; storage is tmpfs, no volume exists):
 #          docker compose -f nats/compose.yaml -p plane-test-nats down -v
 #
 # Test connection string from the host: nats://127.0.0.1:${PLANE_TEST_NATS_PORT:-24322}

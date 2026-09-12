@@ -75,7 +75,7 @@ following the TC-38 review/e2e pattern:
 
 ```sh
 docker compose -f nats/compose.yaml -p plane-test-nats up -d       # start
-docker compose -f nats/compose.yaml -p plane-test-nats down -v     # teardown (removes container + volume)
+docker compose -f nats/compose.yaml -p plane-test-nats down -v     # teardown (removes the container; storage is tmpfs)
 ```
 
 NOTE: run NATS under a DIFFERENT project name (`-p plane-test-nats`) — the
@@ -117,8 +117,7 @@ verbs (`get`, `comment`, `state`, `delete`, …) DO resolve `TESTCLI-N`
 handles against any project via the registry. Until a `--project` flag
 exists, integration tests should scope the whole invocation with
 `PLANE_PROJECT_ID` + `PLANE_IDENT` as shown above — that is the CLI's own
-documented config surface, not a workaround. (`--project` flag in flight
-as TC-81; this section goes stale when it merges.)
+documented config surface, not a workaround.
 
 ## Project creation was NOT admin-gated
 

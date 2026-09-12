@@ -1,3 +1,4 @@
 .plane-test-env
 .plane-cache
 .seed-*.json
+.seed-err.log

@@ -19,9 +19,20 @@ function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i === -1 ? undefined : process.argv[i + 1];
 }
-const positionals = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const raw = process.argv.slice(2);
+// Positionals are only the leading non-flag args: flag VALUES must never
+// leak into name/identifier (a flags-only call otherwise POSTs a wrongly
+// named project — real write, real damage).
+const positionals: string[] = [];
+for (const a of raw) {
+  if (a.startsWith("--")) break;
+  positionals.push(a);
+}
 
-// Same precedence the CLI uses: explicit file, else walk up from cwd.
+// Seat/token lookup is a subset sufficient for the local stack: explicit
+// file, else `.plane-seats` walked up from cwd (capped), else exported env
+// via resolveToken. (The CLI additionally merges legacy seats.env, walks
+// unbounded, and requires a seat — none of which this manual probe needs.)
 function walkUp(name: string): string | undefined {
   let dir = process.cwd();
   for (let i = 0; i < 12; i++) {

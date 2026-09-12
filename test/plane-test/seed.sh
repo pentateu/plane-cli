@@ -119,11 +119,13 @@ fi
 
 # 4. Project (API): find by identifier, else create with the same payload
 # shape the CLI probe uses ({name, identifier}).
-PROJ_JSON="$(api GET "/workspaces/$WS_SLUG/projects/")"
+PROJ_JSON="$(api GET "/workspaces/$WS_SLUG/projects/" || true)"
+[ -n "$PROJ_JSON" ] || { echo "project list failed (check api/token)" >&2; exit 1; }
 PROJ_ID="$(printf '%s' "$PROJ_JSON" | bun -e 'const j=JSON.parse(await Bun.stdin.text()); const list=j.results||j; const p=(Array.isArray(list)?list:[]).find((x)=>x.identifier==="TEST"); console.log(p?p.id:"")' 2>/dev/null || true)"
 if [ -n "$PROJ_ID" ]; then
   echo "project: $PROJ_IDENT exists" >&2
 else
+  rm -f "$DIR/.seed-proj.json"
   api POST "/workspaces/$WS_SLUG/projects/" "{\"name\":\"$PROJ_NAME\",\"identifier\":\"$PROJ_IDENT\"}" > "$DIR/.seed-proj.json"
   PROJ_ID="$(bun -e 'const j=JSON.parse(await Bun.file("'"$DIR"'/.seed-proj.json").text()); console.log(j.id||"")' 2>/dev/null || true)"
   [ -n "$PROJ_ID" ] || { echo "project creation failed:" >&2; head -c 300 "$DIR/.seed-proj.json" >&2; echo >&2; exit 1; }

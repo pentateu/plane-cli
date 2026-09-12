@@ -64,4 +64,5 @@ for NATS) and `test/plane-test/README.md`.
 Opt-in live smoke only: the `TESTCLI` project on the live instance (usage
 in `test/plane-test/README.md`). Prefer the local stack for every CLI
 change; touch live only for the integration points the local stack cannot
-prove (acceptance-flagged, O-9 create-then-delete discipline).
+prove (acceptance-flagged, create-then-delete discipline: verify live,
+then delete the smoke ticket).
