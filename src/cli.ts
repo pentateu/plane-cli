@@ -793,7 +793,7 @@ export async function run(argv: string[]): Promise<unknown> {
         name: title,
         description_html: html,
         state: requireStateId(sm, "todo"),
-        label_ids: [labelId],
+        labels: [labelId],
         ...(prio ? { priority: prio } : {}),
         ...(parentRef ? { parent: parentRef.uuid } : {}),
       };

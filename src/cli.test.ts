@@ -775,7 +775,7 @@ describe("create / sub", () => {
       name: "[ops] x",
       description_html: "<p>b</p>",
       state: "st-todo",
-      label_ids: ["lb-bug"],
+      labels: ["lb-bug"],
       priority: "high",
     });
     expect(d.id).toBe("HT-69");
@@ -1718,7 +1718,7 @@ describe("identifier-aware refs (TC-17)", () => {
     const d = (await run(["sub", "TC-16", "--title", "child", "--type", "ops", "--body", "<p>c</p>"])) as any;
     const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
     expect(post.path).toBe("/projects/pr-2/issues/");
-    expect(post.body).toMatchObject({ parent: "tc-16", state: "st2-todo", label_ids: ["lb2-ops"] });
+    expect(post.body).toMatchObject({ parent: "tc-16", state: "st2-todo", labels: ["lb2-ops"] });
     expect(d.id).toBe("TC-18");
   });
 
