@@ -60,7 +60,7 @@ function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p
   };
 }
 
-const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "HOMETUTOR_TICKETS_PROJECT_ID"];
+const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "PLANE_SYNC_STATE", "HOMETUTOR_TICKETS_PROJECT_ID"];
 
 function capture(obj: any, method: string): any {
   const s = spyOn(obj, method).mockImplementation(() => {});
@@ -202,6 +202,7 @@ beforeEach(() => {
   process.env.PLANE_TOKEN = "test-token";
   process.env.PLANE_CACHE = newCachePath();
   process.env.PLANE_BACKOFF_MS = "1";
+  process.env.PLANE_SYNC_STATE = join(newCachePath(), "syncs.json");
   // Test-env exports (.plane-test-env) must never leak into the unit suite:
   // PLANE_PROJECT_ID short-circuits project discovery and retargets every verb.
   delete process.env.PLANE_PROJECT_ID;
@@ -1331,6 +1332,88 @@ describe("sync", () => {
     const relmap = c.fresh("relmap") as Record<string, { b: string[]; f: string[] }>;
     expect(relmap["is-67"]).toEqual({ b: [], f: ["is-66"] }); // fresh from this walk
     expect(relmap["is-66"]).toEqual({ b: ["is-67"], f: [] }); // preserved from before
+  });
+});
+
+describe("sync mounts (TC-95 phase 1 — registry only)", () => {
+  function mountDir(name: string): string {
+    const dir = mkdtempSync(join(tmpdir(), `plane-sync-${name}-`));
+    tmpDirs.push(dir);
+    return join(dir, "mount");
+  }
+
+  test("sync ls with no mounts returns empty", async () => {
+    const d = (await run(["sync", "ls"])) as Record<string, unknown>;
+    expect(d).toEqual({ syncs: [] });
+  });
+
+  test("mount creates dir + record; ls shows it with null lastPoll", async () => {
+    const dir = mountDir("a");
+    const d = (await run(["sync", "HT-66", "--dir", dir])) as Record<string, unknown>;
+    expect(d).toMatchObject({ ticket: "HT-66", dir, mounted: true });
+    expect(existsSync(dir)).toBeTrue();
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toEqual([{ ticket: "HT-66", dir, lastPoll: null, pending: 0 }]);
+  });
+
+  test("second mount of the same ticket refuses loud", async () => {
+    const dir = mountDir("b");
+    await run(["sync", "HT-66", "--dir", dir]);
+    let caught: any;
+    try {
+      await run(["sync", "HT-66", "--dir", mountDir("b2")]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("already synced");
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toHaveLength(1);
+  });
+
+  test("same dir for a different ticket refuses (one dir, one ticket)", async () => {
+    const dir = mountDir("c");
+    await run(["sync", "HT-66", "--dir", dir]);
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--dir", dir]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("one dir mounts one ticket");
+  });
+
+  test("ticket without --dir fails naming the form", async () => {
+    let caught: any;
+    try {
+      await run(["sync", "HT-66"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("--dir");
+  });
+
+  test("stop removes the mount and keeps the folder", async () => {
+    const dir = mountDir("d");
+    await run(["sync", "HT-66", "--dir", dir]);
+    const d = (await run(["sync", "--stop", "HT-66"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ ticket: "HT-66", stopped: true, dirKept: dir });
+    expect(existsSync(dir)).toBeTrue();
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toEqual([]);
+  });
+
+  test("stop of an unmounted ticket fails listing mounts", async () => {
+    let caught: any;
+    try {
+      await run(["sync", "--stop", "HT-67"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+    expect(String(caught.message)).toContain("no active sync mount");
   });
 });
 

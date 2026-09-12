@@ -1,8 +1,11 @@
 #!/usr/bin/env bun
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
+import { readMounts, writeMounts } from "./sync.ts";
 
 let activeCache: Cache | undefined;
 
@@ -13,7 +16,7 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "limit", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "limit", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
@@ -276,6 +279,9 @@ VERBS
   config                          show resolved seat/apiBase/project/tokenSource/cache
   projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
+  sync <TC-N> --dir <path>        mount ticket↔folder mirror (TC-95 §29.8; daemon fills lastPoll/pending)
+  sync ls                         list active ticket↔folder mounts
+  sync --stop <TC-N>              unmount (daemon exits, folder kept)
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
                                   who holds HT-N up, what HT-N holds up
@@ -412,8 +418,74 @@ export async function run(argv: string[]): Promise<unknown> {
       return { seat: cfg.seat, tokenSource: cfg.tokenSource, apiBase: cfg.apiBase, workspace: cfg.workspace, project: cfg.projectName, cache: Object.keys(cache.data) };
     }
     case "sync": {
+      // TC-95 (§29.8, R-6): --dir / --stop / ls select the ticket↔folder
+      // mount surface; bare `sync` keeps the legacy cache-refresh below.
+      const dirF = typeof args.flags.dir === "string" ? args.flags.dir : undefined;
+      const stopF = args.flags.stop;
+      const sub = args.positionals[0];
+      if (sub === "ls" && dirF === undefined && stopF === undefined) {
+        const mounts = readMounts();
+        return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })) };
+      }
+      if (stopF !== undefined) {
+        if (typeof stopF !== "string" || !stopF.trim())
+          throw new UsageError("validation", "--stop needs a ticket: plane sync --stop TEST-1", {
+            suggestion: "plane sync ls to list active mounts",
+          });
+        const ref = await p.issueRef(stopF, { fresh: true });
+        const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
+        const mounts = readMounts();
+        const hit = mounts.find((m) => m.ticket.toUpperCase() === handle);
+        if (!hit)
+          throw new UsageError("not-found", `no active sync mount for '${handle}'`, {
+            valid: mounts.map((m) => m.ticket),
+            suggestion: "plane sync ls to list active mounts",
+          });
+        writeMounts(mounts.filter((m) => m !== hit));
+        return { ticket: handle, stopped: true, dirKept: hit.dir };
+      }
+      if (dirF !== undefined) {
+        if (sub === undefined)
+          throw new UsageError("validation", "sync --dir needs a ticket: plane sync TEST-1 --dir <path>", {
+            suggestion: "plane sync ls to list active mounts",
+          });
+        const ref = await p.issueRef(sub, { fresh: true });
+        const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
+        const absDir = resolve(dirF);
+        const mounts = readMounts();
+        const dup = mounts.find((m) => m.ticket.toUpperCase() === handle);
+        if (dup)
+          throw new UsageError("validation", `refused: ${handle} already synced → ${dup.dir} — stop that sync first`, {
+            suggestion: `plane sync --stop ${handle} before re-mounting`,
+          });
+        const dirTaken = mounts.find((m) => m.dir === absDir);
+        if (dirTaken)
+          throw new UsageError("validation", `refused: ${absDir} already mounts ${dirTaken.ticket} — one dir mounts one ticket`, {
+            suggestion: "mount into an empty dir",
+          });
+        mkdirSync(absDir, { recursive: true });
+        writeMounts([
+          ...mounts,
+          {
+            ticket: handle,
+            projectId: ref.projectId,
+            uuid: ref.uuid,
+            seq: ref.seq,
+            ident: ref.ident,
+            dir: absDir,
+            seat: cfg.seat,
+            createdAt: new Date().toISOString(),
+            lastPoll: null,
+            pending: 0,
+          },
+        ]);
+        return { ticket: handle, dir: absDir, mounted: true };
+      }
+      if (sub !== undefined)
+        throw new UsageError("validation", `sync ${sub} needs --dir <path>: plane sync ${sub} --dir <path>`, {
+          suggestion: "bare plane sync refreshes the cache; plane sync ls lists mounts",
+        });
       // Capture the default project id BEFORE dropping `project:<name>` —
-      // projectId() resolves from that key when no explicit id is configured.
       const pid = p.projectId();
       cache.drop(`project:${cfg.projectName}`);
       // Project-scoped map keys (multi-project host cache): drop only the
