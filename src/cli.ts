@@ -13,7 +13,7 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "limit", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "limit", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
@@ -299,8 +299,8 @@ VERBS
   depends HT-B HT-A               same edge spelled from the dependent side
   unblocks HT-A HT-B              remove that edge
   create --title t --type bug|feature|ops|plan [--priority urgent|high|medium|low]
-         [--body html | --body-file f.html | --body-md f.md]
-  sub HT-N …                      same as create, filed as child of HT-N
+         [--project IDENT|UUID] [--body html | --body-file f.html | --body-md f.md]
+  sub HT-N …                      same as create, filed as child of HT-N (--project refused: the parent defines the project)
   states | labels | modules       raw id lookups (debug)
 
 ENV
@@ -814,10 +814,33 @@ export async function run(argv: string[]): Promise<unknown> {
       if (prio && !["urgent", "high", "medium", "low"].includes(prio))
         throw new UsageError("validation", `invalid --priority '${prio}'`, { valid: ["urgent", "high", "medium", "low"] });
       const html = await bodyText(args.flags);
+      // TC-81: --project targets a non-default project by identifier or UUID.
+      // Refused on sub before any lookup — the parent defines the project there.
+      const projRaw = typeof args.flags.project === "string" ? args.flags.project : "";
+      if (projRaw && args.verb === "sub")
+        throw new UsageError("validation", "--project cannot combine with sub (the parent defines the project)", {
+          suggestion: "drop --project — the child files into the parent's project",
+        });
       let parentRef: { uuid: string; seq: number; ident: string; projectId: string } | undefined;
       if (args.verb === "sub") parentRef = await p.issueRef(requireTicket(args.positionals), { fresh: true });
-      const projectId = parentRef?.projectId;
-      const ident = parentRef?.ident;
+      let flagTarget: { id: string; ident: string } | undefined;
+      if (projRaw) {
+        if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(projRaw)) {
+          const list = await p.projects();
+          const found = list.find((pr) => String(pr.id).toLowerCase() === projRaw.toLowerCase());
+          if (!found)
+            throw new UsageError("not-found", `no project with id '${projRaw}'`, {
+              valid: list.map((pr) => String(pr.identifier ?? "")).filter(Boolean).sort(),
+              suggestion: "plane projects to list available projects",
+            });
+          flagTarget = { id: String(found.id), ident: String(found.identifier ?? "").toUpperCase() };
+        } else {
+          const found = await p.resolveProjectByIdent(projRaw);
+          flagTarget = { id: String(found.id), ident: String(found.identifier ?? "").toUpperCase() };
+        }
+      }
+      const projectId = parentRef?.projectId ?? flagTarget?.id;
+      const ident = parentRef?.ident ?? flagTarget?.ident;
       const [lm, sm] = await Promise.all([p.labelMap(projectId), p.stateMap(projectId)]);
       const labelId = lm[typeName];
       if (!labelId)
@@ -840,7 +863,7 @@ export async function run(argv: string[]): Promise<unknown> {
       if (dryRun) return { dryRun: true, requests };
       const created = (await p.request("POST", `${p.projectPathFor(targetId)}/issues/`, payload)) as Record<string, unknown>;
       cache.drop(`seqmap:${targetId}`);
-      return { id: `${ident ?? cfg.ident}-${created.sequence_id}` };
+      return { id: `${ident || cfg.ident}-${created.sequence_id}` };
     }
   }
 }
