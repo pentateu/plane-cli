@@ -108,16 +108,15 @@ plane create --title "smoke" --type ops --body "<p>x</p>"
 `PLANE_CACHE` should be fresh (or omitted) per run — the project registry
 cache is 24h-TTL and will otherwise hide newly created projects.
 
-## Known CLI gap (recorded, not hacked around)
+## Project targeting (`--project`, TC-81)
 
-`plane create` / `plane sub` can only file into the DEFAULT project
-(`src/cli.ts` `create` case: `projectId ?? p.projectId()`); `--project` /
-identifier targeting for `create` does not exist yet. Handle-addressed
-verbs (`get`, `comment`, `state`, `delete`, …) DO resolve `TESTCLI-N`
-handles against any project via the registry. Until a `--project` flag
-exists, integration tests should scope the whole invocation with
-`PLANE_PROJECT_ID` + `PLANE_IDENT` as shown above — that is the CLI's own
-documented config surface, not a workaround.
+`plane create --project IDENT|UUID` files into a non-default project
+(identifier case-insensitive, or full UUID); `sub` stays parent-scoped
+(`--project` refused — the parent defines the project). Handle-addressed
+verbs (`get`, `comment`, `state`, `delete`, …) resolve `IDENT-N` handles
+against any project via the registry. Whole-invocation scoping with
+`PLANE_PROJECT_ID` + `PLANE_IDENT` (above) still works and remains the way
+to pin the default project — but it is no longer the only path.
 
 ## Project creation was NOT admin-gated
 

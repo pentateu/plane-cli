@@ -886,6 +886,14 @@ describe("create --project (TC-81)", () => {
     expect(d.id).toBe("INFRA-7");
   });
 
+  test("dry-run with --project shows the resolved target URL without sending", async () => {
+    useInfraRouter();
+    const d = (await run(["create", "--title", "dr", "--type", "bug", "--body", "<p>x</p>", "--project", "INFRA", "--dry-run"])) as Record<string, any>;
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+    expect(d.dryRun).toBe(true);
+    expect(d.requests[0].url).toBe(`http://localhost:8999/api/v1/workspaces/ai-tutor/projects/${INFRA_ID}/issues/`);
+  });
+
   test("unknown UUID fails loud, no write", async () => {
     useInfraRouter();
     let caught: any;

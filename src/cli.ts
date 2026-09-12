@@ -863,7 +863,7 @@ export async function run(argv: string[]): Promise<unknown> {
       if (dryRun) return { dryRun: true, requests };
       const created = (await p.request("POST", `${p.projectPathFor(targetId)}/issues/`, payload)) as Record<string, unknown>;
       cache.drop(`seqmap:${targetId}`);
-      return { id: `${ident ?? cfg.ident}-${created.sequence_id}` };
+      return { id: `${ident || cfg.ident}-${created.sequence_id}` };
     }
   }
 }
