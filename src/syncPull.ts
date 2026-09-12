@@ -13,7 +13,7 @@
  * - body = plain text via htmlToText (spec's "html fallback wherever easier",
  *   inverted: lossless HTML round-trip is a later phase if agents need it)
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { htmlToText, type Plane, type Raw } from "./api.ts";
@@ -59,11 +59,11 @@ interface PullCtx {
   labelById: Map<string, string>; // label uuid -> board name
   seatByMember: Map<string, string>; // member uuid -> seat (email local-part)
   visited: Set<string>;
-  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string }>;
+  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>;
   root: string; // mount dir (kids rel paths resolve against it)
 }
 
-async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: string; bodySha: string }> {
+async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: string; bodySha: string; fileSha: string }> {
   const uuid = String(issue.id);
   ctx.visited.add(uuid);
   mkdirSync(dir, { recursive: true });
@@ -80,7 +80,10 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
   const body = htmlToText(String(issue.description_html ?? ""));
   const md = `${frontMatter(stateToken, seat, labels, String(issue.priority ?? "none"))}# ${String(issue.name ?? uuid)}\n\n${body}\n`;
   writeFileSync(join(dir, "ticket.md"), md);
-  const bodySha = sha256(md);
+  // Baseline tracks the BODY text only: front-matter edits must not read as
+  // body changes (the whole-file sha would flag every state/label edit).
+  const bodySha = sha256(body);
+  const fileSha = sha256(md);
 
   // Children (recursive) — grandchildren nest per §29.7 tree rules.
   // Baselines recorded on the ctx so push can revision-guard children
@@ -89,21 +92,14 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
   for (const child of all.filter((i) => String(i.parent ?? "") === uuid && !ctx.visited.has(String(i.id)))) {
     const slug = ticketSlug(String(child.name ?? child.id), String(child.id).slice(0, 8));
     const r = await pullOne(ctx, child, join(dir, "sub-tickets", slug));
-    ctx.kids.push({ rel: relative(ctx.root, join(dir, "sub-tickets", slug)), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha });
+    ctx.kids.push({ rel: relative(ctx.root, join(dir, "sub-tickets", slug)), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha });
   }
   const rev = String(issue.updated_at ?? "");
-  return { rev, bodySha };
+  return { rev, bodySha, fileSha };
 }
 
-export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; comments: number; children: number; kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string }> }> {
-  const [issue, rawComments, members, states, labels] = await Promise.all([
-    p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`) as Promise<Raw>,
-    p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`) as Promise<Raw>,
-    p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
-    p.stateMap(mount.projectId),
-    p.labelMap(mount.projectId),
-  ]);
-  const ctx: PullCtx = {
+function buildCtx(p: Plane, mount: SyncMount, members: Raw[], states: Record<string, string>, labels: Record<string, string>): PullCtx {
+  return {
     p,
     projectId: mount.projectId,
     stateById: new Map(Object.entries(states).map(([token, id]) => [id, token])),
@@ -117,7 +113,18 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     kids: [],
     root: mount.dir,
   };
-  const { rev, bodySha } = await pullOne(ctx, issue, mount.dir);
+}
+
+export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; fileSha: string; comments: number; children: number; kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }> }> {
+  const [issue, rawComments, members, states, labels] = await Promise.all([
+    p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`) as Promise<Raw>,
+    p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`) as Promise<Raw>,
+    p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
+    p.stateMap(mount.projectId),
+    p.labelMap(mount.projectId),
+  ]);
+  const ctx = buildCtx(p, mount, members, states, labels);
+  const { rev, bodySha, fileSha } = await pullOne(ctx, issue, mount.dir);
   const children = ctx.visited.size - 1;
 
   // Existing comments → synced events (server ids known) + derived snapshot.
@@ -155,5 +162,30 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
   writeStatusFile(mount.dir, { ticket: mount.ticket, ready: kept.length === 0, lastPoll: new Date().toISOString(), pending: kept.length, rev });
-  return { rev, bodySha, comments: events.length, children, kids: ctx.kids };
+  return { rev, bodySha, fileSha, comments: events.length, children, kids: ctx.kids };
+}
+
+/**
+ * Adopt server-side children missing baselines (child creation doesn't bump
+ * the parent rev — Plane-side fact). Pulls each newcomer into its slug dir
+ * and returns the new baselines for the registry. Never touches existing
+ * folders (locally edited children keep their files; push guards them).
+ */
+export async function adoptNewcomers(p: Plane, mount: SyncMount, newcomers: Raw[]): Promise<Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>> {
+  if (!newcomers.length) return [];
+  const [members, states, labels] = await Promise.all([
+    p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
+    p.stateMap(mount.projectId),
+    p.labelMap(mount.projectId),
+  ]);
+  const ctx = buildCtx(p, mount, members, states, labels);
+  for (const child of newcomers) {
+    const slug = ticketSlug(String(child.name ?? child.id), String(child.id).slice(0, 8));
+    const childDir = join(mount.dir, "sub-tickets", slug);
+    if (existsSync(join(childDir, "ticket.md"))) continue;
+    const full = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${String(child.id)}/`)) as Raw;
+    const r = await pullOne(ctx, full, childDir);
+    ctx.kids.push({ rel: relative(ctx.root, childDir), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha });
+  }
+  return ctx.kids;
 }

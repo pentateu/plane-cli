@@ -27,7 +27,7 @@ export async function workerCycle(projectId: string): Promise<Array<{ ticket: st
       // --no-wait mount: initial pull lands on the first worker cycle.
       const pulled = await pullTicket(p, mount);
       const mounts = readMounts();
-      const next = { ...mount, lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 };
+      const next = { ...mount, lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 };
       writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
       writeStatusFile(mount.dir, { ticket: mount.ticket, ready: true, lastPoll: next.lastPoll, pending: 0, rev: next.lastRev });
       out.push({ ticket: mount.ticket, pushed: ["pulled"], comments: pulled.comments });

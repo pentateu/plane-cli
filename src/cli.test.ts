@@ -1665,6 +1665,19 @@ describe("sync daemon (TC-95 phase 4)", () => {
     // Server rows not duplicated (2 synced, same ops as the first pull).
     expect(rows.filter((r: any) => r.status === "synced")).toHaveLength(2);
   });
+
+  test("push-once adopts server-side newcomers into sub-tickets", async () => {
+    const dir = daemonDir("x");
+    await run(["sync", "HT-66", "--dir", dir]);
+    ISSUES.push({ id: "is-68", sequence_id: 68, name: "late child", state: "st-todo", priority: "none", assignees: [], labels: [], parent: "is-66", description_html: "<p>late</p>" });
+    try {
+      const d = (await run(["sync", "HT-66", "--push-once"])) as Record<string, any>;
+      expect(d.pushed).toContain("+sub-tickets/late-child");
+      expect(existsSync(join(dir, "sub-tickets", "late-child", "ticket.md"))).toBeTrue();
+    } finally {
+      ISSUES.pop();
+    }
+  });
 });
 
 describe("blocks / depends / unblocks", () => {

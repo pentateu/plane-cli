@@ -497,7 +497,8 @@ export async function run(argv: string[]): Promise<unknown> {
           pending: 0,
           lastRev: null as string | null,
           lastBodySha: null as string | null,
-          kids: [] as Array<{ rel: string; uuid: string; rev: string; bodySha: string }>,
+          lastFileSha: null as string | null,
+          kids: [] as Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>,
         };
         writeMounts([...mounts, base]);
         if (noWait) {
@@ -509,7 +510,7 @@ export async function run(argv: string[]): Promise<unknown> {
         const pulled = await pullTicket(p, base);
         writeMounts([
           ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
-          { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids },
+          { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids },
         ]);
         return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
       }

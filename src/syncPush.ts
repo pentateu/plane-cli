@@ -18,7 +18,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Plane, Raw } from "./api.ts";
 import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, type SyncMount } from "./sync.ts";
-import { pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
+import { adoptNewcomers, pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
 
 export function countPending(dir: string): number {
   return countPendingEvents(dir);
@@ -246,7 +246,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
     patch.name = title;
     pushed.push("title");
   }
-  const bodySha = sha256(md);
+  const bodySha = sha256(body);
   if (bodySha !== mount.lastBodySha) {
     patch.description_html = body.split("\n").map((l) => `<p>${esc(l) || "<br>"}</p>`).join("");
     pushed.push("body");
@@ -257,6 +257,12 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
   }
 
   // Pending comment events post verbatim (agents stamp per §2.1).
+  // NOTE: the v1 create serializer accepts no `parent` field (verified
+  // against plane-backend v1.4.1 IssueCommentCreateSerializer) — threaded
+  // replies land flat server-side. Parent is still recorded in the events
+  // file (reconcile matching + future API support); the §29.6 quote rule
+  // (quote the referenced passage inline as `> quote`) carries the thread
+  // context in-body instead.
   const events = readEvents(dir);
   let posted = 0;
   for (const e of events) {
@@ -281,8 +287,11 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
   }
   const ticket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`)) as Raw;
   const serverRev = String(ticket.updated_at ?? "");
+  // Reconcile BEFORE any post: a previous run may have landed a comment
+  // without recording its id (kill-mid-push) — adopt instead of duplicating.
+  await reconcileEvents(p, mount);
   const md = readFileSync(join(dir, "ticket.md"), "utf8");
-  const localChanged = sha256(md) !== mount.lastBodySha;
+  const localChanged = sha256(md) !== mount.lastFileSha;
   const serverChanged = mount.lastRev !== null && serverRev !== mount.lastRev;
 
   if (serverChanged && localChanged) {
@@ -291,30 +300,40 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
     appendEvent(dir, conflictNotice(mount.ticket, `server rev ${serverRev} vs local edits (base ${mount.lastRev})`));
     return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
   }
-  if (serverChanged && !localChanged) {
-    // Server-only move: re-pull wins (Phase 2 pull reused via fresh mount?
-    // no — just report; the daemon re-pulls. One-shot returns pulled).
-    return { ticket: mount.ticket, pushed: ["pulled"], comments: 0, rev: serverRev };
-  }
-  if (serverChanged && !localChanged) {
+  // Child arrivals don't bump the parent rev (Plane-side fact, proven live):
+  // adopt any server child missing a baseline — but never clobber a locally
+  // edited child (its sha differs from baseline → handled in the recurse
+  // below with the same conflict shape as root).
+  const knownUuids = new Set((mount.kids ?? []).map((k) => k.uuid));
+  const serverKids = (await p.listIssues({}, 10, mount.projectId)).filter((i) => String(i.parent ?? "") === mount.uuid);
+  const newcomers = serverKids.filter((k) => !knownUuids.has(String(k.id)));
+  // Locally edited children (whole-file sha vs baseline): the re-pull below
+  // must not clobber them — the recurse handles each child individually.
+  const editedKids = (mount.kids ?? []).filter((k) => {
+    const f = join(dir, k.rel, "ticket.md");
+    return existsSync(f) && sha256(readFileSync(f, "utf8")) !== k.fileSha;
+  });
+  if (serverChanged && !localChanged && !editedKids.length) {
     // Server-only move: re-pull wins (local files refresh, baselines follow).
     const pulled = await pullTicket(p, mount);
     const mounts = readMounts();
-    writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? { ...m, lastRev: pulled.rev, lastBodySha: pulled.bodySha, kids: pulled.kids, lastPoll: new Date().toISOString() } : m)));
+    writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? { ...m, lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids, lastPoll: new Date().toISOString() } : m)));
     return { ticket: mount.ticket, pushed: ["pulled"], comments: 0, rev: pulled.rev };
   }
   const r = await pushOne(p, mount, dir, ticket);
 
-  // Recurse into known children (registry baselines; unknown local dirs are
+  // Adopt server-side newcomers (pulled into slug dirs + baselined), then
+  // recurse into known children (registry baselines; unknown local dirs are
   // creation flow — a later phase, ignored here).
-  const pushed = [...r.pushed];
+  const adopted = await adoptNewcomers(p, mount, newcomers);
+  const pushed = [...r.pushed, ...adopted.map((k) => `+${k.rel}`)];
   let comments = r.comments;
-  let kids = mount.kids;
-  for (const kid of mount.kids) {
+  let kids = [...(mount.kids ?? []), ...adopted];
+  for (const kid of kids) {
     const childDir = join(dir, kid.rel);
     const childMd = join(childDir, "ticket.md");
     if (!existsSync(childMd)) continue;
-    if (sha256(readFileSync(childMd, "utf8")) === kid.bodySha) continue;
+    if (sha256(readFileSync(childMd, "utf8")) === kid.fileSha) continue;
     const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
     const childRev = String(childTicket.updated_at ?? "");
     if (childRev !== kid.rev) {
@@ -327,13 +346,15 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
     comments += cr.comments;
     if (cr.pushed.length) pushed.push(`${kid.rel}: ${cr.pushed.join(",")}`);
     const afterChild = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
-    const newSha = sha256(readFileSync(childMd, "utf8"));
-    kids = kids.map((k) => (k.uuid === kid.uuid ? { ...k, rev: String(afterChild.updated_at ?? ""), bodySha: newSha } : k));
+    const newFileSha = sha256(readFileSync(childMd, "utf8"));
+    const newSha = sha256(parseTicketMd(readFileSync(childMd, "utf8")).body);
+    kids = kids.map((k) => (k.uuid === kid.uuid ? { ...k, rev: String(afterChild.updated_at ?? ""), bodySha: newSha, fileSha: newFileSha } : k));
   }
 
   const mounts = readMounts();
   const livePending = countPendingEvents(dir);
-  const next = { ...mounts.find((m) => m.ticket === mount.ticket)!, lastRev: r.rev, lastBodySha: r.bodySha, kids, lastPoll: new Date().toISOString(), pending: livePending };
+  const fileShaNow = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
+  const next = { ...mounts.find((m) => m.ticket === mount.ticket)!, lastRev: r.rev, lastBodySha: r.bodySha, lastFileSha: fileShaNow, kids, lastPoll: new Date().toISOString(), pending: livePending };
   writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
   writeStatusFile(dir, { ticket: mount.ticket, ready: livePending === 0, lastPoll: next.lastPoll, pending: livePending, rev: next.lastRev });
   return { ticket: mount.ticket, pushed, comments, rev: r.rev };
