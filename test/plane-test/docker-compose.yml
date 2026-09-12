@@ -1,0 +1,173 @@
+# TC-86 — local Plane TEST target. NOT production. No security by design.
+# Mirrors the prod plane-selfhost compose (~/plane-selfhost/plane-app):
+# same images (backend fork pentateu/plane-backend:v1.4.1-iswe included),
+# same service names/topology (plane-db, plane-redis, plane-mq, plane-minio,
+# migrator, api, worker). Frontend services (web, space, admin, live, proxy)
+# are intentionally absent — the plane CLI only talks to /api/v1, and the
+# proxy's 8097/8443 binds stay with prod. beat-worker (periodic tasks) is
+# likewise absent: no CLI CRUD path needs it. Localhost-only binds, dummy
+# secrets inline. Never point this at any real data.
+# Host ports are overridable without editing (two checkouts up at once):
+#   PLANE_TEST_API_PORT=3221 PLANE_TEST_PG_PORT=5456 docker compose -p other up -d
+# (container_name values are fixed, so concurrent checkouts still collide on
+# names — one stack at a time per host.)
+name: plane-test
+
+services:
+  plane-db:
+    image: postgres:15.7-alpine
+    command: postgres -c 'max_connections=1000'
+    container_name: plane-test-db
+    environment:
+      POSTGRES_USER: planetest
+      POSTGRES_PASSWORD: planetest
+      POSTGRES_DB: planetest
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${PLANE_TEST_PG_PORT:-5455}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U planetest -d planetest"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  plane-redis:
+    image: valkey/valkey:7.2.11-alpine
+    container_name: plane-test-redis
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  plane-mq:
+    image: rabbitmq:3.13.6-management-alpine
+    container_name: plane-test-mq
+    environment:
+      RABBITMQ_DEFAULT_USER: plane
+      RABBITMQ_DEFAULT_PASS: planetest
+      RABBITMQ_DEFAULT_VHOST: plane
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  plane-minio:
+    image: minio/minio:latest
+    command: server /export --console-address ":9090"
+    container_name: plane-test-minio
+    environment:
+      MINIO_ROOT_USER: access-key
+      MINIO_ROOT_PASSWORD: secret-key
+    volumes:
+      - uploads:/export
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  migrator:
+    # Same backend image prod runs (OIDC fork). One-shot: runs migrations,
+    # then exits 0. Re-run is safe (migrations are idempotent).
+    image: pentateu/plane-backend:v1.4.1-iswe
+    command: ./bin/docker-entrypoint-migrator.sh
+    container_name: plane-test-migrator
+    depends_on:
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+    environment: &plane-test-app-env
+      WEB_URL: http://127.0.0.1:${PLANE_TEST_API_PORT:-3211}
+      DEBUG: "0"
+      CORS_ALLOWED_ORIGINS: http://127.0.0.1:${PLANE_TEST_API_PORT:-3211}
+      GUNICORN_WORKERS: "1"
+      USE_MINIO: "1"
+      DATABASE_URL: postgresql://planetest:planetest@plane-db/planetest
+      SECRET_KEY: dummy-django-secret-key-for-local-test-only
+      AMQP_URL: amqp://plane:planetest@plane-mq:5672/plane
+      RABBITMQ_HOST: plane-mq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_DEFAULT_USER: plane
+      RABBITMQ_DEFAULT_PASS: planetest
+      RABBITMQ_VHOST: plane
+      API_KEY_RATE_LIMIT: 60/minute
+      MINIO_ENDPOINT_SSL: "0"
+      LIVE_SERVER_SECRET_KEY: dummy-live-secret-for-local-test-only
+      PGHOST: plane-db
+      PGDATABASE: planetest
+      POSTGRES_USER: planetest
+      POSTGRES_PASSWORD: planetest
+      POSTGRES_DB: planetest
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: plane-redis
+      REDIS_PORT: "6379"
+      REDIS_URL: redis://plane-redis:6379/
+      MINIO_ROOT_USER: access-key
+      MINIO_ROOT_PASSWORD: secret-key
+      AWS_REGION:
+      AWS_ACCESS_KEY_ID: access-key
+      AWS_SECRET_ACCESS_KEY: secret-key
+      AWS_S3_ENDPOINT_URL: http://plane-minio:9000
+      AWS_S3_BUCKET_NAME: uploads
+
+  api:
+    image: pentateu/plane-backend:v1.4.1-iswe
+    command: ./bin/docker-entrypoint-api.sh
+    container_name: plane-test-api
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+      plane-mq:
+        condition: service_healthy
+      plane-minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PLANE_TEST_API_PORT:-3211}:8000"
+    volumes:
+      - logs_api:/code/plane/logs
+    environment: *plane-test-app-env
+    # Liveness only (TCP accept proves gunicorn listens); seed.sh gates on a
+    # real HTTP 401/403 before doing anything, and worker retries regardless.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket,sys; socket.create_connection(('127.0.0.1',8000),timeout=3).close()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  worker:
+    image: pentateu/plane-backend:v1.4.1-iswe
+    command: ./bin/docker-entrypoint-worker.sh
+    container_name: plane-test-worker
+    depends_on:
+      api:
+        condition: service_healthy
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+      plane-mq:
+        condition: service_healthy
+    volumes:
+      - logs_worker:/code/plane/logs
+    environment: *plane-test-app-env
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
+  logs_api:
+  logs_worker:
+  rabbitmq_data:
