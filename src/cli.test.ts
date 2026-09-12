@@ -829,6 +829,97 @@ describe("create / sub", () => {
   });
 });
 
+describe("create --project (TC-81)", () => {
+  const INFRA_STATES = [
+    { id: "st9-backlog", name: "Backlog" },
+    { id: "st9-todo", name: "Todo" },
+    { id: "st9-progress", name: "In Progress" },
+    { id: "st9-done", name: "Done" },
+    { id: "st9-cancelled", name: "Cancelled" },
+  ];
+  const INFRA_LABELS = [
+    { id: "lb9-bug", name: "type:bug" },
+    { id: "lb9-feature", name: "type:feature" },
+    { id: "lb9-ops", name: "type:ops" },
+    { id: "lb9-plan", name: "type:plan" },
+  ];
+  const PROJECTS_81 = [
+    { id: "pr-1", name: "Ai Tutor", identifier: "HT" },
+    { id: "11111111-2222-3333-4444-555555555555", name: "Infra", identifier: "INFRA" },
+  ];
+  const INFRA_ID = "11111111-2222-3333-4444-555555555555";
+  function useInfraRouter() {
+    router = (_m, path, b) => {
+      if (path.endsWith("/projects/")) return { status: 200, json: { results: PROJECTS_81, next_page_results: false } };
+      if (path === "/members/") return { status: 200, json: MEMBERS };
+      if (path.endsWith("/states/")) return { status: 200, json: { results: path.includes(INFRA_ID) ? INFRA_STATES : STATES } };
+      if (path.endsWith("/labels/")) return { status: 200, json: { results: path.includes(INFRA_ID) ? INFRA_LABELS : LABELS } };
+      if (path === `/projects/${INFRA_ID}/issues/` && _m === "POST")
+        return { status: 200, json: { ...(b as any), id: "in-new", sequence_id: 7 } };
+      if (/\/projects\/[^/]+\/issues\/?$/.test(path) && _m === "POST")
+        return { status: 200, json: { ...(b as any), id: "is-new", sequence_id: 69 } };
+      return { status: 404 };
+    };
+  }
+
+  test("identifier (case-insensitive) posts into that project with its states/labels", async () => {
+    useInfraRouter();
+    const d = (await run(["create", "--title", "infra job", "--type", "ops", "--body", "<p>x</p>", "--project", "infra"])) as Record<string, unknown>;
+    const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
+    expect(post.path).toBe(`/projects/${INFRA_ID}/issues/`);
+    expect(post.body).toMatchObject({ state: "st9-todo", label_ids: ["lb9-ops"] });
+    expect(d.id).toBe("INFRA-7");
+  });
+
+  test("project UUID posts into that project", async () => {
+    useInfraRouter();
+    const d = (await run(["create", "--title", "infra job", "--type", "bug", "--body", "<p>x</p>", "--project", INFRA_ID])) as Record<string, unknown>;
+    const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
+    expect(post.path).toBe(`/projects/${INFRA_ID}/issues/`);
+    expect(post.body).toMatchObject({ state: "st9-todo", label_ids: ["lb9-bug"] });
+    expect(d.id).toBe("INFRA-7");
+  });
+
+  test("unknown UUID fails loud, no write", async () => {
+    useInfraRouter();
+    let caught: any;
+    try {
+      await run(["create", "--title", "t", "--type", "bug", "--body", "<p>x</p>", "--project", "99999999-9999-9999-9999-999999999999"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+    expect(caught.valid).toEqual(["HT", "INFRA"]);
+    expect(calls.some((c) => c.method === "POST")).toBeFalse();
+  });
+
+  test("unknown identifier fails loud listing live idents, no write", async () => {
+    useInfraRouter();
+    let caught: any;
+    try {
+      await run(["create", "--title", "t", "--type", "bug", "--body", "<p>x</p>", "--project", "NOPE"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("not-found");
+    expect(caught.valid).toEqual(["HT", "INFRA"]);
+    expect(calls.some((c) => c.method === "POST")).toBeFalse();
+  });
+
+  test("sub with --project is refused before any write", async () => {
+    useInfraRouter();
+    let caught: any;
+    try {
+      await run(["sub", "HT-66", "--title", "child", "--type", "ops", "--body", "<p>c</p>", "--project", "INFRA"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("--project cannot combine with sub");
+    expect(calls.some((c) => c.method === "POST")).toBeFalse();
+  });
+});
+
 const TWINS = [
   { id: "is-66a", sequence_id: 66, name: "twin A", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>a</p>" },
   { id: "is-66b", sequence_id: 66, name: "twin B", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>b</p>" },
