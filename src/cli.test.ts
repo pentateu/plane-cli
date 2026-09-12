@@ -841,6 +841,22 @@ describe("create / sub", () => {
     expect(post.body).toMatchObject({ name: "nb" });
     expect("description_html" in (post.body as Record<string, unknown>)).toBeFalse();
   });
+
+  test("--max-chars caps description with a labeled marker", async () => {
+    const d = (await run(["get", "HT-66", "--fields", "description", "--max-chars", "10"])) as Record<string, unknown>;
+    expect(d.description).toBe("xxxxxxxxxx…(+590 chars — plane get HT-66 --full)");
+  });
+
+  test("--max-chars caps comments; --full still wins", async () => {
+    const d = (await run(["get", "HT-66", "--comments", "--max-chars", "5"])) as Record<string, any>;
+    expect(String(d.comments[0].text)).toContain("…[truncated");
+    const f = (await run(["get", "HT-66", "--comments", "--max-chars", "5", "--full"])) as Record<string, any>;
+    expect(String(f.comments[0].text)).not.toContain("…[truncated");
+  });
+
+  test("--max-chars rejects non-positive integers", async () => {
+    await expect(run(["get", "HT-66", "--max-chars", "0"])).rejects.toMatchObject({ kind: "validation" });
+  });
 });
 
 describe("create --project (TC-81)", () => {

@@ -19,7 +19,7 @@ function finish(code: number): never {
 
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
-const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "limit", "body", "body-file", "body-md", "file", "comment"]);
+const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "max-chars", "limit", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "daemon", "no-wait", "wait-all"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
@@ -265,7 +265,8 @@ CONTRACT
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only
   surfaces that can show native payloads)
   output is minimal by default; widen with --fields a,b · deepen with --full (comments capped at
-  300 chars with a labeled marker, never a bare …; --full returns the full text) · native payload with --raw
+  300 chars with a labeled marker, never a bare …; --full returns the full text; --max-chars N
+  overrides the 500/300/100 read caps per call) · native payload with --raw
   boolean flags are bare; inline values ('--yes=false') are rejected with exit 4
   every mutating verb accepts --dry-run (prints exactly what execution would send, changes nothing)
   claim/state are idempotent: re-applying returns changed:false, exit 0 — safe retries.
@@ -289,11 +290,11 @@ VERBS
   sync --daemon [--interval N]     run the supervisor (one worker process per project, poll N seconds)
   sync ls                         list active ticket↔folder mounts
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
-  get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
+  get HT-N [--comments] [--full] [--max-chars N] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
                                   who holds HT-N up, what HT-N holds up
   list [--state s]… [--priority p] [--label l] [--assignee me|name] [--parent HT-N]
-       [--blocked-by HT-N] [--search q] [--limit N] [--page N]
+       [--blocked-by HT-N] [--search q] [--limit N] [--page N] [--max-chars N]
                                   --state is repeatable (multi-state); --blocked-by =
                                   the "what can start now" query: tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
@@ -303,7 +304,7 @@ VERBS
   assign HT-N <seat|member-mail> [--comment "…"]
                                   assign another seat/member (single assignee replace)
   state HT-N <state> [--comment "…"]
-  comments HT-N                   numbered thread c1,c2,… oldest first
+  comments HT-N [--max-chars N]       numbered thread c1,c2,… oldest first
   reply HT-N cM "text"            threaded answer to comment cM (review-loop close-out)
   comment HT-N "text"             top-level comment ('--file -' reads stdin)
   uncomment HT-N cM --yes       delete comment cM (destructive, needs --yes)
@@ -378,6 +379,9 @@ export async function run(argv: string[]): Promise<unknown> {
   if (args.verb !== "projects") await p.ensureProject();
   const dryRun = args.flags["dry-run"] === true;
   const full = args.flags.full === true;
+  // Agent-controlled read cap: overrides the 500/300/100 defaults below;
+  // --full still means unlimited. Parsed once, applied everywhere text is cut.
+  const maxChars = typeof args.flags["max-chars"] === "string" ? parsePositiveInt(args.flags["max-chars"], "--max-chars") : undefined;
   const fields = typeof args.flags.fields === "string" ? args.flags.fields : undefined;
   const positional = args.positionals[0];
 
@@ -643,8 +647,8 @@ export async function run(argv: string[]): Promise<unknown> {
         wantComments ? p.comments(uuid, projectId, { full }) : Promise.resolve([]),
         p.relationsCached(uuid, projectId),
       ]);
-      const shaped = await p.shapeIssue(rawIssue as never, { full, relations: rels, ident, projectId });
-      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text: full ? text : labeledCut(text, 300, "--full for all") })) } : {}) };
+      const shaped = await p.shapeIssue(rawIssue as never, { full, maxChars, relations: rels, ident, projectId });
+      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text: full ? text : labeledCut(text, maxChars ?? 300, "--full for all") })) } : {}) };
       return pickFields(obj as Record<string, unknown>, fields);
     }
     case "list": {
@@ -725,7 +729,7 @@ export async function run(argv: string[]): Promise<unknown> {
         const s = await p.shapeIssue(i as never, { ident: all.ident });
         rows.push({
           id: s.id,
-          title: labeledCut(s.title, 100, `plane get ${s.id} --full`),
+          title: labeledCut(s.title, maxChars ?? 100, `plane get ${s.id} --full`),
           state: s.state,
           priority: s.priority,
           assignee: s.assignees[0] ?? null,
@@ -856,7 +860,7 @@ export async function run(argv: string[]): Promise<unknown> {
     case "comments": {
       const ref = await p.issueRef(requireTicket(args.positionals));
       const list = await p.comments(ref.uuid, ref.projectId, { full });
-      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : labeledCut(c.text, 300, "--full for all") }));
+      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : labeledCut(c.text, maxChars ?? 300, "--full for all") }));
       return pickFields({ id: `${ref.ident}-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
     }
     case "reply":
