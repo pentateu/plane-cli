@@ -11,7 +11,7 @@ function finish(code: number): never {
   process.exit(code);
 }
 
-const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
+const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "limit", "body", "body-file", "body-md", "file", "comment"]);
 const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
@@ -285,6 +285,8 @@ VERBS
                                   the "what can start now" query: tickets held up by HT-N
   claim HT-N [--comment "…"]      assign self + move to progress
   unclaim HT-N                   remove self from assignees (idempotent)
+  label-add HT-N <label>        add a board label (idempotent, additive)
+  label-remove HT-N <label>     remove a board label (idempotent)
   assign HT-N <seat|member-mail> [--comment "…"]
                                   assign another seat/member (single assignee replace)
   state HT-N <state> [--comment "…"]
@@ -767,6 +769,40 @@ export async function run(argv: string[]): Promise<unknown> {
       }
       if (changed) await p.patchIssue(ref.uuid, { assignees: assignees.filter((a) => a !== meId) }, ref.projectId);
       return { id: `${ref.ident}-${ref.seq}`, changed };
+    }
+    case "label-add":
+    case "label-remove": {
+      // TC-78: label mutation verbs (reads existed; writes did not). Additive
+      // and idempotent like claim/state: re-adding / removing-absent reports
+      // changed:false with exit 0 — safe retries, never duplicates.
+      const label = args.positionals[1];
+      if (!label || !label.trim())
+        throw new UsageError("validation", `${args.verb} needs a label name`, {
+          valid: [`plane ${args.verb} HT-N <label>`],
+          suggestion: "plane labels lists the board labels",
+        });
+      const ref = await p.issueRef(requireTicket(args.positionals), { fresh: true });
+      const lm = await p.labelMap(ref.projectId);
+      const lid = lm[label];
+      if (!lid)
+        throw new UsageError("validation", `label '${label}' not found on board`, {
+          valid: Object.keys(lm).sort(),
+          suggestion: "plane sync then retry",
+        });
+      const issue = (await p.request("GET", `${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`)) as Record<string, unknown>;
+      const current = normalizeIdArray(issue.labels);
+      const next = args.verb === "label-add" ? (current.includes(lid) ? current : [...current, lid]) : current.filter((l) => l !== lid);
+      const changed = next.length !== current.length;
+      if (dryRun) {
+        return {
+          dryRun: true,
+          requests: changed
+            ? [{ method: "PATCH", url: `${cfg.apiBase}${p.projectPathFor(ref.projectId)}/issues/${ref.uuid}/`, body: { labels: next } }]
+            : [],
+        };
+      }
+      if (changed) await p.patchIssue(ref.uuid, { labels: next }, ref.projectId);
+      return { id: `${ref.ident}-${ref.seq}`, label, changed };
     }
     case "create":
     case "sub": {

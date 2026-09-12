@@ -990,6 +990,63 @@ describe("unclaim", () => {
   });
 });
 
+describe("label-add / label-remove (TC-78)", () => {
+  test("label-add appends the board uuid with exact PATCH body, additive", async () => {
+    useWriteRouter();
+    const d = (await run(["label-add", "HT-67", "type:feature"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-67", label: "type:feature", changed: true });
+    expect(calls.find((c) => c.method === "PATCH")!.body).toEqual({ labels: ["lb-bug", "lb-feature"] });
+  });
+
+  test("label-add is idempotent: re-adding reports changed:false with zero writes", async () => {
+    useWriteRouter();
+    const d = (await run(["label-add", "HT-67", "type:bug"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-67", changed: false });
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+  });
+
+  test("label-remove drops only the named uuid, keeps the rest", async () => {
+    useWriteRouter();
+    const d = (await run(["label-remove", "HT-66", "type:plan"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-66", label: "type:plan", changed: true });
+    expect(calls.find((c) => c.method === "PATCH")!.body).toEqual({ labels: [] });
+  });
+
+  test("label-remove of an absent label is a no-op success", async () => {
+    useWriteRouter();
+    const d = (await run(["label-remove", "HT-67", "type:feature"])) as Record<string, unknown>;
+    expect(d).toMatchObject({ id: "HT-67", changed: false });
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+  });
+
+  test("unknown label fails loud listing the board labels", async () => {
+    useWriteRouter();
+    await expect(run(["label-add", "HT-67", "type:chore"])).rejects.toMatchObject({
+      kind: "validation",
+      valid: ["type:bug", "type:feature", "type:ops", "type:plan"],
+    });
+  });
+
+  test("missing label arg fails loud with usage", async () => {
+    await expect(run(["label-add", "HT-67"])).rejects.toMatchObject({ kind: "validation" });
+  });
+
+  test("dry-run prints the exact PATCH and writes nothing", async () => {
+    useWriteRouter();
+    const before = calls.length;
+    const d = (await run(["label-add", "HT-67", "type:feature", "--dry-run"])) as Record<string, any>;
+    expect(calls.filter((c) => c.method !== "GET").length).toBe(0);
+    void before;
+    expect(d.requests).toEqual([
+      {
+        method: "PATCH",
+        url: expect.stringContaining("/issues/is-67/"),
+        body: { labels: ["lb-bug", "lb-feature"] },
+      },
+    ]);
+  });
+});
+
 describe("explicit idents hit their own project", () => {
   test("HT- refs resolve via registry when the default is another project (INFRA-62)", async () => {
     process.env.PLANE_PROJECT_NAME = "Teamctl";
