@@ -25,6 +25,7 @@ export interface SyncMount {
   pending: number; // daemon fills; events awaiting push
   lastRev: string | null; // server updated_at at last pull/push (revision guard)
   lastBodySha: string | null; // sha of ticket.md at last pull/push (change detect)
+  kids: Array<{ slug: string; uuid: string; rev: string; bodySha: string }>; // sub-ticket baselines (no registry rows for children)
 }
 
 export function syncStatePath(): string {

@@ -1438,6 +1438,64 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(kids).toContain("# [impl] personal tutor coherence");
     expect(kids).toContain("state: progress");
   });
+
+  test("push-once applies front-matter edits as PATCH", async () => {
+    const dir = mountDir("g");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const md = readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress");
+    writeFileSync(join(dir, "ticket.md"), md);
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.pushed).toContain("state");
+    const patch = calls.find((c) => c.method === "PATCH" && /\/issues\/is-67\/$/.test(c.path))!;
+    expect(patch.body).toMatchObject({ state: "st-progress" });
+  });
+
+  test("push-once posts pending events and flips them synced", async () => {
+    const dir = mountDir("h");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const pending = { event: "add", op: "evt-test-1", id: null, parent: null, author: "dev1", body: "local note", body_sha: "sha256-x", at: "2026-09-12T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(pending) + "\n", { flag: "a" });
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.comments).toBe(1);
+    expect(calls.some((c) => c.method === "POST" && /\/issues\/is-67\/comments\/$/.test(c.path))).toBeTrue();
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const mine = rows.find((r: any) => r.op === "evt-test-1");
+    expect(mine.status).toBe("synced");
+    expect(typeof mine.id).toBe("string");
+  });
+
+  test("push-once with server+local moves conflicts (local kept, notice filed)", async () => {
+    const dir = mountDir("i");
+    await run(["sync", "HT-67", "--dir", dir]);
+    // Simulate a server-side move by backdating the stored rev.
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.pushed).toEqual([]);
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeTrue();
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
+  });
+
+  test("push-once with unknown state refuses loud with a conflict notice", async () => {
+    const dir = mountDir("j");
+    await run(["sync", "HT-67", "--dir", dir]);
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: bogus"));
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught.message)).toContain("refused: unknown-state");
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
+  });
 });
 
 describe("blocks / depends / unblocks", () => {

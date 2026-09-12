@@ -14,7 +14,7 @@
  *   inverted: lossless HTML round-trip is a later phase if agents need it)
  */
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { htmlToText, type Plane, type Raw } from "./api.ts";
 import type { SyncMount } from "./sync.ts";
@@ -59,6 +59,8 @@ interface PullCtx {
   labelById: Map<string, string>; // label uuid -> board name
   seatByMember: Map<string, string>; // member uuid -> seat (email local-part)
   visited: Set<string>;
+  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string }>;
+  root: string; // mount dir (kids rel paths resolve against it)
 }
 
 async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: string; bodySha: string }> {
@@ -81,15 +83,19 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
   const bodySha = sha256(md);
 
   // Children (recursive) — grandchildren nest per §29.7 tree rules.
+  // Baselines recorded on the ctx so push can revision-guard children
+  // without registry rows.
   const all = await ctx.p.listIssues({}, 10, ctx.projectId);
   for (const child of all.filter((i) => String(i.parent ?? "") === uuid && !ctx.visited.has(String(i.id)))) {
     const slug = ticketSlug(String(child.name ?? child.id), String(child.id).slice(0, 8));
-    await pullOne(ctx, child, join(dir, "sub-tickets", slug));
+    const r = await pullOne(ctx, child, join(dir, "sub-tickets", slug));
+    ctx.kids.push({ rel: relative(ctx.root, join(dir, "sub-tickets", slug)), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha });
   }
-  return { rev: String(issue.updated_at ?? ""), bodySha };
+  const rev = String(issue.updated_at ?? "");
+  return { rev, bodySha };
 }
 
-export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; comments: number; children: number }> {
+export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; comments: number; children: number; kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string }> }> {
   const [issue, rawComments, members, states, labels] = await Promise.all([
     p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`) as Promise<Raw>,
     p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`) as Promise<Raw>,
@@ -108,6 +114,8 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
       (Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]),
     ),
     visited: new Set<string>(),
+    kids: [],
+    root: mount.dir,
   };
   const { rev, bodySha } = await pullOne(ctx, issue, mount.dir);
   const children = ctx.visited.size - 1;
@@ -136,5 +144,5 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     join(mount.dir, "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
-  return { rev, bodySha, comments: events.length, children };
+  return { rev, bodySha, comments: events.length, children, kids: ctx.kids };
 }

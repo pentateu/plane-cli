@@ -7,6 +7,7 @@ import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, ty
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 import { readMounts, writeMounts } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
+import { pushTicket } from "./syncPush.ts";
 
 let activeCache: Cache | undefined;
 
@@ -18,7 +19,7 @@ function finish(code: number): never {
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -281,6 +282,7 @@ VERBS
   projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
   sync <TC-N> --dir <path>        mount ticket↔folder mirror (TC-95 §29.8; daemon fills lastPoll/pending)
+  sync <TC-N> --push-once          one-shot push of folder edits (bridge until the daemon loop lands)
   sync ls                         list active ticket↔folder mounts
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
   get HT-N [--comments] [--full] [--raw] [--fields f1,f2]
@@ -483,7 +485,7 @@ export async function run(argv: string[]): Promise<unknown> {
           },
         ]);
         // Phase 2: initial pull so the folder is immediately usable.
-        const pulled = await pullTicket(p, { ticket: handle, projectId: ref.projectId, uuid: ref.uuid, seq: ref.seq, ident: ref.ident, dir: absDir, seat: cfg.seat, createdAt: "", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null });
+        const pulled = await pullTicket(p, { ticket: handle, projectId: ref.projectId, uuid: ref.uuid, seq: ref.seq, ident: ref.ident, dir: absDir, seat: cfg.seat, createdAt: "", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null, kids: [] });
         writeMounts([
           ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
           {
@@ -499,9 +501,26 @@ export async function run(argv: string[]): Promise<unknown> {
             pending: 0,
             lastRev: pulled.rev,
             lastBodySha: pulled.bodySha,
+            kids: pulled.kids,
           },
         ]);
         return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
+      }
+      if (args.flags["push-once"] === true) {
+        if (sub === undefined)
+          throw new UsageError("validation", "sync --push-once needs a ticket: plane sync TEST-1 --push-once", {
+            suggestion: "plane sync ls to list active mounts",
+          });
+        const ref = await p.issueRef(sub, { fresh: true });
+        const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
+        const mounts = readMounts();
+        const hit = mounts.find((m) => m.ticket.toUpperCase() === handle);
+        if (!hit)
+          throw new UsageError("not-found", `no active sync mount for '${handle}'`, {
+            valid: mounts.map((m) => m.ticket),
+            suggestion: "plane sync ls to list active mounts",
+          });
+        return await pushTicket(p, hit);
       }
       if (sub !== undefined)
         throw new UsageError("validation", `sync ${sub} needs --dir <path>: plane sync ${sub} --dir <path>`, {
