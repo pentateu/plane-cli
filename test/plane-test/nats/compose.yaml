@@ -1,7 +1,7 @@
 # TC-86: NATS test service for plane CLI integration tests.
 # TC-38 pattern: nats:2.10-alpine, client port bound high-ephemeral on
 # 127.0.0.1 only. Ephemeral per-run: start, run tests, tear down — the
-# teardown below removes the container and volume so nothing leaks.
+# teardown below removes the container (storage is tmpfs, no volume exists).
 #
 # Port 24322 was chosen free at the time of writing (checked with
 # `ss -tlnp`; avoids the occupied 15042, 14933, 14228, 4224, 8224, 14222).

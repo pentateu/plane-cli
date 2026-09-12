@@ -55,6 +55,13 @@ Reference deployment: **pentateu/AI_Tutor** (Ai Tutor project).
 
 ## Testing
 
-Plane CLI test target: the `TESTCLI` project on the live instance (smoke
-tests, zero production tickets touched) + ephemeral NATS test services —
-see `test/plane-test/README.md` and `test/plane-test/compose.yaml`.
+Primary: a **local** Plane TEST stack — zero production contact. Mirrors
+prod images/topology, seeds its own workspace + `TEST` project + type
+labels, then tears down without residue — see
+`test/plane-test/docker-compose.yml` (+ `test/plane-test/nats/compose.yaml`
+for NATS) and `test/plane-test/README.md`.
+
+Opt-in live smoke only: the `TESTCLI` project on the live instance (usage
+in `test/plane-test/README.md`). Prefer the local stack for every CLI
+change; touch live only for the integration points the local stack cannot
+prove (acceptance-flagged, O-9 create-then-delete discipline).
