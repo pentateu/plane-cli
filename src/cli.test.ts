@@ -867,7 +867,7 @@ describe("create --project (TC-81)", () => {
     const d = (await run(["create", "--title", "infra job", "--type", "ops", "--body", "<p>x</p>", "--project", "infra"])) as Record<string, unknown>;
     const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
     expect(post.path).toBe(`/projects/${INFRA_ID}/issues/`);
-    expect(post.body).toMatchObject({ state: "st9-todo", label_ids: ["lb9-ops"] });
+    expect(post.body).toMatchObject({ state: "st9-todo", labels: ["lb9-ops"] });
     expect(d.id).toBe("INFRA-7");
   });
 
@@ -876,7 +876,7 @@ describe("create --project (TC-81)", () => {
     const d = (await run(["create", "--title", "infra job", "--type", "bug", "--body", "<p>x</p>", "--project", INFRA_ID])) as Record<string, unknown>;
     const post = calls.find((c) => c.method === "POST" && /\/projects\/[^/]+\/issues\/?$/.test(c.path))!;
     expect(post.path).toBe(`/projects/${INFRA_ID}/issues/`);
-    expect(post.body).toMatchObject({ state: "st9-todo", label_ids: ["lb9-bug"] });
+    expect(post.body).toMatchObject({ state: "st9-todo", labels: ["lb9-bug"] });
     expect(d.id).toBe("INFRA-7");
   });
 
