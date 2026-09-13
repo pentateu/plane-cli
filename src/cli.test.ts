@@ -1508,11 +1508,11 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(d).toMatchObject({ ticket: "HT-67", comments: 2, children: 1 });
     const md = readFileSync(join(dir, "ticket.md"), "utf8");
     expect(md).toContain("---\nstate: todo\nassignee: dev2\nlabels: [type:bug]\npriority: none\n---\n# [bug] overshoot quota\n");
-    const events = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const events = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({ event: "add", id: "cm-0", status: "synced" });
     expect(events.every((e: any) => typeof e.op === "string" && typeof e.body_sha === "string")).toBeTrue();
-    const snap = JSON.parse(readFileSync(join(dir, "comments.json"), "utf8"));
+    const snap = JSON.parse(readFileSync(join(dir, ".plane", "comments.json"), "utf8"));
     expect(snap).toHaveLength(2);
     expect(snap[0]).toEqual({ id: "cm-0", parent: null, author: expect.any(String), body: expect.any(String), at: expect.any(String), status: "synced" });
   });
@@ -1540,11 +1540,11 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     const dir = mountDir("h");
     await run(["sync", "HT-67", "--dir", dir]);
     const pending = { event: "add", op: "evt-test-1", id: null, parent: null, author: "dev1", body: "local note", body_sha: "sha256-x", at: "2026-09-12T00:00:00.000Z", status: "pending" };
-    writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(pending) + "\n", { flag: "a" });
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify(pending) + "\n", { flag: "a" });
     const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
     expect(d.comments).toBe(1);
     expect(calls.some((c) => c.method === "POST" && /\/issues\/is-67\/comments\/$/.test(c.path))).toBeTrue();
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     const mine = rows.find((r: any) => r.op === "evt-test-1");
     expect(mine.status).toBe("synced");
     expect(typeof mine.id).toBe("string");
@@ -1563,7 +1563,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(d.pushed).toEqual([]);
     expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
     expect(existsSync(join(dir, "ticket.md.conflict"))).toBeTrue();
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
   });
 
@@ -1578,7 +1578,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     await run(["sync", "HT-67", "--push-once"]);
     await run(["sync", "HT-67", "--push-once"]);
     await run(["sync", "HT-67", "--push-once"]);
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.filter((r: any) => r.status === "conflict")).toHaveLength(1);
   });
 
@@ -1597,7 +1597,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     // Follow-up cycle is clean: baselines followed the forced push.
     const d2 = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
     expect(d2.pushed).toEqual([]);
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
   });
 
@@ -1613,7 +1613,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     }
     expect(String(caught.message)).toContain("refused: unknown-state");
     expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
   });
 });
@@ -1638,12 +1638,12 @@ describe("sync daemon (TC-95 phase 4)", () => {
     await run(["sync", "HT-67", "--dir", mnt]);
     // Crashed between post and id write: server HAS cm-0, row still pending.
     const landed = { event: "add", op: "evt-landed-1", id: "cm-0", parent: null, author: "dev1", body: "x", body_sha: "sha256-x", at: "2026-09-12T00:00:00.000Z", status: "pending" };
-    writeFileSync(join(mnt, "comments.events.jsonl"), JSON.stringify(landed) + "\n", { flag: "a" });
+    writeFileSync(join(mnt, ".plane", "comments.events.jsonl"), JSON.stringify(landed) + "\n", { flag: "a" });
     const postsBefore = calls.filter((c) => c.method === "POST" && /\/comments\/$/.test(c.path)).length;
     await workerCycle("pr-1");
     const postsAfter = calls.filter((c) => c.method === "POST" && /\/comments\/$/.test(c.path)).length;
     expect(postsAfter).toBe(postsBefore); // adopted, never re-posted
-    const rows = readFileSync(join(mnt, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(mnt, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.find((r: any) => r.op === "evt-landed-1").status).toBe("synced");
   });
 
@@ -1654,10 +1654,10 @@ describe("sync daemon (TC-95 phase 4)", () => {
     const mnt = join(dir, "mount");
     await run(["sync", "HT-67", "--dir", mnt]);
     const fresh = { event: "add", op: "evt-fresh-1", id: null, parent: null, author: "dev1", body: "brand new", body_sha: "sha256-y", at: "2026-09-12T00:00:00.000Z", status: "pending" };
-    writeFileSync(join(mnt, "comments.events.jsonl"), JSON.stringify(fresh) + "\n", { flag: "a" });
+    writeFileSync(join(mnt, ".plane", "comments.events.jsonl"), JSON.stringify(fresh) + "\n", { flag: "a" });
     await workerCycle("pr-1");
     expect(calls.some((c) => c.method === "POST" && /\/issues\/is-67\/comments\/$/.test(c.path))).toBeTrue();
-    const rows = readFileSync(join(mnt, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(mnt, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     const mine = rows.find((r: any) => r.op === "evt-fresh-1");
     expect(mine.status).toBe("synced");
     // Same op retained (dedup key stable across the crash window).
@@ -1754,7 +1754,7 @@ describe("sync daemon (TC-95 phase 4)", () => {
   test("blocking mount writes a ready status file", async () => {
     const dir = daemonDir("t");
     await run(["sync", "HT-67", "--dir", dir]);
-    const st = JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"));
+    const st = JSON.parse(readFileSync(join(dir, ".plane", ".sync-status.json"), "utf8"));
     expect(st).toMatchObject({ ticket: "HT-67", ready: true, pending: 0 });
     expect(typeof st.rev).toBe("string");
   });
@@ -1763,9 +1763,9 @@ describe("sync daemon (TC-95 phase 4)", () => {
     const { workerCycle } = await import("./syncWorker.ts");
     const dir = daemonDir("u");
     await run(["sync", "HT-67", "--dir", dir, "--no-wait"]);
-    expect(JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: false, rev: null });
+    expect(JSON.parse(readFileSync(join(dir, ".plane", ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: false, rev: null });
     await workerCycle("pr-1");
-    expect(JSON.parse(readFileSync(join(dir, ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: true });
+    expect(JSON.parse(readFileSync(join(dir, ".plane", ".sync-status.json"), "utf8"))).toMatchObject({ ticket: "HT-67", ready: true });
   });
 
   test("re-pull preserves local pending rows", async () => {
@@ -1775,12 +1775,12 @@ describe("sync daemon (TC-95 phase 4)", () => {
     const dir = daemonDir("v");
     await run(["sync", "HT-67", "--dir", dir]);
     const mine = { event: "add", op: "evt-keep-1", id: null, parent: null, author: "dev1", body: "unposted", body_sha: "sha256-k", at: "2026-09-12T00:00:00.000Z", status: "pending" };
-    writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(mine) + "\n", { flag: "a" });
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify(mine) + "\n", { flag: "a" });
     const cfg = resolveConfig({});
     const p = new Plane(cfg, new Cache(process.env.PLANE_CACHE!));
     const mounts = JSON.parse(readFileSync(process.env.PLANE_SYNC_STATE!, "utf8"));
     await pullTicket(p, mounts[0]);
-    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.op === "evt-keep-1" && r.status === "pending")).toBeTrue();
     // Server rows not duplicated (2 synced, same ops as the first pull).
     expect(rows.filter((r: any) => r.status === "synced")).toHaveLength(2);

@@ -18,7 +18,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Plane, Raw } from "./api.ts";
 import { htmlToText } from "./api.ts";
-import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, type SyncMount } from "./sync.ts";
+import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, metaDir, type SyncMount } from "./sync.ts";
 import { adoptNewcomers, pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
 
 export function countPending(dir: string): number {
@@ -108,7 +108,7 @@ function conflictNotice(ticket: string, detail: string): SyncEvent {
 }
 
 function appendEvent(dir: string, e: SyncEvent): void {
-  writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(e) + "\n", { flag: "a" });
+  writeFileSync(join(metaDir(dir), "comments.events.jsonl"), JSON.stringify(e) + "\n", { flag: "a" });
 }
 
 /** ONE notice per (server rev, base rev) pair: while a conflict sits
@@ -125,9 +125,9 @@ function readEvents(dir: string): SyncEvent[] {
 }
 
 function writeEvents(dir: string, events: SyncEvent[]): void {
-  writeFileSync(join(dir, "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
+  writeFileSync(join(metaDir(dir), "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
   writeFileSync(
-    join(dir, "comments.json"),
+    join(metaDir(dir), "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
 }
@@ -328,8 +328,8 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       added++;
     }
     if (added) {
-      writeFileSync(join(dir, "comments.events.jsonl"), prior.map((e) => JSON.stringify(e)).join("\n") + (prior.length ? "\n" : ""));
-      writeFileSync(join(dir, "comments.json"), JSON.stringify(prior.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n");
+      writeFileSync(join(metaDir(dir), "comments.events.jsonl"), prior.map((e) => JSON.stringify(e)).join("\n") + (prior.length ? "\n" : ""));
+      writeFileSync(join(metaDir(dir), "comments.json"), JSON.stringify(prior.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n");
     }
   }
   const md = readFileSync(join(dir, "ticket.md"), "utf8");

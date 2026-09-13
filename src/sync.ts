@@ -68,18 +68,24 @@ export interface SyncStatus {
 }
 
 /**
- * Watch surface: `.sync-status.json` inside each mount dir states whether
- * the folder is complete and drained. Watchers (inotify/kqueue, or a simple
- * poll on mtime) see readiness without touching the registry — the file
- * appears at mount time (ready:false) and flips when the pull lands and
- * whenever the drain state changes.
+ * Watch surface: `.plane/.sync-status.json` inside each mount dir states
+ * whether the folder is complete and drained. Watchers (inotify/kqueue, or
+ * a simple poll on mtime) see readiness without touching the registry — the
+ * file appears at mount time (ready:false) and flips when the pull lands
+ * and whenever the drain state changes.
  */
 export function statusFile(dir: string): string {
-  return join(dir, ".sync-status.json");
+  return join(dir, ".plane", ".sync-status.json");
+}
+
+/** ALL sync metadata lives in this hidden dir; the mount root holds only
+ *  the files humans edit (ticket.md, sub-tickets/) — no JSON noise. */
+export function metaDir(dir: string): string {
+  return join(dir, ".plane");
 }
 
 export function countPendingEvents(dir: string): number {
-  const f = join(dir, "comments.events.jsonl");
+  const f = join(metaDir(dir), "comments.events.jsonl");
   if (!existsSync(f)) return 0;
   let n = 0;
   for (const line of readFileSync(f, "utf8").split("\n")) {
@@ -93,7 +99,7 @@ export function countPendingEvents(dir: string): number {
 
 export function writeStatusFile(dir: string, s: SyncStatus): void {
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(metaDir(dir), { recursive: true });
     writeFileSync(statusFile(dir), JSON.stringify(s) + "\n");
   } catch { /* status is advisory — never fail a sync over it */ }
 }
@@ -116,7 +122,7 @@ export interface StoredEvent {
 }
 
 export function readEventsFile(dir: string): StoredEvent[] {
-  const f = join(dir, "comments.events.jsonl");
+  const f = join(metaDir(dir), "comments.events.jsonl");
   if (!existsSync(f)) return [];
   const out: StoredEvent[] = [];
   for (const line of readFileSync(f, "utf8").split("\n")) {

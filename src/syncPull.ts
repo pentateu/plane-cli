@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { htmlToText, type Plane, type Raw } from "./api.ts";
-import { readEventsFile, writeStatusFile, type SyncMount } from "./sync.ts";
+import { readEventsFile, writeStatusFile, metaDir, type SyncMount } from "./sync.ts";
 
 export interface SyncEvent {
   event: "add" | "reply" | "resolve";
@@ -160,9 +160,10 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   // append in time order; local pending rows stay verbatim; conflict rows
   // are dropped (resolved by this pull).
   const events: SyncEvent[] = [...prior.filter((e) => e.status === "synced"), ...fresh, ...kept];
-  writeFileSync(join(mount.dir, "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
+  mkdirSync(metaDir(mount.dir), { recursive: true });
+  writeFileSync(join(metaDir(mount.dir), "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
   writeFileSync(
-    join(mount.dir, "comments.json"),
+    join(metaDir(mount.dir), "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
   // Stale conflict snapshots: the pull just made server state local — any
