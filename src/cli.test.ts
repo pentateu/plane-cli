@@ -1449,6 +1449,48 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(ls.syncs).toEqual([]);
   });
 
+  test("stop-all clears every mount, keeps folders, reports what it closed", async () => {
+    const d1 = mountDir("sa1");
+    const d2 = mountDir("sa2");
+    await run(["sync", "HT-66", "--dir", d1]);
+    await run(["sync", "HT-67", "--dir", d2]);
+    const d = (await run(["sync", "--stop-all"])) as Record<string, any>;
+    expect(d.stopped).toEqual(["HT-66", "HT-67"]);
+    expect(d.dirsKept).toEqual([d1, d2]);
+    expect(existsSync(d1)).toBeTrue();
+    expect(existsSync(d2)).toBeTrue();
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toEqual([]);
+  });
+
+  test("stop-all with no mounts is a clean no-op", async () => {
+    const d = (await run(["sync", "--stop-all"])) as Record<string, any>;
+    expect(d.stopped).toEqual([]);
+    expect(d.note).toContain("no active syncs");
+  });
+
+  test("ls warns when mounts exist but no daemon is running (stalled)", async () => {
+    const dir = mountDir("stall");
+    await run(["sync", "HT-66", "--dir", dir]);
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.daemon).toBeNull();
+    expect(String(ls.warning)).toContain("STALLED");
+    await run(["sync", "--stop-all"]);
+    const clean = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(clean.warning).toBeUndefined();
+  });
+
+  test("ls --check reports live ticket state and flags finished work safeToStop", async () => {
+    const dir = mountDir("ck");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const d = (await run(["sync", "ls", "--check"])) as Record<string, any>;
+    expect(d.daemon).toBeNull();
+    expect(String(d.warning)).toContain("STALLED");
+    expect(d.syncs[0].state).toBe("todo"); // mock is-67 sits in st-todo
+    expect(d.syncs[0].safeToStop).toBeFalse();
+    await run(["sync", "--stop-all"]);
+  });
+
   test("stop of an unmounted ticket fails listing mounts", async () => {
     let caught: any;
     try {

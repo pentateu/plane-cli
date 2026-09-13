@@ -20,7 +20,7 @@ function finish(code: number): never {
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "max-chars", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "force", "daemon", "no-wait", "wait-all"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "force", "daemon", "no-wait", "wait-all", "stop-all", "check"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -289,8 +289,10 @@ VERBS
   sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
   sync --wait-all [--timeout N]   block until EVERY mount is pulled and drained (whole-handover gate)
   sync --daemon [--interval N]     run the supervisor foreground (mounting auto-starts a background daemon)
-  sync ls                         list active ticket↔folder mounts (+ daemon pid)
-  sync --stop <TC-N>              unmount (daemon exits, folder kept)
+  sync ls                         list active ticket↔folder mounts (+ daemon pid; warns when stalled)
+  sync ls --check                 + live ticket state per mount — flags done/cancelled as safeToStop (end-of-ticket sweep)
+  sync --stop <TC-N>              unmount one (daemon exits when the last mount goes, folder kept)
+  sync --stop-all                 unmount EVERY mount — the end-of-session cleanup check
   get HT-N [--comments] [--full] [--max-chars N] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
                                   who holds HT-N up, what HT-N holds up
@@ -448,7 +450,29 @@ export async function run(argv: string[]): Promise<unknown> {
       }
       if (sub === "ls" && dirF === undefined && stopF === undefined) {
         const mounts = readMounts();
-        return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })), daemon: daemonAlive() };
+        const daemon = daemonAlive();
+        const stalled = mounts.length > 0 && daemon === null
+          ? { warning: "no daemon running — mounts are STALLED (edits go nowhere); start one: plane sync --daemon, or clean up: plane sync --stop-all" }
+          : {};
+        if (args.flags.check !== true) return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })), daemon, ...stalled };
+        // --check: per-mount live ticket state — the end-of-ticket cleanup
+        // sweep ("did I leave any syncs running on finished work?").
+        const syncs = [];
+        for (const m of mounts) {
+          const row: Record<string, unknown> = { ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending };
+          try {
+            const issue = (await p.request("GET", `${p.projectPathFor(m.projectId)}/issues/${m.uuid}/`)) as Raw;
+            const sm = await p.stateMap(m.projectId);
+            const token = Object.entries(sm).find(([, id]) => id === String(issue.state))?.[0] ?? String(issue.state);
+            row.state = token;
+            row.safeToStop = token === "done" || token === "cancelled";
+          } catch (e) {
+            row.state = "unknown";
+            row.error = String((e as Error).message).slice(0, 120);
+          }
+          syncs.push(row);
+        }
+        return { syncs, daemon, ...stalled };
       }
       if (stopF !== undefined) {
         if (typeof stopF !== "string" || !stopF.trim())
@@ -466,6 +490,19 @@ export async function run(argv: string[]): Promise<unknown> {
           });
         writeMounts(mounts.filter((m) => m !== hit));
         return { ticket: handle, stopped: true, dirKept: hit.dir };
+      }
+      if (args.flags["stop-all"] === true) {
+        // End-of-ticket cleanup sweep: close EVERY mount in one command.
+        // Folders are kept (they hold the user's files); the daemon notices
+        // zero mounts on its next roll-call and exits itself.
+        const mounts = readMounts();
+        if (!mounts.length) return { stopped: [], dirsKept: [], note: "no active syncs" };
+        writeMounts([]);
+        return {
+          stopped: mounts.map((m) => m.ticket),
+          dirsKept: mounts.map((m) => m.dir),
+          note: "folders kept — delete them yourself if unwanted; daemon exits on its next roll-call",
+        };
       }
       // Mount trigger: an explicit --dir, or a bare ticket sub — but never
         // when a gate/push flag is present (those operate on existing mounts).
