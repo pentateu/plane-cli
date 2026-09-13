@@ -100,7 +100,7 @@ function conflictNotice(ticket: string, detail: string): SyncEvent {
     id: null,
     parent: null,
     author: "sync-daemon",
-    body: `refused: conflict — ${detail} on ${ticket} (local kept, server side in .conflict — resolve, then re-push)`,
+    body: `refused: conflict — ${detail} on ${ticket} (local kept, server side in .conflict — resolve with \`sync ${ticket} --push-once --force\` for local-wins, or re-mount for server-wins)`,
     body_sha: sha256(`${ticket}:${detail}`),
     at: new Date().toISOString(),
     status: "conflict",
@@ -109,6 +109,15 @@ function conflictNotice(ticket: string, detail: string): SyncEvent {
 
 function appendEvent(dir: string, e: SyncEvent): void {
   writeFileSync(join(dir, "comments.events.jsonl"), JSON.stringify(e) + "\n", { flag: "a" });
+}
+
+/** ONE notice per (server rev, base rev) pair: while a conflict sits
+ *  unresolved, every poll cycle re-detects it — re-notifying each time
+ *  would spam ~12 identical rows/min at the 5s cadence. */
+function conflictAlreadyNoticed(dir: string, serverRev: string, baseRev: string | null): boolean {
+  return readEvents(dir).some(
+    (e) => e.status === "conflict" && e.body.includes(`server rev ${serverRev} vs local edits (base ${baseRev})`),
+  );
 }
 
 function readEvents(dir: string): SyncEvent[] {
@@ -279,7 +288,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
   return { pushed, comments: posted, rev: String(after.updated_at ?? ""), bodySha };
 }
 
-export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult> {
+export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: boolean }): Promise<PushResult> {
   const dir = mount.dir;
   if (!existsSync(join(dir, "ticket.md"))) {
     throw Object.assign(new Error(`refused: missing-ticket — no ticket.md in ${dir} (mount pulled nothing?)`), {
@@ -327,10 +336,13 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
   const localChanged = sha256(md) !== mount.lastFileSha;
   const serverChanged = mount.lastRev !== null && serverRev !== mount.lastRev;
 
-  if (serverChanged && localChanged) {
+  if (serverChanged && localChanged && !opts?.force) {
     // Conflict: local kept, server side aside, ONE notice, push nothing.
+    // --force (manual `sync TC-N --push-once --force` only, never the daemon)
+    // skips this branch: local wins, baselines follow the push below.
     writeFileSync(join(dir, "ticket.md.conflict"), JSON.stringify(ticket, null, 2) + "\n");
-    appendEvent(dir, conflictNotice(mount.ticket, `server rev ${serverRev} vs local edits (base ${mount.lastRev})`));
+    if (!conflictAlreadyNoticed(dir, serverRev, mount.lastRev))
+      appendEvent(dir, conflictNotice(mount.ticket, `server rev ${serverRev} vs local edits (base ${mount.lastRev})`));
     return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
   }
   // Child arrivals don't bump the parent rev (Plane-side fact, proven live):
@@ -360,6 +372,7 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
   // creation flow — a later phase, ignored here).
   const adopted = await adoptNewcomers(p, mount, newcomers);
   const pushed = [...r.pushed, ...adopted.map((k) => `+${k.rel}`)];
+  if (opts?.force && serverChanged && localChanged) pushed.unshift("forced");
   let comments = r.comments;
   let kids = [...(mount.kids ?? []), ...adopted];
   for (const kid of kids) {
@@ -369,9 +382,10 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
     if (sha256(readFileSync(childMd, "utf8")) === kid.fileSha) continue;
     const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
     const childRev = String(childTicket.updated_at ?? "");
-    if (childRev !== kid.rev) {
+    if (childRev !== kid.rev && !opts?.force) {
       writeFileSync(`${childMd}.conflict`, JSON.stringify(childTicket, null, 2) + "\n");
-      appendEvent(dir, conflictNotice(mount.ticket, `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`));
+      if (!conflictAlreadyNoticed(dir, childRev, kid.rev))
+        appendEvent(dir, conflictNotice(mount.ticket, `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`));
       continue;
     }
     const childMount: SyncMount = { ...mount, uuid: kid.uuid, lastBodySha: kid.bodySha };

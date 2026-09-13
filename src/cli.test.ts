@@ -1525,6 +1525,40 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
   });
 
+  test("conflict notice fires ONCE across repeated polls (no per-cycle spam)", async () => {
+    const dir = mountDir("i2");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]);
+    await run(["sync", "HT-67", "--push-once"]);
+    await run(["sync", "HT-67", "--push-once"]);
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.filter((r: any) => r.status === "conflict")).toHaveLength(1);
+  });
+
+  test("push-once --force resolves local-wins (pushes over the server, re-baselines)", async () => {
+    const dir = mountDir("i3");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8") + "\nforced body line\n");
+    const d = (await run(["sync", "HT-67", "--push-once", "--force"])) as Record<string, any>;
+    expect(d.pushed).toContain("forced");
+    expect(d.pushed).toContain("body");
+    expect(calls.some((c) => c.method === "PATCH" && /\/issues\/is-67\/$/.test(c.path))).toBeTrue();
+    // Follow-up cycle is clean: baselines followed the forced push.
+    const d2 = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d2.pushed).toEqual([]);
+    const rows = readFileSync(join(dir, "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+  });
+
   test("push-once with unknown state refuses loud with a conflict notice", async () => {
     const dir = mountDir("j");
     await run(["sync", "HT-67", "--dir", dir]);

@@ -13,7 +13,7 @@
  * - body = plain text via htmlToText (spec's "html fallback wherever easier",
  *   inverted: lossless HTML round-trip is a later phase if agents need it)
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { htmlToText, type Plane, type Raw } from "./api.ts";
@@ -128,10 +128,13 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   const children = ctx.visited.size - 1;
 
   // Existing comments → synced events (server ids known) + derived snapshot.
-  // Local pending/conflict rows SURVIVE the rewrite (re-pull must never drop
-  // unposted work); server rows already present (by id) are not duplicated.
+  // Local pending rows SURVIVE the rewrite (re-pull must never drop unposted
+  // work); server rows already present (by id) are not duplicated. Conflict
+  // rows + .conflict snapshots are DROPPED: a completed pull means the
+  // server state is now the local state — the conflict is resolved
+  // (server-wins), so its notice row and stale snapshot are litter.
   const prior = readEventsFile(mount.dir);
-  const kept = prior.filter((e) => e.status !== "synced");
+  const kept = prior.filter((e) => e.status === "pending");
   const knownIds = new Set(prior.filter((e) => e.status === "synced" && e.id).map((e) => e.id as string));
   const seatByMember = ctx.seatByMember;
   const list = (((rawComments as Raw).results ?? rawComments) as Raw[]).slice()
@@ -154,13 +157,20 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     } as SyncEvent);
   }
   // Prior synced rows keep their ops (stable dedup keys); fresh server rows
-  // append in time order; local pending/conflict rows stay verbatim.
+  // append in time order; local pending rows stay verbatim; conflict rows
+  // are dropped (resolved by this pull).
   const events: SyncEvent[] = [...prior.filter((e) => e.status === "synced"), ...fresh, ...kept];
   writeFileSync(join(mount.dir, "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
   writeFileSync(
     join(mount.dir, "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
+  // Stale conflict snapshots: the pull just made server state local — any
+  // .conflict file (root or child) describes a fight that is now over.
+  try { rmSync(join(mount.dir, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
+  for (const kid of ctx.kids) {
+    try { rmSync(join(mount.dir, kid.rel, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
+  }
   writeStatusFile(mount.dir, { ticket: mount.ticket, ready: kept.length === 0, lastPoll: new Date().toISOString(), pending: kept.length, rev });
   return { rev, bodySha, fileSha, comments: events.length, children, kids: ctx.kids };
 }
