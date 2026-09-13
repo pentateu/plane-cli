@@ -1418,7 +1418,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     const def = join(homedir(), ".config", "plane", "sync", "HT-66");
     expect(d).toMatchObject({ ticket: "HT-66", dir: def, mounted: true });
     expect(existsSync(def)).toBeTrue();
-    tmpDirs.push(def, join(homedir(), ".config", "plane", "sync")); // clean up real-home test footprint
+    tmpDirs.push(def); // clean up ONLY the HT-66 test footprint — never the parent sync dir (live mounts live there)
     const ls = (await run(["sync", "ls"])) as Record<string, any>;
     expect(ls.syncs).toHaveLength(1);
   });
@@ -1434,6 +1434,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
       caught = e;
     }
     expect(caught).toBeUndefined();
+    tmpDirs.push(join(homedir(), ".config", "plane", "sync", "HT-67")); // test footprint only, never the parent
     const ls = (await run(["sync", "ls"])) as Record<string, any>;
     expect(ls.syncs).toHaveLength(2);
   });
