@@ -2,29 +2,33 @@
  * TC-95 (§29.8) Phase 3 — one-shot push: folder → ticket.
  *
  * Applies local edits with the same call-time checks as the tc/plane verbs:
- * - drift (server updated_at vs mount.lastRev) + local change (bodySha vs
- *   mount.lastBodySha): both moved → conflict (local kept, `.conflict` copy
+ * - drift (server updated_at vs mount.lastRev) + local change (fileSha vs
+ *   mount.lastFileSha): both moved → conflict (local kept, `.conflict` copy
  *   of the server side, ONE conflict notice in comments.events.jsonl, push
  *   nothing). Server-only move → re-pull wins. Local-only → push.
- * - §30.3 checks (intent-claim, 3-cap, budgets) are TC-63's shape; the
- *   refusal carrier here is interim: {refused, rule, ticket, detail, remedy}
- *   plus the conflict event (never silent, never a dropped edit).
- * - pending comment events post verbatim (agents stamp bodies per §2.1);
- *   rows flip to synced with the server id; comments.json rebuilds.
- * - crash-safe order lives here: rows are already pending BEFORE this runs
- *   (agents append first); restart reconcile is Phase 4 (daemon).
+ * - §30.3 checks (review C7/I1/I7/I8): the intent-claim gate runs ONLY when
+ *   the computed patch actually changes state fields (never on pure comment
+ *   drains or body edits), reads the workspace from the resolved config
+ *   (not raw env), FAILS CLOSED on an unreadable journal (the gate must not
+ *   disable itself exactly when the other writer is active), and RE-READS
+ *   the claim immediately before the PATCH (check-then-act narrowed to one
+ *   round-trip; documented as advisory — no server-side CAS exists).
+ * - C6: the revision guard re-fetches the issue immediately before the
+ *   PATCH; a rev moved mid-push aborts to the conflict path (never
+ *   overwrites, never baselines-over).
+ * - C5 crash-safe posting: the §2.1 msg_id is PERSISTED before the POST
+ *   (row status "posting"), flipped to synced after; restart reconcile
+ *   adopts by stamp substring — no double-post, no lost post.
+ * - Event-file rewrites ALL go through updateEvents (lock + merge, C2);
+ *   registry rewrites through updateMounts (C1).
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Plane, Raw } from "./api.ts";
 import { htmlToText } from "./api.ts";
-import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, metaDir, type SyncMount } from "./sync.ts";
+import { readEventsFile, updateMounts, updateEvents, writeStatusFile, metaDir, countPendingEvents, type SyncMount, type StoredEvent } from "./sync.ts";
 import { adoptNewcomers, pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
-
-export function countPending(dir: string): number {
-  return countPendingEvents(dir);
-}
 
 export interface PushRefusal {
   refused: true;
@@ -97,7 +101,7 @@ export function parseTicketMd(text: string): { fm: FrontMatter; title: string; b
 function conflictNotice(ticket: string, detail: string): SyncEvent {
   return {
     event: "add",
-    op: `conflict-${Date.now()}`,
+    op: `conflict-${Date.now()}-${randomUUID().slice(0, 8)}`,
     id: null,
     parent: null,
     author: "sync-daemon",
@@ -108,8 +112,21 @@ function conflictNotice(ticket: string, detail: string): SyncEvent {
   };
 }
 
-function appendEvent(dir: string, e: SyncEvent): void {
-  writeFileSync(join(metaDir(dir), "comments.events.jsonl"), JSON.stringify(e) + "\n", { flag: "a" });
+/**
+ * I3 (review): ONE notice per (ticket, rule, detail) — refusal paths run
+ * every poll cycle while the condition holds; without dedup a blocked mount
+ * spams ~12 identical rows/min. Dedup scope INCLUDES the ticket (M2): two
+ * mounts sharing a dir must not suppress each other's notices.
+ */
+async function refuseOnce(dir: string, ticket: string, rule: string, detail: string): Promise<void> {
+  await updateEvents(dir, (events) => {
+    const marker = `${rule}: ${detail}`;
+    const already = (events as SyncEvent[]).some((e) => e.status === "conflict" && e.body.includes(marker) && e.body.includes(`on ${ticket}`));
+    if (!already) {
+      events.push(conflictNotice(ticket, `${rule}: ${detail}`));
+    }
+    return undefined;
+  });
 }
 
 /**
@@ -118,25 +135,37 @@ function appendEvent(dir: string, e: SyncEvent): void {
  * the ticket's Plane state is being mutated (or about to be) through the
  * teamctl journal outbox; racing it would double-write.
  *
- * Journal sidecar shape (teamctl src/journal.ts): `~/.local/state/teamctl/
+ * Journal sidecar shape (teamctl src/journal.ts): `$TEAMCTL_STATE_HOME/
  * <workspace>/journals/<TC-N>.header.json` → `pending.plane = {entry, op,
  * attempts, last_error} | null`; the arming entry's seat lives in the
- * entries file (`<TC-N>.md`, line with iso == entry). Missing/unreadable
- * journal → no claim (fail-open here: plane-cli tickets may have no journal
- * at all — the coordination layer is teamctl's, this is the advisory hook).
+ * entries file (`<TC-N>.md`, `## <iso> — <kind> — <seat>` heading).
+ *
+ * Fail-closed (review I8): a journal that EXISTS but is unreadable returns
+ * `unreadable` — the caller refuses (the gate must not disable itself
+ * exactly when the other writer mutates the file, incl. torn writes).
+ * A cleanly ABSENT journal is fail-open: plane-cli tickets may have no
+ * journal at all (the coordination layer is teamctl's; this is the hook).
  */
-export function readLiveIntentClaim(mountTicket: string, workspace: string): { seat: string; iso: string; op: string } | null {
+export function readLiveIntentClaim(
+  mountTicket: string,
+  workspace: string,
+): { seat: string; iso: string; op: string } | null | "unreadable" {
   const stateHome = process.env.TEAMCTL_STATE_HOME ?? join(process.env.HOME ?? "", ".local", "state", "teamctl");
   const headerPath = join(stateHome, workspace, "journals", `${mountTicket}.header.json`);
   if (!existsSync(headerPath)) return null;
+  let header: { pending?: { plane?: { entry: string; op: string } | null } };
   try {
-    const header = JSON.parse(readFileSync(headerPath, "utf8")) as { pending?: { plane?: { entry: string; op: string } | null } };
-    const slot = header.pending?.plane;
-    if (!slot) return null;
-    // Arming entry seat: the entries file is markdown — `## <iso> — <kind>
-    // — <seat>` headings (teamctl journal.ts render). Scan for the iso.
-    const entriesPath = join(stateHome, workspace, "journals", `${mountTicket}.md`);
-    let seat = "unknown";
+    header = JSON.parse(readFileSync(headerPath, "utf8"));
+  } catch {
+    return "unreadable";
+  }
+  const slot = header.pending?.plane;
+  if (!slot) return null;
+  // Arming entry seat: the entries file is markdown — `## <iso> — <kind>
+  // — <seat>` headings (teamctl journal.ts render). Scan for the iso.
+  const entriesPath = join(stateHome, workspace, "journals", `${mountTicket}.md`);
+  let seat = "unknown";
+  try {
     if (existsSync(entriesPath)) {
       for (const line of readFileSync(entriesPath, "utf8").split("\n")) {
         const m = /^## (\S+) — (\S+) — (\S+)\s*$/.exec(line);
@@ -146,10 +175,8 @@ export function readLiveIntentClaim(mountTicket: string, workspace: string): { s
         }
       }
     }
-    return { seat, iso: slot.entry, op: slot.op };
-  } catch {
-    return null;
-  }
+  } catch { /* seat stays unknown — the claim still gates */ }
+  return { seat, iso: slot.entry, op: slot.op };
 }
 
 /** Five-field §30.3 refusal block for an intent-claim conflict. */
@@ -165,42 +192,32 @@ function intentClaimBlock(ticket: string, claim: { seat: string; iso: string; op
   ].join("\n");
 }
 
-/** ONE notice per (server rev, base rev) pair: while a conflict sits
- *  unresolved, every poll cycle re-detects it — re-notifying each time
- *  would spam ~12 identical rows/min at the 5s cadence. */
-function conflictAlreadyNoticed(dir: string, serverRev: string, baseRev: string | null): boolean {
-  return readEvents(dir).some(
-    (e) => e.status === "conflict" && e.body.includes(`server rev ${serverRev} vs local edits (base ${baseRev})`),
-  );
-}
-
 function readEvents(dir: string): SyncEvent[] {
   return readEventsFile(dir) as SyncEvent[];
 }
 
-function writeEvents(dir: string, events: SyncEvent[]): void {
-  writeFileSync(join(metaDir(dir), "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
+/** Rebuild the derived comments.json snapshot from the events file. */
+function writeCommentsJson(dir: string, events: SyncEvent[]): void {
   writeFileSync(
     join(metaDir(dir), "comments.json"),
     JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
   );
 }
 
-export function countPending(dir: string): number {
-  return countPendingEvents(dir);
-}
-
 /**
- * Restart reconcile (§29.6 durable pending-op): for every pending/conflict
- * row, re-list server comments — id known and landed → adopt + synced;
- * id unknown → match (author, parent, body_sha) → adopt; else leave pending
- * for the push to post under the SAME op (never re-post landed, never lose
- * unlanded).
+ * Restart reconcile (§29.6 durable pending-op; review C5): for every
+ * pending/posting/conflict row, re-list server comments —
+ * - id known on server → adopt + synced;
+ * - row carries an `entry` msg_id → match by STAMP SUBSTRING
+ *   (`entry <msg_id>` is unique and survives Plane's HTML normalization —
+ *   full-HTML equality is too brittle) → adopt without re-posting;
+ * - else → leave pending for the push to post under the SAME op (rows
+ *   never re-post landed work, never lose unlanded work).
  */
 export async function reconcileEvents(p: Plane, mount: SyncMount): Promise<{ adopted: number; stillPending: number }> {
   const dir = mount.dir;
   const events = readEvents(dir);
-  if (!events.some((e) => e.status === "pending" || e.status === "conflict")) return { adopted: 0, stillPending: 0 };
+  if (!events.some((e) => e.status === "pending" || e.status === "posting" || e.status === "conflict")) return { adopted: 0, stillPending: 0 };
   const raw = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`)) as Raw;
   const server = (((raw as Raw).results ?? raw) as Raw[]).map((c) => ({
     id: String(c.id),
@@ -209,50 +226,48 @@ export async function reconcileEvents(p: Plane, mount: SyncMount): Promise<{ ado
     body: String(c.comment_html ?? ""),
   }));
   let adopted = 0;
-  for (const e of events) {
-    if (e.status !== "pending" && e.status !== "conflict") continue;
-    if (e.id && server.some((c) => c.id === e.id)) {
-      e.status = "synced";
-      adopted++;
-      continue;
+  await updateEvents(dir, (stored) => {
+    const rows = stored as SyncEvent[];
+    for (const e of rows) {
+      if (e.status !== "pending" && e.status !== "posting" && e.status !== "conflict") continue;
+      if (e.id && server.some((c) => c.id === e.id)) {
+        e.status = "synced";
+        adopted++;
+        continue;
+      }
+      // Stamp-substring match (C5): the msg_id is unique per post; a row
+      // that reached "posting" before a kill is adopted here instead of
+      // being re-posted as a duplicate.
+      if (e.entry) {
+        const hit = server.find((c) => (c.parent ?? null) === (e.parent ?? null) && c.body.includes(`entry ${e.entry}`));
+        if (hit) {
+          e.id = hit.id;
+          e.status = "synced";
+          adopted++;
+          continue;
+        }
+      }
+      // Legacy unstamped rows: exact posted-HTML shape match.
+      const rendered = `<p>${esc(e.body)}</p>`;
+      const hit = server.find((c) => (c.parent ?? null) === (e.parent ?? null) && c.body === rendered);
+      if (hit) {
+        e.id = hit.id;
+        e.status = "synced";
+        adopted++;
+      }
     }
-    // Match by author display/seat? Server actor is a member id; event author
-    // is a seat. Match on parent + identical posted-HTML shape instead: the
-    // daemon posts `<p>${esc(body)} — teamctl · entry <msg_id></p>` (§2.1
-    // stamp) — compare against that rendering, stamp included.
-    const escd = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const rendered = e.entry
-      ? `<p>${escd(`${e.body} — teamctl · entry ${e.entry}`)}</p>`
-      : `<p>${escd(e.body)}</p>`;
-    const hit = server.find((c) => (c.parent ?? null) === (e.parent ?? null) && c.body === rendered);
-    if (hit) {
-      e.id = hit.id;
-      e.status = "synced";
-      adopted++;
-    }
-  }
-  writeEvents(dir, events);
-  return { adopted, stillPending: events.filter((e) => e.status === "pending").length };
+    return undefined;
+  });
+  const after = readEvents(dir) as SyncEvent[];
+  writeCommentsJson(dir, after);
+  return { adopted, stillPending: after.filter((e) => e.status === "pending" || e.status === "posting").length };
 }
 
-async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Promise<{ pushed: string[]; comments: number; rev: string; bodySha: string }> {
+async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw, guardedRev: string): Promise<{ pushed: string[]; comments: number; rev: string; bodySha: string }> {
   const pushed: string[] = [];
   const md = readFileSync(join(dir, "ticket.md"), "utf8");
   const { fm, title, body } = parseTicketMd(md);
   const patch: Raw = {};
-
-  // §30.3 (a) intent-claim: a LIVE foreign pending_plane claim blocks the
-  // front-matter apply (state/assignee/labels/priority are the mutation
-  // surface — comment posts and title/body edits are not gated by it).
-  const stateChanging = Boolean(fm.state) || fm.assignee !== undefined || fm.labels.length > 0 || Boolean(fm.priority);
-  if (stateChanging) {
-    const claim = readLiveIntentClaim(mount.ticket, process.env.PLANE_WORKSPACE ?? "ai-tutor");
-    if (claim && claim.seat !== mount.seat) {
-      const block = intentClaimBlock(mount.ticket, claim, mount.seat);
-      appendEvent(dir, { event: "add", op: `conflict-${Date.now()}`, id: null, parent: null, author: "sync-daemon", body: block, body_sha: sha256(block), at: new Date().toISOString(), status: "conflict" });
-      throw Object.assign(new Error(block), { refusal: { refused: true, rule: "intent-claim", ticket: mount.ticket, detail: `LIVE pending_plane:${claim.op} by ${claim.seat}`, remedy: "let the journal outbox drain, then re-edit" } as PushRefusal });
-    }
-  }
 
   // State (CLI token → server id).
   if (fm.state) {
@@ -260,7 +275,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
     const id = sm[fm.state];
     if (!id) {
       const r: PushRefusal = { refused: true, rule: "unknown-state", ticket: mount.ticket, detail: `no '${fm.state}' state on the board`, remedy: "use a listed state token" };
-      appendEvent(dir, conflictNotice(mount.ticket, `${r.rule}: ${r.detail}`));
+      await refuseOnce(dir, mount.ticket, r.rule, r.detail);
       throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail} (${r.remedy})`), { refusal: r });
     }
     if (String(ticket.state) !== id) {
@@ -278,7 +293,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
       const m = list.find((x) => x.display_name === seat || String(x.email ?? "").split("@")[0] === seat);
       if (!m) {
         const r: PushRefusal = { refused: true, rule: "unknown-assignee", ticket: mount.ticket, detail: `no member '${seat}' on the roster`, remedy: "use a roster seat name or empty to unassign" };
-        appendEvent(dir, conflictNotice(mount.ticket, `${r.rule}: ${r.detail}`));
+        await refuseOnce(dir, mount.ticket, r.rule, r.detail);
         throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail} (${r.remedy})`), { refusal: r });
       }
       want = [String(m.id)];
@@ -297,7 +312,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
       const id = lm[name];
       if (!id) {
         const r: PushRefusal = { refused: true, rule: "unknown-label", ticket: mount.ticket, detail: `no label '${name}' on the board`, remedy: "plane sync then retry" };
-        appendEvent(dir, conflictNotice(mount.ticket, `${r.rule}: ${r.detail}`));
+        await refuseOnce(dir, mount.ticket, r.rule, r.detail);
         throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail} (${r.remedy})`), { refusal: r });
       }
       ids.push(id);
@@ -314,7 +329,7 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
   // Priority.
   if (fm.priority && !["urgent", "high", "medium", "low", "none"].includes(fm.priority)) {
     const r: PushRefusal = { refused: true, rule: "unknown-priority", ticket: mount.ticket, detail: `invalid priority '${fm.priority}'`, remedy: "urgent|high|medium|low|none" };
-    appendEvent(dir, conflictNotice(mount.ticket, `${r.rule}: ${r.detail}`));
+    await refuseOnce(dir, mount.ticket, r.rule, r.detail);
     throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail} (${r.remedy})`), { refusal: r });
   }
   if (fm.priority && String(ticket.priority ?? "none") !== fm.priority) {
@@ -332,34 +347,79 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
     pushed.push("body");
   }
 
+  const stateFields = ["state", "assignees", "labels", "priority"];
+  const stateChanging = stateFields.some((k) => k in patch);
+
+  // C6: re-fetch the rev immediately before the PATCH — a server edit that
+  // landed since the guard GET must not be overwritten or baselined-over.
+  const fresh = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`)) as Raw;
+  const freshRev = String(fresh.updated_at ?? "");
+  if (guardedRev && freshRev !== guardedRev) {
+    const r: PushRefusal = { refused: true, rule: "server-moved", ticket: mount.ticket, detail: `server rev moved mid-push (${guardedRev} → ${freshRev})`, remedy: "next cycle re-evaluates (conflict or re-pull)" };
+    await refuseOnce(dir, mount.ticket, r.rule, r.detail);
+    throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail}`), { refusal: r });
+  }
+
+  // C7/I1: gate ONLY real state-field patches, re-read the claim HERE —
+  // immediately before the PATCH (the check-then-act window shrinks to one
+  // round-trip; advisory by design — no server-side CAS exists). I7: the
+  // workspace comes from the resolved config, never raw env. I8: an
+  // unreadable journal fails CLOSED.
+  if (stateChanging) {
+    const claim = readLiveIntentClaim(mount.ticket, p.cfg.workspace);
+    if (claim === "unreadable") {
+      const r: PushRefusal = { refused: true, rule: "journal-unreadable", ticket: mount.ticket, detail: "teamctl journal sidecar exists but is unreadable (torn write?)", remedy: "retry next cycle — the gate fails closed while the writer is active" };
+      await refuseOnce(dir, mount.ticket, r.rule, r.detail);
+      throw Object.assign(new Error(`refused: ${r.rule} — ${r.detail}`), { refusal: r });
+    }
+    if (claim && claim.seat !== mount.seat) {
+      const block = intentClaimBlock(mount.ticket, claim, mount.seat);
+      await refuseOnce(dir, mount.ticket, "intent-claim", `LIVE pending_plane:${claim.op} by ${claim.seat}`);
+      throw Object.assign(new Error(block), { refusal: { refused: true, rule: "intent-claim", ticket: mount.ticket, detail: `LIVE pending_plane:${claim.op} by ${claim.seat}`, remedy: "let the journal outbox drain, then re-edit" } as PushRefusal });
+    }
+  }
+
   if (Object.keys(patch).length) {
     await p.patchIssue(mount.uuid, patch, mount.projectId);
   }
 
-  // Pending comment events post verbatim (agents stamp per §2.1).
+  // Pending comment events post with the §2.1 stamp. C5 crash-safety: the
+  // msg_id is PERSISTED (status "posting") BEFORE the POST — a kill between
+  // POST and flip is recovered by reconcile's stamp-substring match, never
+  // re-posted as a duplicate. Re-posts reuse the recorded msg_id.
   // NOTE: the v1 create serializer accepts no `parent` field (verified
   // against plane-backend v1.4.1 IssueCommentCreateSerializer) — threaded
   // replies land flat server-side. Parent is still recorded in the events
   // file (reconcile matching + future API support); the §29.6 quote rule
   // (quote the referenced passage inline as `> quote`) carries the thread
   // context in-body instead.
-  // §2.1 uniform stamp: every daemon-posted comment carries
-  // `— teamctl · entry <msg_id>` (one stamp, one narrow grep). The msg_id is
-  // minted per post and recorded on the event row (`entry`) — the NATS
-  // outbox (§4.5) later reuses it as the Nats-Msg-Id.
-  const events = readEvents(dir);
   let posted = 0;
-  for (const e of events) {
-    if (e.status !== "pending") continue;
-    const msgId = randomUUID();
-    const stamped = `${e.body} — teamctl · entry ${msgId}`;
-    const res = (await p.postComment(mount.uuid, `<p>${esc(stamped)}</p>`, e.parent ?? undefined, mount.projectId)) as Raw;
-    e.id = String(res.id ?? res.comment_id ?? "");
-    e.entry = msgId;
-    e.status = "synced";
+  const pendingRows = readEvents(dir).filter((e) => e.status === "pending");
+  for (const row of pendingRows) {
+    const msgId = row.entry ?? randomUUID();
+    const stamped = `${row.body} — teamctl · entry ${msgId}`;
+    await updateEvents(dir, (stored) => {
+      const mine = (stored as SyncEvent[]).find((e) => e.op === row.op);
+      if (mine && mine.status === "pending") {
+        mine.entry = msgId;
+        mine.status = "posting";
+      }
+      return undefined;
+    });
+    const res = (await p.postComment(mount.uuid, `<p>${esc(stamped)}</p>`, row.parent ?? undefined, mount.projectId)) as Raw;
+    const newId = String(res.id ?? res.comment_id ?? "");
+    await updateEvents(dir, (stored) => {
+      const mine = (stored as SyncEvent[]).find((e) => e.op === row.op);
+      if (mine && mine.status === "posting") {
+        mine.id = newId;
+        mine.entry = msgId;
+        mine.status = "synced";
+      }
+      return undefined;
+    });
     posted++;
   }
-  if (posted) writeEvents(dir, events);
+  if (posted) writeCommentsJson(dir, readEvents(dir));
 
   const after = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`)) as Raw;
   return { pushed, comments: posted, rev: String(after.updated_at ?? ""), bodySha };
@@ -378,36 +438,37 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // without recording its id (kill-mid-push) — adopt instead of duplicating.
   await reconcileEvents(p, mount);
   // Pull new server comments that don't bump the issue rev (comments are
-  // separate from updated_at). Merge by id, keep pending rows.
+  // separate from updated_at). Merge by id, keep pending rows. C2: the
+  // merge runs through updateEvents (lock + unknown-op preservation).
   {
     const raw = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`)) as Raw;
     const server = (((raw as any).results ?? raw) as Raw[]).slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
-    const prior = readEventsFile(dir) as SyncEvent[];
-    const known = new Set(prior.filter((e) => e.id).map((e) => e.id as string));
     const members = (await p.request("GET", `${p.base()}/members/`)) as Raw[];
     const seatByMember = new Map((Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]));
     let added = 0;
-    for (const c of server) {
-      const id = String(c.id);
-      if (known.has(id)) continue;
-      const body = htmlToText(String(c.comment_html ?? ""));
-      prior.push({
-        event: c.parent ? "reply" : "add",
-        op: `server-${id.slice(0,8)}`,
-        id,
-        parent: c.parent ? String(c.parent) : null,
-        author: seatByMember.get(String(c.actor ?? "")) ?? String(c.actor ?? ""),
-        body,
-        body_sha: sha256(body),
-        at: String(c.created_at ?? ""),
-        status: "synced",
-      } as SyncEvent);
-      added++;
-    }
-    if (added) {
-      writeFileSync(join(metaDir(dir), "comments.events.jsonl"), prior.map((e) => JSON.stringify(e)).join("\n") + (prior.length ? "\n" : ""));
-      writeFileSync(join(metaDir(dir), "comments.json"), JSON.stringify(prior.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n");
-    }
+    await updateEvents(dir, (stored) => {
+      const prior = stored as SyncEvent[];
+      const known = new Set(prior.filter((e) => e.id).map((e) => e.id as string));
+      for (const c of server) {
+        const id = String(c.id);
+        if (known.has(id)) continue;
+        const body = htmlToText(String(c.comment_html ?? ""));
+        prior.push({
+          event: c.parent ? "reply" : "add",
+          op: `server-${id.slice(0,8)}`,
+          id,
+          parent: c.parent ? String(c.parent) : null,
+          author: seatByMember.get(String(c.actor ?? "")) ?? String(c.actor ?? ""),
+          body,
+          body_sha: sha256(body),
+          at: String(c.created_at ?? ""),
+          status: "synced",
+        } as SyncEvent);
+        added++;
+      }
+      return undefined;
+    });
+    if (added) writeCommentsJson(dir, readEvents(dir));
   }
   const md = readFileSync(join(dir, "ticket.md"), "utf8");
   const localChanged = sha256(md) !== mount.lastFileSha;
@@ -418,8 +479,7 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     // --force (manual `sync TC-N --push-once --force` only, never the daemon)
     // skips this branch: local wins, baselines follow the push below.
     writeFileSync(join(dir, "ticket.md.conflict"), JSON.stringify(ticket, null, 2) + "\n");
-    if (!conflictAlreadyNoticed(dir, serverRev, mount.lastRev))
-      appendEvent(dir, conflictNotice(mount.ticket, `server rev ${serverRev} vs local edits (base ${mount.lastRev})`));
+    await refuseOnce(dir, mount.ticket, "conflict", `server rev ${serverRev} vs local edits (base ${mount.lastRev})`);
     return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
   }
   // Child arrivals don't bump the parent rev (Plane-side fact, proven live):
@@ -438,11 +498,20 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   if (serverChanged && !localChanged && !editedKids.length) {
     // Server-only move: re-pull wins (local files refresh, baselines follow).
     const pulled = await pullTicket(p, mount);
-    const mounts = readMounts();
-    writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? { ...m, lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids, lastPoll: new Date().toISOString() } : m)));
+    await updateMounts((mounts) => {
+      const hit = mounts.find((m) => m.ticket === mount.ticket);
+      if (hit) {
+        hit.lastRev = pulled.rev;
+        hit.lastBodySha = pulled.bodySha;
+        hit.lastFileSha = pulled.fileSha;
+        hit.kids = pulled.kids;
+        hit.lastPoll = new Date().toISOString();
+      }
+      return undefined;
+    });
     return { ticket: mount.ticket, pushed: ["pulled"], comments: 0, rev: pulled.rev };
   }
-  const r = await pushOne(p, mount, dir, ticket);
+  const r = await pushOne(p, mount, dir, ticket, serverRev);
 
   // Adopt server-side newcomers (pulled into slug dirs + baselined), then
   // recurse into known children (registry baselines; unknown local dirs are
@@ -451,35 +520,69 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   const pushed = [...r.pushed, ...adopted.map((k) => `+${k.rel}`)];
   if (opts?.force && serverChanged && localChanged) pushed.unshift("forced");
   let comments = r.comments;
+  // I10: persist the parent result + adopted baselines BEFORE the child
+  // loop — a child-loop throw must not orphan the parent's landed work.
   let kids = [...(mount.kids ?? []), ...adopted];
+  await updateMounts((mounts) => {
+    const hit = mounts.find((m) => m.ticket === mount.ticket);
+    if (hit) {
+      hit.lastRev = r.rev;
+      hit.lastBodySha = r.bodySha;
+      hit.lastFileSha = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
+      hit.kids = kids;
+      hit.lastPoll = new Date().toISOString();
+      hit.pending = countPendingEvents(dir);
+    }
+    return undefined;
+  });
   for (const kid of kids) {
     const childDir = join(dir, kid.rel);
     const childMd = join(childDir, "ticket.md");
     if (!existsSync(childMd)) continue;
     if (sha256(readFileSync(childMd, "utf8")) === kid.fileSha) continue;
-    const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
-    const childRev = String(childTicket.updated_at ?? "");
-    if (childRev !== kid.rev && !opts?.force) {
-      writeFileSync(`${childMd}.conflict`, JSON.stringify(childTicket, null, 2) + "\n");
-      if (!conflictAlreadyNoticed(dir, childRev, kid.rev))
-        appendEvent(dir, conflictNotice(mount.ticket, `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`));
-      continue;
+    try {
+      const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
+      const childRev = String(childTicket.updated_at ?? "");
+      if (childRev !== kid.rev && !opts?.force) {
+        writeFileSync(`${childMd}.conflict`, JSON.stringify(childTicket, null, 2) + "\n");
+        await refuseOnce(dir, mount.ticket, "conflict", `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`);
+        continue;
+      }
+      // I4: the child mount carries the CHILD's handle — the intent-claim
+      // gate inside pushOne consults the child's own journal (a foreign
+      // claim on the parent must not block child edits, and a refusal must
+      // name the child, not the parent).
+      const childSeq = Number(childTicket.sequence_id ?? 0);
+      const childMount: SyncMount = { ...mount, uuid: kid.uuid, ticket: childSeq ? `${mount.ident}-${childSeq}` : mount.ticket, lastBodySha: kid.bodySha, lastFileSha: kid.fileSha };
+      const cr = await pushOne(p, childMount, childDir, childTicket, childRev);
+      comments += cr.comments;
+      if (cr.pushed.length) pushed.push(`${kid.rel}: ${cr.pushed.join(",")}`);
+      const afterChild = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
+      const newFileSha = sha256(readFileSync(childMd, "utf8"));
+      const newSha = sha256(parseTicketMd(readFileSync(childMd, "utf8")).body);
+      kids = kids.map((k) => (k.uuid === kid.uuid ? { ...k, rev: String(afterChild.updated_at ?? ""), bodySha: newSha, fileSha: newFileSha } : k));
+    } catch (e) {
+      // I2/I10: a poisoned child records its refusal and never kills the
+      // parent cycle (the refusal row is already filed by refuseOnce).
+      const message = String((e as Error)?.message ?? e).slice(0, 200);
+      pushed.push(`${kid.rel}: refused (${message.split("\n")[0]})`);
     }
-    const childMount: SyncMount = { ...mount, uuid: kid.uuid, lastBodySha: kid.bodySha };
-    const cr = await pushOne(p, childMount, childDir, childTicket);
-    comments += cr.comments;
-    if (cr.pushed.length) pushed.push(`${kid.rel}: ${cr.pushed.join(",")}`);
-    const afterChild = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
-    const newFileSha = sha256(readFileSync(childMd, "utf8"));
-    const newSha = sha256(parseTicketMd(readFileSync(childMd, "utf8")).body);
-    kids = kids.map((k) => (k.uuid === kid.uuid ? { ...k, rev: String(afterChild.updated_at ?? ""), bodySha: newSha, fileSha: newFileSha } : k));
   }
 
-  const mounts = readMounts();
   const livePending = countPendingEvents(dir);
   const fileShaNow = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
-  const next = { ...mounts.find((m) => m.ticket === mount.ticket)!, lastRev: r.rev, lastBodySha: r.bodySha, lastFileSha: fileShaNow, kids, lastPoll: new Date().toISOString(), pending: livePending };
-  writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
-  writeStatusFile(dir, { ticket: mount.ticket, ready: livePending === 0, lastPoll: next.lastPoll, pending: livePending, rev: next.lastRev });
+  await updateMounts((mounts) => {
+    const hit = mounts.find((m) => m.ticket === mount.ticket);
+    if (hit) {
+      hit.lastRev = r.rev;
+      hit.lastBodySha = r.bodySha;
+      hit.lastFileSha = fileShaNow;
+      hit.kids = kids;
+      hit.lastPoll = new Date().toISOString();
+      hit.pending = livePending;
+    }
+    return undefined;
+  });
+  writeStatusFile(dir, { ticket: mount.ticket, ready: livePending === 0, lastPoll: new Date().toISOString(), pending: livePending, rev: r.rev });
   return { ticket: mount.ticket, pushed, comments, rev: r.rev };
 }

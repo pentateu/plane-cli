@@ -7,47 +7,79 @@
  * (pull-if-server-moved / push-if-local-changed / conflict) → stamp
  * lastPoll + live pending count. Exits when it has no mounts left.
  *
+ * Per-mount isolation (review I2): a poisoned mount (bad state, missing
+ * ticket.md, live foreign claim) must NOT starve its siblings — every
+ * mount gets its own try/catch, the error lands in the status file, and
+ * the loop continues.
+ *
  * Usage: bun src/syncWorker.ts <projectId> [--interval-ms N] [--once]
  * (--once runs a single cycle — unit/live harness, no sleep.)
  */
 import { Cache } from "./cache.ts";
 import { Plane } from "./api.ts";
 import { resolveConfig } from "./config.ts";
-import { readMounts, writeMounts, writeStatusFile } from "./sync.ts";
-import { countPending, pushTicket, reconcileEvents } from "./syncPush.ts";
+import { readMounts, updateMounts, writeStatusFile } from "./sync.ts";
+import { countPendingEvents } from "./sync.ts";
+import { pushTicket, reconcileEvents } from "./syncPush.ts";
 import { pullTicket } from "./syncPull.ts";
 
-export async function workerCycle(projectId: string): Promise<Array<{ ticket: string; pushed: string[]; comments: number }>> {
+export async function workerCycle(projectId: string): Promise<Array<{ ticket: string; pushed: string[]; comments: number; error?: string }>> {
   const cfg = resolveConfig({});
   const cache = new Cache(process.env.PLANE_CACHE ?? `${process.env.HOME}/.config/plane/cache.json`);
   const p = new Plane(cfg, cache);
-  const out: Array<{ ticket: string; pushed: string[]; comments: number }> = [];
+  const out: Array<{ ticket: string; pushed: string[]; comments: number; error?: string }> = [];
   for (const mount of readMounts().filter((m) => m.projectId === projectId)) {
-    if (mount.lastRev === null) {
-      // --no-wait mount: initial pull lands on the first worker cycle.
-      const pulled = await pullTicket(p, mount);
-      const mounts = readMounts();
-      const next = { ...mount, lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids, lastPoll: new Date().toISOString(), pending: 0 };
-      writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
-      writeStatusFile(mount.dir, { ticket: mount.ticket, ready: true, lastPoll: next.lastPoll, pending: 0, rev: next.lastRev });
-      out.push({ ticket: mount.ticket, pushed: ["pulled"], comments: pulled.comments });
-      continue;
+    try {
+      if (mount.lastRev === null) {
+        // --no-wait mount: initial pull lands on the first worker cycle.
+        const pulled = await pullTicket(p, mount);
+        await updateMounts((mounts) => {
+          const hit = mounts.find((m) => m.ticket === mount.ticket);
+          if (hit) {
+            hit.lastRev = pulled.rev;
+            hit.lastBodySha = pulled.bodySha;
+            hit.lastFileSha = pulled.fileSha;
+            hit.kids = pulled.kids;
+            hit.lastPoll = new Date().toISOString();
+            hit.pending = 0;
+          }
+          return undefined;
+        });
+        writeStatusFile(mount.dir, { ticket: mount.ticket, ready: true, lastPoll: new Date().toISOString(), pending: 0, rev: pulled.rev });
+        out.push({ ticket: mount.ticket, pushed: ["pulled"], comments: pulled.comments });
+        continue;
+      }
+      await reconcileEvents(p, mount);
+      const r = await pushTicket(p, mount);
+      const pending = countPendingEvents(mount.dir);
+      await updateMounts((mounts) => {
+        const hit = mounts.find((m) => m.ticket === mount.ticket);
+        if (hit) {
+          hit.lastPoll = new Date().toISOString();
+          hit.pending = pending;
+        }
+        return undefined;
+      });
+      writeStatusFile(mount.dir, { ticket: mount.ticket, ready: pending === 0, lastPoll: new Date().toISOString(), pending, rev: r.rev });
+      out.push({ ticket: r.ticket, pushed: r.pushed, comments: r.comments });
+    } catch (e) {
+      // I2: record + continue — one sick mount never starves siblings.
+      const message = String((e as Error)?.message ?? e).slice(0, 300);
+      writeStatusFile(mount.dir, { ticket: mount.ticket, ready: false, lastPoll: new Date().toISOString(), pending: countPendingEvents(mount.dir), rev: mount.lastRev, error: message });
+      out.push({ ticket: mount.ticket, pushed: [], comments: 0, error: message });
     }
-    await reconcileEvents(p, mount);
-    const r = await pushTicket(p, mount);
-    const mounts = readMounts();
-    const hit = mounts.find((m) => m.ticket === mount.ticket);
-    if (hit) {
-      const next = { ...hit, lastPoll: new Date().toISOString(), pending: countPending(hit.dir) };
-      writeMounts(mounts.map((m) => (m.ticket === mount.ticket ? next : m)));
-      writeStatusFile(hit.dir, { ticket: hit.ticket, ready: hit.lastRev !== null && next.pending === 0, lastPoll: next.lastPoll, pending: next.pending, rev: hit.lastRev });
-    }
-    out.push({ ticket: r.ticket, pushed: r.pushed, comments: r.comments });
   }
   return out;
 }
 
 const projectId = process.argv[2];
+
+/** Backoff predicate (review I12/M10): extracted for unit testing. The
+ *  M10 dead substring branches are gone — ApiError always sets `.kind`. */
+export function shouldBackoff(e: unknown): boolean {
+  const kind = String((e as { kind?: string })?.kind ?? "");
+  return kind === "rate-limit" || kind === "network";
+}
 
 if (import.meta.main) {
   if (!projectId) {
@@ -69,19 +101,22 @@ if (import.meta.main) {
         await workerCycle(projectId);
         backoffMs = intervalMs; // healthy cycle resets the ramp
       } catch (e) {
-        const kind = String((e as any)?.kind ?? (e as Error)?.message ?? "");
-        // Rate-limit (429 + Plane 5900) and network errors: ramp 1x → 2x → 4x
-        // up to 60s so a flaky/limited API isn't hammered into a crash by the
-        // poll loop. Any other error keeps the base cadence.
-        if (kind.includes("rate-limit") || kind.includes("network") || kind.includes("Unable to connect") || kind.includes("socket")) {
+        // Cycle-level failures (registry corrupt, ...) keep the ramp too.
+        if (shouldBackoff(e)) {
           backoffMs = Math.min(backoffMs * 2, 60_000);
           console.error(`worker ${projectId}: ${String((e as Error)?.message ?? e)} — backing off ${Math.round(backoffMs / 1000)}s`);
         } else {
           console.error(`worker ${projectId}: ${String((e as Error)?.message ?? e)}`);
         }
       }
-      const left = readMounts().filter((m) => m.projectId === projectId);
-      if (!left.length) {
+      let left: number;
+      try {
+        left = readMounts().filter((m) => m.projectId === projectId).length;
+      } catch (e) {
+        console.error(`worker ${projectId}: registry unreadable — ${String((e as Error).message)}`);
+        process.exit(1); // M8: loud, nonzero — never "no mounts left" on corruption
+      }
+      if (!left) {
         console.error(`worker ${projectId}: no mounts left — exiting`);
         process.exit(0);
       }

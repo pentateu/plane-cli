@@ -11,6 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { withLock } from "./lock.ts";
 
 export interface SyncMount {
   ticket: string; // canonical handle, e.g. "TEST-1" (uppercased ident)
@@ -26,7 +27,7 @@ export interface SyncMount {
   lastRev: string | null; // server updated_at at last pull/push (revision guard)
   lastBodySha: string | null; // sha of ticket BODY text at last pull/push (body-push decision)
   lastFileSha: string | null; // sha of the whole ticket.md file (ANY local edit → conflict detection)
-  kids: Array<{ slug: string; uuid: string; rev: string; bodySha: string; fileSha: string }>; // sub-ticket baselines (no registry rows for children)
+  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>; // sub-ticket baselines, rel = dir path relative to mount root (no registry rows for children)
 }
 
 export function syncStatePath(): string {
@@ -35,15 +36,20 @@ export function syncStatePath(): string {
   return `${homedir()}/.config/plane/syncs.json`;
 }
 
+/** Corrupt registry = loud (review M8): silent [] made a worker exit 0 "no
+ *  mounts left" while real mounts existed — data-loss signal must not be
+ *  swallowed. */
 export function readMounts(): SyncMount[] {
   const path = syncStatePath();
   if (!existsSync(path)) return [];
+  let raw: unknown;
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8"));
-    return Array.isArray(raw) ? (raw as SyncMount[]) : [];
-  } catch {
-    return [];
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    throw new Error(`sync registry corrupt (${path}): ${String((e as Error).message)}`);
   }
+  if (!Array.isArray(raw)) throw new Error(`sync registry corrupt (${path}): not an array`);
+  return raw as SyncMount[];
 }
 
 export function writeMounts(mounts: SyncMount[]): void {
@@ -52,6 +58,22 @@ export function writeMounts(mounts: SyncMount[]): void {
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, JSON.stringify(mounts, null, 2));
   renameSync(tmp, path);
+}
+
+/**
+ * C1 (review): the ONLY sanctioned registry mutation. Locks the registry,
+ * re-reads FRESH inside the section, applies the mutator, writes. Every
+ * former read→map→write call site must go through this — a bare writeMounts
+ * of a pre-lock read resurrects stopped mounts and drops concurrent edits.
+ * Mutator mutates the array IN PLACE (or replaces its contents); its return
+ * value is ignored. Return data via closure capture.
+ */
+export async function updateMounts(mutate: (mounts: SyncMount[]) => void): Promise<void> {
+  await withLock(`${syncStatePath()}.lock`, () => {
+    const mounts = readMounts();
+    mutate(mounts);
+    writeMounts(mounts);
+  });
 }
 
 export function findMount(ticketHandle: string): SyncMount | undefined {
@@ -65,6 +87,8 @@ export interface SyncStatus {
   lastPoll: string | null;
   pending: number;
   rev: string | null;
+  /** I2 (review): last cycle error for this mount (absent = healthy). */
+  error?: string;
 }
 
 /**
@@ -132,4 +156,29 @@ export function readEventsFile(dir: string): StoredEvent[] {
     } catch { /* torn last line under concurrent append — next read heals */ }
   }
   return out;
+}
+
+export function writeEventsFile(dir: string, events: StoredEvent[]): void {
+  mkdirSync(metaDir(dir), { recursive: true });
+  writeFileSync(join(metaDir(dir), "comments.events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : ""));
+}
+
+/**
+ * C2 (review): the ONLY sanctioned event-file rewrite. Locks the per-mount
+ * event file, reads FRESH inside the section, applies the mutator, writes.
+ * Merge rule for concurrent shell appends (the documented agent path): rows
+ * whose `op` is unknown to the mutator's read are PRESERVED — an append
+ * landing mid-section survives the rewrite. `op` is the row identity.
+ */
+export async function updateEvents(dir: string, mutate: (events: StoredEvent[]) => void): Promise<void> {
+  await withLock(join(metaDir(dir), "events.lock"), () => {
+    const events = readEventsFile(dir);
+    const known = new Set(events.map((e) => String((e as { op?: string }).op ?? "")));
+    mutate(events);
+    // Rows appended while the mutator ran (unknown ops) are merged back —
+    // an append landing mid-section survives the rewrite.
+    const fresh = readEventsFile(dir).filter((e) => !known.has(String((e as { op?: string }).op ?? "")));
+    const resultOps = new Set(events.map((e) => String((e as { op?: string }).op ?? "")));
+    writeEventsFile(dir, [...events, ...fresh.filter((e) => !resultOps.has(String((e as { op?: string }).op ?? "")))]);
+  });
 }

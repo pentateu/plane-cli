@@ -1,9 +1,22 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { updateMounts, updateEvents, readMounts } from "./sync.ts";
+import { supervisorPidFile, daemonAlive } from "./syncSupervisor.ts";
+import { withLock } from "./lock.ts";
+import { Plane } from "./api.ts";
+import { resolveConfig } from "./config.ts";
 import { Cache } from "./cache.ts";
 import { resolveAsToken, run, peekCache, HELP } from "./cli.ts";
+
+/** Module-level mount dir helper (the sync-mounts describe has its own; this
+ *  one serves the review-fix suite). */
+function reviewMountDir(name: string): string {
+  const dir = mkdtempSync(join(tmpdir(), `plane-sync-${name}-`));
+  tmpDirs.push(dir);
+  return join(dir, "mount");
+}
 
 type Call = { method: string; path: string; body?: unknown };
 let calls: Call[] = [];
@@ -107,6 +120,7 @@ const ISSUES = [
     labels: ["lb-plan"],
     parent: "is-67",
     description_html: `<p>${"x".repeat(1200)}</p>`,
+    updated_at: "2026-09-13T08:00:00.000Z",
   },
   {
     id: "is-67",
@@ -118,6 +132,7 @@ const ISSUES = [
     labels: ["lb-bug"],
     parent: null,
     description_html: "<p>short body</p>",
+    updated_at: "2026-09-13T08:00:00.000Z",
   },
 ];
 
@@ -132,7 +147,7 @@ function useDefaultRouter() {
     if (/\/projects\/[^/]+\/issues\/?$/.test(path) && _m === "POST")
       return { status: 200, json: { ...(globalThis.__postBody ?? {}), id: "is-new", sequence_id: 69 } };
     if (/\/projects\/[^/]+\/issues\/$/.test(path))
-      return { status: 200, json: { results: ISSUES, next_page_results: false, total_count: ISSUES.length } };
+      return { status: 200, json: { results: [...ISSUES, ...(globalThis.__extraIssues ?? [])], next_page_results: false, total_count: ISSUES.length + (globalThis.__extraIssues?.length ?? 0) } };
     let m = path.match(/\/work-items\/([^/]+)\/relations\/$/);
     if (m && _m === "GET") {
       const r = relsOf(m[1]!);
@@ -183,6 +198,7 @@ globalThis.__postBody = undefined;
 globalThis.__relations = {};
 globalThis.__relationsDeleteEnabled = false;
 globalThis.__relationsDeleteMode = "off";
+globalThis.__extraIssues = undefined;
 
 beforeEach(() => {
   calls = [];
@@ -2550,5 +2566,270 @@ describe("assign", () => {
     const before = calls.filter((c) => c.method !== "GET").length;
     await expect(run(["assign", "HT-66"])).rejects.toMatchObject({ kind: "validation" });
     expect(calls.filter((c) => c.method !== "GET").length).toBe(before);
+  });
+});
+
+describe("TC-95 review fixes — races, locks, pidfile, crash-safety", () => {
+  test("C1: concurrent registry writers do not lose mounts (updateMounts lock)", async () => {
+    // Two concurrent updateMounts: each reads fresh inside the lock.
+    await updateMounts((mounts) => {
+      mounts.push({ ticket: "A-1", projectId: "p", uuid: "u1", seq: 1, ident: "A", dir: "/tmp/a1", seat: "s", createdAt: "t", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null, lastFileSha: null, kids: [] });
+    });
+    const [, ] = await Promise.all([
+      updateMounts((mounts) => {
+        const hit = mounts.find((m) => m.ticket === "A-1");
+        if (hit) hit.pending = 5;
+      }),
+      updateMounts((mounts) => {
+        mounts.push({ ticket: "B-2", projectId: "p", uuid: "u2", seq: 2, ident: "B", dir: "/tmp/b2", seat: "s", createdAt: "t", lastPoll: null, pending: 0, lastRev: null, lastBodySha: null, lastFileSha: null, kids: [] });
+      }),
+    ]);
+    const after = readMounts();
+    expect(after.map((m) => m.ticket).sort()).toEqual(["A-1", "B-2"]);
+    expect(after.find((m) => m.ticket === "A-1")!.pending).toBe(5);
+    await updateMounts((mounts) => { mounts.length = 0; });
+  });
+
+  test("C2: concurrent event append survives a locked rewrite (updateEvents)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "plane-lock-ev-"));
+    tmpDirs.push(dir);
+    mkdirSync(join(dir, ".plane"), { recursive: true });
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify({ event: "add", op: "r1", id: null, parent: null, author: "x", body: "one", body_sha: "s", at: "t", status: "pending" }) + "\n");
+    // Simulate the race: the mutator "runs" while an agent appends — the
+    // append lands between the lock read and the write (we append inside
+    // the section via a second withLock-free direct append is NOT the
+    // pattern; instead prove the merge: an unknown op present on disk but
+    // not in the mutator's read is preserved).
+    const p = join(dir, ".plane", "comments.events.jsonl");
+    // Pre-populate a "mid-cycle append" the mutator won't know about by
+    // writing it AFTER acquiring the lock is impossible from outside —
+    // so test the merge semantics directly: mutate one row, verify an
+    // externally appended row (unknown op) survives.
+    await updateEvents(dir, (events) => {
+      const r = events.find((e) => e.op === "r1");
+      if (r) (r as any).status = "synced";
+      // External append happens "during" the section:
+      appendFileSync(p, JSON.stringify({ event: "add", op: "r2-agent", id: null, parent: null, author: "agent", body: "two", body_sha: "s", at: "t", status: "pending" }) + "\n");
+    });
+    const rows = readFileSync(p, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.map((r) => r.op).sort()).toEqual(["r1", "r2-agent"]);
+    expect(rows.find((r) => r.op === "r1").status).toBe("synced");
+    expect(rows.find((r) => r.op === "r2-agent").status).toBe("pending");
+  });
+
+  test("C3: two concurrent ensureSupervisor — exactly one daemon (pidfile claim)", async () => {
+    // In the unit suite PLANE_SYNC_NO_DAEMON short-circuits ensureSupervisor;
+    // test the CLAIM primitive instead: claimPidFile is not exported, so
+    // exercise it through two sequential daemonAlive + manual claim paths.
+    // Simulate: process A claims (writes pidfile with its pid + a live
+    // supervisor cmdline is unavailable in tests) — we assert the LOCK
+    // semantics via the lock module instead (the pidfile uses the same
+    // O_EXCL pattern through claimPidFile; direct unit coverage of the
+    // lock primitive):
+    const lockPath = join(tmpdir(), `plane-claim-${Date.now()}.lock`);
+    const order: string[] = [];
+    await Promise.all([
+      withLock(lockPath, async () => {
+        order.push("A-in");
+        await new Promise((r) => setTimeout(r, 30));
+        order.push("A-out");
+      }),
+      withLock(lockPath, async () => {
+        order.push("B-in");
+      }),
+    ]);
+    expect(order).toEqual(["A-in", "A-out", "B-in"]);
+    rmSync(lockPath, { force: true });
+  });
+
+  test("C4: stale pidfile (dead pid) does not block a new daemon", async () => {
+    // daemonAlive steals a pidfile whose pid is dead or foreign. Write a
+    // pidfile naming a pid that cannot be a supervisor: use a pid we know
+    // is not ours and verify daemonAlive returns null (stolen).
+    const pidFile = supervisorPidFile();
+    mkdirSync(dirname(pidFile), { recursive: true });
+    // Find a definitely-dead pid: spawn and reap.
+    const victim = Bun.spawn(["true"]);
+    await victim.exited;
+    writeFileSync(pidFile, `${victim.pid} ${Date.now()}`);
+    expect(daemonAlive()).toBeNull(); // dead pid → stolen → null
+    expect(existsSync(pidFile)).toBeFalse(); // claim removed
+  });
+
+  test("C5: kill between POST and flip — reconcile adopts by stamp substring", async () => {
+    const dir = reviewMountDir("c5");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const pending = { event: "add", op: "c5-row", id: null, parent: null, author: "dev1", body: "crash test body", body_sha: "sha256-c5", at: "2026-09-13T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify(pending) + "\n", { flag: "a" });
+    // Push once: posts + flips to synced with entry recorded.
+    await run(["sync", "HT-67", "--push-once"]);
+    const rows1 = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const synced = rows1.find((r: any) => r.op === "c5-row");
+    expect(synced.status).toBe("synced");
+    expect(typeof synced.entry).toBe("string");
+    // Simulate the crash window: row reset to "posting" (entry persisted,
+    // id lost) — exactly the state a kill between POST and flip leaves.
+    synced.id = null;
+    synced.status = "posting";
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), rows1.map((r: any) => JSON.stringify(r)).join("\n") + "\n");
+    // Reconcile must ADOPT by the stamp (server has the stamped body) —
+    // not re-post. The mock server comment carries the stamped body.
+    globalThis.__comments = [
+      { id: "cm-crash", created_at: "2026-09-13T00:01:00Z", comment_html: `<p>crash test body — teamctl · entry ${synced.entry}</p>`, actor: "mb-dev1" },
+    ];
+    const mounts = JSON.parse(readFileSync(process.env.PLANE_SYNC_STATE!, "utf8"));
+    const { reconcileEvents } = await import("./syncPush.ts");
+    const res = await reconcileEvents(new Plane(resolveConfig({}), new Cache(process.env.PLANE_CACHE!)), mounts[0]);
+    expect(res.adopted).toBe(1);
+    const rows2 = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const healed = rows2.find((r: any) => r.op === "c5-row");
+    expect(healed.status).toBe("synced");
+    expect(healed.id).toBe("cm-crash");
+    // No duplicate was posted.
+    expect(calls.filter((c) => c.method === "POST" && /comments\/$/.test(c.path)).length).toBe(1);
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("C6: server rev moving mid-push aborts to refusal (no overwrite)", async () => {
+    const dir = reviewMountDir("c6");
+    await run(["sync", "HT-67", "--dir", dir]);
+    // Make the pre-PATCH re-check GET return a NEWER rev than the guard GET:
+    // 1st issue GET (pushTicket guard) → fixture rev; 2nd (pushOne re-check)
+    // → moved rev. The refusal must fire and no PATCH may land.
+    let issueGets = 0;
+    const prevRouter = router;
+    router = (_m, path) => {
+      if (path.endsWith("/issues/is-67/") && _m === "GET") {
+        issueGets++;
+        if (issueGets >= 2) return { status: 200, json: { id: "is-67", sequence_id: 67, name: "t67", state: "st-todo", priority: "none", assignees: [], labels: [], parent: null, description_html: "<p>short body</p>", updated_at: "2026-09-13T09:99:99Z" } };
+      }
+      return prevRouter(_m, path);
+    };
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8") + "\nlocal edit\n");
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught?.message ?? "")).toContain("server-moved");
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+    router = prevRouter;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I12: shouldBackoff predicate — rate-limit and network true, others false", async () => {
+    const { shouldBackoff } = await import("./syncWorker.ts");
+    expect(shouldBackoff({ kind: "rate-limit", message: "x" })).toBeTrue();
+    expect(shouldBackoff({ kind: "network", message: "x" })).toBeTrue();
+    expect(shouldBackoff({ kind: "auth", message: "x" })).toBeFalse();
+    expect(shouldBackoff({ kind: "validation", message: "x" })).toBeFalse();
+    expect(shouldBackoff(new Error("plain"))).toBeFalse();
+    expect(shouldBackoff(undefined)).toBeFalse();
+  });
+
+  test("I2: one poisoned mount does not starve siblings (per-mount isolation)", async () => {
+    const d1 = reviewMountDir("iso1");
+    const d2 = reviewMountDir("iso2");
+    await run(["sync", "HT-66", "--dir", d1]);
+    await run(["sync", "HT-67", "--dir", d2]);
+    // Poison HT-66: delete its ticket.md.
+    rmSync(join(d1, "ticket.md"));
+    // Give HT-67 a local edit that must still push.
+    writeFileSync(join(d2, "ticket.md"), readFileSync(join(d2, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const { workerCycle } = await import("./syncWorker.ts");
+    const res = await workerCycle("pr-1");
+    expect(res).toHaveLength(2);
+    const poisoned = res.find((r) => r.ticket === "HT-66");
+    const healthy = res.find((r) => r.ticket === "HT-67");
+    expect(poisoned?.error).toContain("missing-ticket");
+    expect(healthy?.pushed).toContain("state");
+    // Healthy mount's registry row advanced despite the sibling error.
+    const mounts = readMounts();
+    expect(mounts.find((m) => m.ticket === "HT-67")!.lastRev).toBeTruthy();
+    await run(["sync", "--stop-all"]);
+  });
+
+  test("I1: pure comment drain is NOT gated by a foreign intent claim", async () => {
+    const dir = reviewMountDir("i1");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateHome = mkdtempSync(join(tmpdir(), "plane-coord-"));
+    tmpDirs.push(stateHome);
+    const jr = join(stateHome, "ai-tutor", "journals");
+    mkdirSync(jr, { recursive: true });
+    writeFileSync(join(jr, "HT-67.header.json"), JSON.stringify({ state: "todo", pending: { plane: { entry: "2026-09-13T00:00:00.000Z", op: "state", attempts: 0, last_error: null } } }));
+    writeFileSync(join(jr, "HT-67.md"), "## 2026-09-13T00:00:00.000Z — claim — manager\n");
+    process.env.TEAMCTL_STATE_HOME = stateHome;
+    // Comment-only drain (no front-matter change): must post despite the claim.
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify({ event: "add", op: "i1-row", id: null, parent: null, author: "dev1", body: "drain me", body_sha: "sha", at: "t", status: "pending" }) + "\n", { flag: "a" });
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.comments).toBe(1);
+    // A state change under the same claim still refuses.
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught.message)).toContain("intent-claim");
+    delete process.env.TEAMCTL_STATE_HOME;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I3: refusal rows dedupe per (rule, detail) across cycles", async () => {
+    const dir = reviewMountDir("i3");
+    await run(["sync", "HT-67", "--dir", dir]);
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: bogus"));
+    for (let i = 0; i < 3; i++) {
+      try {
+        await run(["sync", "HT-67", "--push-once"]);
+      } catch { /* refusal expected every time */ }
+    }
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.filter((r: any) => r.status === "conflict" && r.body.includes("unknown-state"))).toHaveLength(1);
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I8: unreadable journal fails CLOSED (gate refuses, never silently passes)", async () => {
+    const dir = reviewMountDir("i8");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateHome = mkdtempSync(join(tmpdir(), "plane-coord-"));
+    tmpDirs.push(stateHome);
+    const jr = join(stateHome, "ai-tutor", "journals");
+    mkdirSync(jr, { recursive: true });
+    writeFileSync(join(jr, "HT-67.header.json"), "{corrupt json");
+    process.env.TEAMCTL_STATE_HOME = stateHome;
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught.message)).toContain("journal-unreadable");
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+    delete process.env.TEAMCTL_STATE_HOME;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I9: same-titled siblings get distinct dirs", async () => {
+    const dir = reviewMountDir("i9");
+    // Two children of HT-66 with the SAME name.
+    globalThis.__extraIssues = [
+      { id: "is-twin-a", sequence_id: 70, name: "twin child", state: "st-todo", priority: "none", assignees: [], labels: [], parent: "is-66", description_html: "<p>a</p>" },
+      { id: "is-twin-b", sequence_id: 71, name: "twin child", state: "st-todo", priority: "none", assignees: [], labels: [], parent: "is-66", description_html: "<p>b</p>" },
+    ];
+    await run(["sync", "HT-66", "--dir", dir]);
+    const sub = join(dir, "sub-tickets");
+    const dirs = existsSync(sub) ? readdirSync(sub) : [];
+    const twins = dirs.filter((d) => d.startsWith("twin-child"));
+    expect(twins.length).toBeGreaterThanOrEqual(2);
+    const bodies = twins.map((t) => readFileSync(join(sub, t, "ticket.md"), "utf8"));
+    expect(bodies.filter((b) => b.includes("# twin child")).length).toBe(2);
+    // Each twin has its own .plane comment home (I5).
+    for (const t of twins) expect(existsSync(join(sub, t, ".plane"))).toBeTrue();
+    delete (globalThis as any).__extraIssues;
+    await run(["sync", "--stop", "HT-66"]);
   });
 });

@@ -9,59 +9,126 @@
  *
  * Mounts added/removed while running are picked up on the next roll-call
  * (new project → spawn; empty project → worker exits itself).
+ *
+ * Pidfile protocol (review C3/C4): the pidfile is claimed ATOMICALLY
+ * (`openSync "wx"`) by the supervisor at startup — a loser exits instead
+ * of running a second daemon. Identity = pid + /proc/<pid>/cmdline check:
+ * a recycled pid (different binary) reads as STALE, not alive. Removal is
+ * own-pid-only: a crashed supervisor's stale file is stolen by the next
+ * starter; a live daemon's claim is never deleted by anyone else.
  */
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeSync, closeSync } from "node:fs";
+import { dirname } from "node:path";
 import { readMounts } from "./sync.ts";
 
 const WORKER_FILE = new URL("./syncWorker.ts", import.meta.url).pathname;
 export const SUPERVISOR_FILE = new URL("./syncSupervisor.ts", import.meta.url).pathname;
 
-/** Pidfile lives beside the mount registry; the daemon writes its pid there
- *  on start and removes it on exit. `ensureSupervisor` uses it to avoid
- *  double-daemons (auto-start on mount + manual `sync --daemon`). */
 export function supervisorPidFile(): string {
   const state = process.env.PLANE_SYNC_STATE ?? `${process.env.HOME ?? "~"}/.config/plane/syncs.json`;
   return `${state.replace(/\.json$/, "")}-daemon.pid`;
 }
 
-export function daemonAlive(): number | null {
-  const f = supervisorPidFile();
-  if (!existsSync(f)) return null;
+/** /proc identity: the pid must belong to a syncSupervisor process. A
+ *  recycled pid (any other binary) reads as dead. Non-Linux (no /proc)
+ *  falls back to signal-0 liveness (weaker, still better than nothing). */
+function procIdentityHolds(pid: number): boolean {
   try {
-    const pid = Number(readFileSync(f, "utf8").trim());
-    if (!Number.isFinite(pid) || pid <= 0) return null;
-    process.kill(pid, 0); // throws ESRCH when the pid is gone
-    return pid;
-  } catch {
-    return null;
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    return cmd.includes("syncSupervisor");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false; // dead or no /proc
+    // EPERM etc: fall back to signal-0 (alive check only).
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
+export function daemonAlive(): number | null {
+  const f = supervisorPidFile();
+  if (!existsSync(f)) return null;
+  let pid = 0;
+  try {
+    pid = Number(readFileSync(f, "utf8").trim().split(" ")[0]);
+  } catch {
+    return null;
+  }
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  if (pid === process.pid) return pid;
+  if (!procIdentityHolds(pid)) {
+    // Stale (crashed daemon or recycled pid): steal so the next starter
+    // isn't blocked forever (review C4). Only when we can actually remove.
+    try {
+      rmSync(f, { force: true });
+    } catch { /* concurrent starter may have removed it already */ }
+    return null;
+  }
+  return pid;
+}
+
+/** Atomic claim: O_EXCL create; on EEXIST verify the holder — a dead or
+ *  foreign-pid holder is stale and gets stolen once, then one retry. */
+function claimPidFile(): boolean {
+  const f = supervisorPidFile();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(f, "wx");
+      writeSync(fd, `${process.pid} ${Date.now()}`);
+      closeSync(fd);
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      const live = daemonAlive(); // steals when stale/dead
+      if (live !== null) return false; // a REAL daemon owns it — we lost
+    }
+  }
+  return false;
+}
+
+/** Remove the pidfile ONLY when it still names us (review C4): our stale
+ *  file must never delete a successor's claim. */
+function releasePidFile(): void {
+  const f = supervisorPidFile();
+  try {
+    const raw = readFileSync(f, "utf8").trim().split(" ")[0];
+    if (Number(raw) === process.pid) rmSync(f, { force: true });
+  } catch { /* already gone */ }
+}
+
+export type SpawnResult =
+  | { state: "started"; pid: number; log: string }
+  | { state: "already"; pid: number; log: string }
+  | { state: "failed"; pid: number; log: string; error: string };
+
 /** Spawn a DETACHED supervisor (survives the mounting CLI process) unless
- *  one is already alive. Returns { started | already } with the pid.
+ *  one is already alive. Discriminated result (review I11): a spawn failure
+ *  is REPORTED, never dressed up as `running (pid 0)`.
  *  PLANE_SYNC_NO_DAEMON=1 (unit suite) skips spawning entirely. */
-export function ensureSupervisor(): { started: boolean; pid: number; log: string; skipped?: boolean } {
-  if (process.env.PLANE_SYNC_NO_DAEMON === "1") return { started: false, pid: 0, log: "", skipped: true };
+export function ensureSupervisor(): SpawnResult {
+  if (process.env.PLANE_SYNC_NO_DAEMON === "1") return { state: "failed", pid: 0, log: "", error: "daemon spawn disabled (PLANE_SYNC_NO_DAEMON)" };
   const live = daemonAlive();
-  if (live !== null) return { started: false, pid: live, log: "" };
+  if (live !== null) return { state: "already", pid: live, log: "" };
   const pidFile = supervisorPidFile();
   const log = pidFile.replace("daemon.pid", "daemon.log");
   try {
-    rmSync(pidFile, { force: true });
     const outFd = openSync(log, "a");
     const pollMs = Number.isFinite(Number(process.env.PLANE_SYNC_POLL_MS)) ? Number(process.env.PLANE_SYNC_POLL_MS) : 5000;
     const kid = Bun.spawn(["bun", SUPERVISOR_FILE, `--interval-ms=${Math.round(pollMs)}`], {
-      env: { ...process.env, PLANE_SUPERVISOR_BOOTSTRAP_PID: pidFile },
+      env: { ...process.env },
       stdout: outFd,
       stderr: outFd,
+      stdin: "ignore",
       detached: true,
       cwd: process.cwd(),
     });
     kid.unref?.();
-    return { started: true, pid: kid.pid, log };
+    return { state: "started", pid: kid.pid, log };
   } catch (e) {
-    return { started: false, pid: 0, log: String((e as Error).message) };
+    return { state: "failed", pid: 0, log, error: String((e as Error).message) };
   }
 }
 
@@ -70,16 +137,12 @@ export function projectsOf(mounts: Array<{ projectId: string }>): string[] {
 }
 
 export async function runSupervisor(opts: { intervalMs: number; once?: boolean }): Promise<void> {
-  const pidFile = process.env.PLANE_SUPERVISOR_BOOTSTRAP_PID ?? supervisorPidFile();
-  const claimPid = () => {
-    try {
-      const dir = pidFile.includes("/") ? pidFile.replace(/\/[^/]+$/, "") : ".";
-      mkdirSync(dir, { recursive: true });
-      const fd = openSync(pidFile, "w");
-      writeSync(fd, String(process.pid));
-    } catch { /* best-effort: still run without a pidfile */ }
-  };
-  claimPid();
+  // C3: atomic claim BEFORE any work. A concurrent supervisor already owns
+  // the pidfile → we exit 0 (it is running; our spawner will observe it).
+  if (!claimPidFile()) {
+    console.error("supervisor: another daemon holds the pidfile — exiting");
+    return;
+  }
   const kids = new Map<string, ReturnType<typeof Bun.spawn>>();
   const deadCode = new Map<string, number | null>();
   const respawning = new Set<string>();
@@ -88,7 +151,10 @@ export async function runSupervisor(opts: { intervalMs: number; once?: boolean }
     if (dead) return;
     dead = true;
     for (const k of kids.values()) k.kill("SIGTERM");
-    setTimeout(() => { try { rmSync(pidFile, { force: true }); } catch { /* best effort */ } process.exit(0); }, 500);
+    setTimeout(() => {
+      releasePidFile();
+      process.exit(0);
+    }, 500);
   };
   process.on("SIGTERM", killAll);
   process.on("SIGINT", killAll);
@@ -121,7 +187,7 @@ export async function runSupervisor(opts: { intervalMs: number; once?: boolean }
     const anyAlive = [...kids].some(([pid, k]) => (deadCode.has(pid) ? deadCode.get(pid) : k.exitCode) === null);
     if (!want.length && !anyAlive) {
       console.error("supervisor: no mounts left — exiting");
-      try { rmSync(pidFile, { force: true }); } catch { /* best effort */ }
+      releasePidFile();
       process.exit(0);
     }
   };
@@ -148,6 +214,7 @@ export async function runSupervisor(opts: { intervalMs: number; once?: boolean }
     const codes: Array<{ project: string; code: number | null }> = [];
     for (const [pid, kid] of kids) codes.push({ project: pid, code: await kid.exited });
     console.log(JSON.stringify(codes));
+    releasePidFile();
     return;
   }
   rollCall();

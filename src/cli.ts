@@ -5,10 +5,17 @@ import { join, resolve } from "node:path";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
-import { readMounts, writeMounts, writeStatusFile, findMount } from "./sync.ts";
+import { readMounts, writeStatusFile, findMount, updateMounts, countPendingEvents } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
-import { countPending, pushTicket } from "./syncPush.ts";
-import { runSupervisor, ensureSupervisor, daemonAlive } from "./syncSupervisor.ts";
+import { pushTicket } from "./syncPush.ts";
+import { runSupervisor, ensureSupervisor, daemonAlive, type SpawnResult } from "./syncSupervisor.ts";
+
+/** I11 (review): never dress a spawn failure up as `running (pid 0)`. */
+function describeDaemon(d: SpawnResult): string {
+  if (d.state === "started") return `started (pid ${d.pid})`;
+  if (d.state === "already") return `running (pid ${d.pid})`;
+  return `FAILED to start: ${d.error}`;
+}
 
 let activeCache: Cache | undefined;
 
@@ -499,26 +506,35 @@ export async function run(argv: string[]): Promise<unknown> {
           });
         const ref = await p.issueRef(stopF, { fresh: true });
         const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
-        const mounts = readMounts();
-        const hit = mounts.find((m) => m.ticket.toUpperCase() === handle);
-        if (!hit)
+        let stoppedMount: { ticket: string; dir: string } | null = null;
+        await updateMounts((mounts) => {
+          const hit = mounts.find((m) => m.ticket.toUpperCase() === handle);
+          if (!hit) return; // nothing to stop — report below from fresh read
+          stoppedMount = { ticket: hit.ticket, dir: hit.dir };
+          const kept = mounts.filter((m) => m !== hit);
+          mounts.length = 0;
+          mounts.push(...kept);
+        });
+        if (!stoppedMount)
           throw new UsageError("not-found", `no active sync mount for '${handle}'`, {
-            valid: mounts.map((m) => m.ticket),
+            valid: readMounts().map((m) => m.ticket),
             suggestion: "plane sync ls to list active mounts",
           });
-        writeMounts(mounts.filter((m) => m !== hit));
-        return { ticket: handle, stopped: true, dirKept: hit.dir };
+        return { ticket: handle, stopped: true, dirKept: stoppedMount.dir };
       }
       if (args.flags["stop-all"] === true) {
         // End-of-ticket cleanup sweep: close EVERY mount in one command.
         // Folders are kept (they hold the user's files); the daemon notices
         // zero mounts on its next roll-call and exits itself.
-        const mounts = readMounts();
-        if (!mounts.length) return { stopped: [], dirsKept: [], note: "no active syncs" };
-        writeMounts([]);
+        const closed: Array<{ ticket: string; dir: string }> = [];
+        await updateMounts((mounts) => {
+          closed.push(...mounts.map((m) => ({ ticket: m.ticket, dir: m.dir })));
+          mounts.length = 0;
+        });
+        if (!closed.length) return { stopped: [], dirsKept: [], note: "no active syncs" };
         return {
-          stopped: mounts.map((m) => m.ticket),
-          dirsKept: mounts.map((m) => m.dir),
+          stopped: closed.map((m) => m.ticket),
+          dirsKept: closed.map((m) => m.dir),
           note: "folders kept — delete them yourself if unwanted; daemon exits on its next roll-call",
         };
       }
@@ -542,17 +558,6 @@ export async function run(argv: string[]): Promise<unknown> {
           : ticketsRoot
             ? join(ticketsRoot, handle, "tmp", "ticket-sync")
             : join(homedir(), ".config", "plane", "sync", handle);
-        const mounts = readMounts();
-        const dup = mounts.find((m) => m.ticket.toUpperCase() === handle);
-        if (dup)
-          throw new UsageError("validation", `refused: ${handle} already synced → ${dup.dir} — stop that sync first`, {
-            suggestion: `plane sync --stop ${handle} before re-mounting`,
-          });
-        const dirTaken = mounts.find((m) => m.dir === absDir);
-        if (dirTaken)
-          throw new UsageError("validation", `refused: ${absDir} already mounts ${dirTaken.ticket} — one dir mounts one ticket`, {
-            suggestion: "mount into an empty dir",
-          });
         mkdirSync(absDir, { recursive: true });
         // --no-wait: register now, pull later (daemon adopts unpulled mounts
         // on its first cycle; `sync --wait` blocks until it lands). Default
@@ -575,21 +580,39 @@ export async function run(argv: string[]): Promise<unknown> {
           lastFileSha: null as string | null,
           kids: [] as Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>,
         };
-        writeMounts([...mounts, base]);
+        // Duplicate/dir-taken checks INSIDE the registry lock (C1): a
+        // concurrent mount of the same ticket between check and write
+        // would otherwise double-register.
+        await updateMounts((mounts) => {
+          const dup = mounts.find((m) => m.ticket.toUpperCase() === handle);
+          if (dup)
+            throw new UsageError("validation", `refused: ${handle} already synced → ${dup.dir} — stop that sync first`, {
+              suggestion: `plane sync --stop ${handle} before re-mounting`,
+            });
+          const dirTaken = mounts.find((m) => m.dir === absDir);
+          if (dirTaken)
+            throw new UsageError("validation", `refused: ${absDir} already mounts ${dirTaken.ticket} — one dir mounts one ticket`, {
+              suggestion: "mount into an empty dir",
+            });
+          mounts.push(base);
+          return undefined;
+        });
         if (noWait) {
           writeStatusFile(absDir, { ticket: handle, ready: false, lastPoll: null, pending: 0, rev: null });
           const d = ensureSupervisor();
-          return { ticket: handle, dir: absDir, mounted: true, waiting: true, daemon: d.started ? `started (pid ${d.pid})` : `running (pid ${d.pid})` };
+          return { ticket: handle, dir: absDir, mounted: true, waiting: true, daemon: describeDaemon(d) };
         }
         // Blocking default: initial pull so the folder is complete before
         // this returns.
         const pulled = await pullTicket(p, base);
-        writeMounts([
-          ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
-          { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids },
-        ]);
+        await updateMounts((mounts) => {
+          const kept = mounts.filter((m) => m.ticket.toUpperCase() !== handle);
+          mounts.length = 0;
+          mounts.push(...kept, { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids });
+          return undefined;
+        });
         const daemon = ensureSupervisor();
-        return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children, daemon: daemon.started ? `started (pid ${daemon.pid})` : `running (pid ${daemon.pid})` };
+        return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children, daemon: describeDaemon(daemon) };
       }
       if (args.flags["wait-all"] === true) {
         // Whole-handover gate: EVERY mount pulled (lastRev set) and drained
@@ -604,7 +627,7 @@ export async function run(argv: string[]): Promise<unknown> {
         const deadline = Date.now() + Math.round(timeoutRaw * 1000);
         for (;;) {
           const mounts = readMounts();
-          const open = mounts.filter((m) => m.lastRev === null || (m.pending ?? 0) !== 0 || countPending(m.dir) !== 0);
+          const open = mounts.filter((m) => m.lastRev === null || (m.pending ?? 0) !== 0 || countPendingEvents(m.dir) !== 0);
           if (!open.length) return { ready: true, syncs: mounts.map((m) => m.ticket) };
           if (Date.now() >= deadline)
             throw new UsageError("validation", `sync --wait-all timed out (${open.length} open: ${open.map((m) => m.ticket).join(", ")})`, {
@@ -635,7 +658,7 @@ export async function run(argv: string[]): Promise<unknown> {
               valid: readMounts().map((m) => m.ticket),
               suggestion: "plane sync ls to list active mounts",
             });
-          if (hit.lastRev !== null && (hit.pending ?? 0) === 0 && countPending(hit.dir) === 0)
+          if (hit.lastRev !== null && (hit.pending ?? 0) === 0 && countPendingEvents(hit.dir) === 0)
             return { ticket: handle, ready: true, dir: hit.dir };
           if (Date.now() >= deadline)
             throw new UsageError("validation", `sync --wait timed out on '${handle}' (still unpulled or draining)`, {
