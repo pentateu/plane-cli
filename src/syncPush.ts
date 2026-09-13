@@ -17,6 +17,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Plane, Raw } from "./api.ts";
+import { htmlToText } from "./api.ts";
 import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, type SyncMount } from "./sync.ts";
 import { adoptNewcomers, pullTicket, sha256, type SyncEvent } from "./syncPull.ts";
 
@@ -290,6 +291,38 @@ export async function pushTicket(p: Plane, mount: SyncMount): Promise<PushResult
   // Reconcile BEFORE any post: a previous run may have landed a comment
   // without recording its id (kill-mid-push) — adopt instead of duplicating.
   await reconcileEvents(p, mount);
+  // Pull new server comments that don't bump the issue rev (comments are
+  // separate from updated_at). Merge by id, keep pending rows.
+  {
+    const raw = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`)) as Raw;
+    const server = (((raw as any).results ?? raw) as Raw[]).slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    const prior = readEventsFile(dir) as SyncEvent[];
+    const known = new Set(prior.filter((e) => e.id).map((e) => e.id as string));
+    const members = (await p.request("GET", `${p.base()}/members/`)) as Raw[];
+    const seatByMember = new Map((Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]));
+    let added = 0;
+    for (const c of server) {
+      const id = String(c.id);
+      if (known.has(id)) continue;
+      const body = htmlToText(String(c.comment_html ?? ""));
+      prior.push({
+        event: c.parent ? "reply" : "add",
+        op: `server-${id.slice(0,8)}`,
+        id,
+        parent: c.parent ? String(c.parent) : null,
+        author: seatByMember.get(String(c.actor ?? "")) ?? String(c.actor ?? ""),
+        body,
+        body_sha: sha256(body),
+        at: String(c.created_at ?? ""),
+        status: "synced",
+      } as SyncEvent);
+      added++;
+    }
+    if (added) {
+      writeFileSync(join(dir, "comments.events.jsonl"), prior.map((e) => JSON.stringify(e)).join("\n") + (prior.length ? "\n" : ""));
+      writeFileSync(join(dir, "comments.json"), JSON.stringify(prior.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n");
+    }
+  }
   const md = readFileSync(join(dir, "ticket.md"), "utf8");
   const localChanged = sha256(md) !== mount.lastFileSha;
   const serverChanged = mount.lastRev !== null && serverRev !== mount.lastRev;

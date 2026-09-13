@@ -62,14 +62,26 @@ api_code() { # api_code <method> <path> — prints only the HTTP status
 
 # 2. User + workspace via Django shell (no token needed). Output captured and
 # asserted — a failure aborts here with the captured stderr, not downstream.
-WS_OUT="$($API <<'PY' 2>"$DIR/.seed-err.log" | tail -1 || true
+WS_OUT="$(  $API <<'PY' 2>"$DIR/.seed-err.log" | tail -1 || true
 from django.contrib.auth import get_user_model
+from plane.license.models import Instance
 from plane.db.models import Workspace, WorkspaceMember
 User = get_user_model()
-user, _ = User.objects.get_or_create(
+# Web login: password + is_setup_done guard. Raw creates bypass the
+# credential-seeding hook — set it directly, then flip the setup flag.
+user, created = User.objects.get_or_create(
     email="test@iswe.co.nz",
     defaults={"username": "test", "first_name": "Test", "last_name": "User", "is_active": True},
 )
+user.set_password("testpass123")
+user.display_name = "test"
+user.save()  # touch password/display_name even when pre-existing
+inst = Instance.objects.first()
+if inst is None:
+    inst = Instance.objects.create(admin="test@iswe.co.nz", is_setup_done=True)
+elif not inst.is_setup_done:
+    inst.is_setup_done = True
+    inst.save(update_fields=["is_setup_done"])
 ws, _ = Workspace.objects.get_or_create(slug="plane-cli-test",
     defaults={"name": "Plane CLI Test", "owner": user})
 WorkspaceMember.objects.get_or_create(workspace=ws, member=user,
