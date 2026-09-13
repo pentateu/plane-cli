@@ -265,8 +265,8 @@ CONTRACT
   (untranslated ids render as short 'member:'/'label:' prefixes; --raw and --dry-run are the only
   surfaces that can show native payloads)
   output is minimal by default; widen with --fields a,b · deepen with --full (comments capped at
-  300 chars with a labeled marker, never a bare …; --full returns the full text; --max-chars N
-  overrides the 500/300/100 read caps per call) · native payload with --raw
+  600 chars with a labeled marker, never a bare …; --full returns the full text; --max-chars N
+  overrides the 1000/600/200 read caps per call) · native payload with --raw
   boolean flags are bare; inline values ('--yes=false') are rejected with exit 4
   every mutating verb accepts --dry-run (prints exactly what execution would send, changes nothing)
   claim/state are idempotent: re-applying returns changed:false, exit 0 — safe retries.
@@ -379,7 +379,7 @@ export async function run(argv: string[]): Promise<unknown> {
   if (args.verb !== "projects") await p.ensureProject();
   const dryRun = args.flags["dry-run"] === true;
   const full = args.flags.full === true;
-  // Agent-controlled read cap: overrides the 500/300/100 defaults below;
+  // Agent-controlled read cap: overrides the 1000/600/200 defaults below;
   // --full still means unlimited. Parsed once, applied everywhere text is cut.
   const maxChars = typeof args.flags["max-chars"] === "string" ? parsePositiveInt(args.flags["max-chars"], "--max-chars") : undefined;
   const fields = typeof args.flags.fields === "string" ? args.flags.fields : undefined;
@@ -648,7 +648,7 @@ export async function run(argv: string[]): Promise<unknown> {
         p.relationsCached(uuid, projectId),
       ]);
       const shaped = await p.shapeIssue(rawIssue as never, { full, maxChars, relations: rels, ident, projectId });
-      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text: full ? text : labeledCut(text, maxChars ?? 300, "--full for all") })) } : {}) };
+      const obj = { ...shaped, ...(wantComments ? { comments: comments.map(({ n, author, date, text }) => ({ n: `c${n}`, author, date, text: full ? text : labeledCut(text, maxChars ?? 600, "--full for all") })) } : {}) };
       return pickFields(obj as Record<string, unknown>, fields);
     }
     case "list": {
@@ -729,7 +729,7 @@ export async function run(argv: string[]): Promise<unknown> {
         const s = await p.shapeIssue(i as never, { ident: all.ident });
         rows.push({
           id: s.id,
-          title: labeledCut(s.title, maxChars ?? 100, `plane get ${s.id} --full`),
+          title: labeledCut(s.title, maxChars ?? 200, `plane get ${s.id} --full`),
           state: s.state,
           priority: s.priority,
           assignee: s.assignees[0] ?? null,
@@ -860,7 +860,7 @@ export async function run(argv: string[]): Promise<unknown> {
     case "comments": {
       const ref = await p.issueRef(requireTicket(args.positionals));
       const list = await p.comments(ref.uuid, ref.projectId, { full });
-      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : labeledCut(c.text, maxChars ?? 300, "--full for all") }));
+      const shaped = list.map((c) => ({ n: `c${c.n}`, author: c.author, date: c.date, text: full ? c.text : labeledCut(c.text, maxChars ?? 600, "--full for all") }));
       return pickFields({ id: `${ref.ident}-${ref.seq}`, comments: shaped }, fields ?? "id,comments");
     }
     case "reply":

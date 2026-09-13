@@ -106,7 +106,7 @@ const ISSUES = [
     assignees: ["mb-dev1"],
     labels: ["lb-plan"],
     parent: "is-67",
-    description_html: `<p>${"x".repeat(600)}</p>`,
+    description_html: `<p>${"x".repeat(1200)}</p>`,
   },
   {
     id: "is-67",
@@ -662,19 +662,19 @@ describe("comments / reply / comment", () => {
 describe("comment read cap (O-3)", () => {
   test("default truncates with a labeled marker; --full returns the whole comment", async () => {
     globalThis.__comments = [
-      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"y".repeat(600)}</p>`, actor: "mb-dev1" },
+      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"y".repeat(1200)}</p>`, actor: "mb-dev1" },
     ];
     const d = (await run(["comments", "HT-66"])) as Record<string, any>;
     expect(String(d.comments[0].text)).toContain("…[truncated");
     expect(String(d.comments[0].text)).toContain("--full for all");
-    expect(String(d.comments[0].text).length).toBe(339); // 300 + "…[truncated 300 chars — --full for all]"
+    expect(String(d.comments[0].text).length).toBe(639); // 600 + "…[truncated 600 chars — --full for all]"
     const f = (await run(["comments", "HT-66", "--full"])) as Record<string, any>;
-    expect(String(f.comments[0].text).length).toBe(600);
+    expect(String(f.comments[0].text).length).toBe(1200);
   });
 
   test("get --comments uses the same labeled cap", async () => {
     globalThis.__comments = [
-      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"z".repeat(400)}</p>`, actor: "mb-dev1" },
+      { id: "cm-long", created_at: "2026-09-06T03:00:00Z", comment_html: `<p>${"z".repeat(800)}</p>`, actor: "mb-dev1" },
     ];
     const d = (await run(["get", "HT-66", "--comments"])) as Record<string, any>;
     expect(String(d.comments[0].text)).toContain("…[truncated");
@@ -721,7 +721,7 @@ describe("O-5 list pagination contract", () => {
   });
 
   test("O-13: long title shows marker + resume", async () => {
-    useListRouter([{ id: "is-300", sequence_id: 300, name: "x".repeat(120), state: "st-todo", priority: "none", assignees: [], labels: [], parent: null }]);
+    useListRouter([{ id: "is-300", sequence_id: 300, name: "x".repeat(250), state: "st-todo", priority: "none", assignees: [], labels: [], parent: null }]);
     const d = (await run(["list"])) as Record<string, any>;
     expect(String(d.items[0].title)).toContain("…[truncated");
     expect(String(d.items[0].title)).toContain("plane get HT-300 --full");
@@ -844,7 +844,7 @@ describe("create / sub", () => {
 
   test("--max-chars caps description with a labeled marker", async () => {
     const d = (await run(["get", "HT-66", "--fields", "description", "--max-chars", "10"])) as Record<string, unknown>;
-    expect(d.description).toBe("xxxxxxxxxx…(+590 chars — plane get HT-66 --full)");
+    expect(d.description).toBe("xxxxxxxxxx…(+1190 chars — plane get HT-66 --full)");
   });
 
   test("--max-chars caps comments; --full still wins", async () => {

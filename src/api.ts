@@ -454,7 +454,7 @@ export class Plane {
     let description: string | undefined;
     if ("description_html" in i) {
       const t = htmlToText(String(i.description_html ?? ""));
-      const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : (opts.maxChars ?? 500));
+      const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : (opts.maxChars ?? 1000));
       description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get ${ident}-${i.sequence_id} --full)`;
     }
     const normalizeIdArray = (v: unknown): string[] => (Array.isArray(v) ? (v as any[]).map((a) => (typeof a === "string" ? a : a?.id)).filter((s): s is string => typeof s === "string" && s.length > 0) : []);
