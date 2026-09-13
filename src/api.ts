@@ -115,6 +115,7 @@ export class Plane {
   }
 
   async request(method: string, path: string, body?: unknown): Promise<Raw | Raw[]> {
+    if (process.env.TRACE_PLANE_REQ) console.error(`TRACE ${method} ${path}`);
     const doFetch = async (): Promise<Response> => {
       try {
         return await fetch(`${this.cfg.apiBase}${path}`, {

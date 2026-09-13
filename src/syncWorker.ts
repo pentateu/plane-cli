@@ -63,18 +63,29 @@ if (import.meta.main) {
       (e) => { console.error(String(e?.message ?? e)); process.exit(1); },
     );
   } else {
+    let backoffMs = intervalMs;
     const tick = async () => {
       try {
         await workerCycle(projectId);
+        backoffMs = intervalMs; // healthy cycle resets the ramp
       } catch (e) {
-        console.error(`worker ${projectId}: ${String((e as Error)?.message ?? e)}`);
+        const kind = String((e as any)?.kind ?? (e as Error)?.message ?? "");
+        // Rate-limit (429 + Plane 5900) and network errors: ramp 1x → 2x → 4x
+        // up to 60s so a flaky/limited API isn't hammered into a crash by the
+        // poll loop. Any other error keeps the base cadence.
+        if (kind.includes("rate-limit") || kind.includes("network") || kind.includes("Unable to connect") || kind.includes("socket")) {
+          backoffMs = Math.min(backoffMs * 2, 60_000);
+          console.error(`worker ${projectId}: ${String((e as Error)?.message ?? e)} — backing off ${Math.round(backoffMs / 1000)}s`);
+        } else {
+          console.error(`worker ${projectId}: ${String((e as Error)?.message ?? e)}`);
+        }
       }
       const left = readMounts().filter((m) => m.projectId === projectId);
       if (!left.length) {
         console.error(`worker ${projectId}: no mounts left — exiting`);
         process.exit(0);
       }
-      setTimeout(tick, intervalMs);
+      setTimeout(tick, backoffMs);
     };
     process.on("SIGTERM", () => process.exit(0));
     tick();

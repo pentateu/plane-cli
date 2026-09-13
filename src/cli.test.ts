@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cache } from "./cache.ts";
 import { resolveAsToken, run, peekCache, HELP } from "./cli.ts";
@@ -60,7 +60,7 @@ function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p
   };
 }
 
-const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "PLANE_SYNC_STATE", "HOMETUTOR_TICKETS_PROJECT_ID"];
+const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "PLANE_SYNC_STATE", "HOMETUTOR_TICKETS_PROJECT_ID", "HOME"];
 
 function capture(obj: any, method: string): any {
   const s = spyOn(obj, method).mockImplementation(() => {});
@@ -203,6 +203,12 @@ beforeEach(() => {
   process.env.PLANE_CACHE = newCachePath();
   process.env.PLANE_BACKOFF_MS = "1";
   process.env.PLANE_SYNC_STATE = join(newCachePath(), "syncs.json");
+  // Unit tests must never spawn the real detached sync daemon: the auto-start
+  // on mount (TC-95 daemon UX) is a live-stack behavior, not a unit one.
+  process.env.PLANE_SYNC_NO_DAEMON = "1";
+  // Bare `sync TC-N` resolves default dir into $HOME; contain that in a temp
+  // dir so tests never touch the real user home.
+  process.env.HOME = newCachePath();
   // Test-env exports (.plane-test-env) must never leak into the unit suite:
   // PLANE_PROJECT_ID short-circuits project discovery and retargets every verb.
   delete process.env.PLANE_PROJECT_ID;
@@ -1367,7 +1373,7 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
 
   test("sync ls with no mounts returns empty", async () => {
     const d = (await run(["sync", "ls"])) as Record<string, unknown>;
-    expect(d).toEqual({ syncs: [] });
+    expect(d).toEqual({ syncs: [], daemon: null });
   });
 
   test("mount creates dir + record; ls shows it with null lastPoll", async () => {
@@ -1407,15 +1413,29 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(String(caught.message)).toContain("one dir mounts one ticket");
   });
 
-  test("ticket without --dir fails naming the form", async () => {
+  test("bare ticket mounts into the default dir ($HOME/.config/plane/sync/TC-N)", async () => {
+    const d = (await run(["sync", "HT-66"])) as Record<string, unknown>;
+    const def = join(homedir(), ".config", "plane", "sync", "HT-66");
+    expect(d).toMatchObject({ ticket: "HT-66", dir: def, mounted: true });
+    expect(existsSync(def)).toBeTrue();
+    tmpDirs.push(def, join(homedir(), ".config", "plane", "sync")); // clean up real-home test footprint
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toHaveLength(1);
+  });
+
+  test("bare ticket freshly mounts even when default dir is taken by another ticket (validation not panic)", async () => {
+    // Same check shape as explicit-dir collisions: default dirs are real dirs.
+    const dir = mountDir("dflt");
+    await run(["sync", "HT-66", "--dir", dir]);
     let caught: any;
     try {
-      await run(["sync", "HT-66"]);
+      await run(["sync", "HT-67"]); // HT-67 default dir is distinct — mounts fine
     } catch (e) {
       caught = e;
     }
-    expect(caught.kind).toBe("validation");
-    expect(String(caught.message)).toContain("--dir");
+    expect(caught).toBeUndefined();
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toHaveLength(2);
   });
 
   test("stop removes the mount and keeps the folder", async () => {

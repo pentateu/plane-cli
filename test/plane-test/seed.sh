@@ -109,6 +109,10 @@ if [ -n "$SECRET" ]; then
     echo "token: cached key still valid" >&2
   else
     echo "token: cached key rejected — minting fresh" >&2
+    # The DB was wiped (token gone) — the CLI cache maps the old project
+    # uuid to TEST (24h TTL). Clear it so resolveProjectByIdent re-resolves:
+    # a stale uuid 403s on every write until then.
+    rm -f "$DIR/.plane-cache"
     SECRET=""
   fi
 fi

@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
 import { readMounts, writeMounts, writeStatusFile } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
 import { countPending, pushTicket } from "./syncPush.ts";
-import { runSupervisor } from "./syncSupervisor.ts";
+import { runSupervisor, ensureSupervisor, daemonAlive } from "./syncSupervisor.ts";
 
 let activeCache: Cache | undefined;
 
@@ -283,12 +283,13 @@ VERBS
   config                          show resolved seat/apiBase/project/tokenSource/cache
   projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
-  sync <TC-N> --dir <path>        mount ticket↔folder mirror (blocks until pulled; --no-wait returns at once)
-  sync <TC-N> --push-once          one-shot push of folder edits (bridge until the daemon loop lands)
+  sync <TC-N>                     mount ticket↔folder mirror (default dir ~/.config/plane/sync/TC-N; blocks until pulled)
+  sync <TC-N> --dir <path>        mount into <path>; --no-wait returns at once
+  sync <TC-N> --push-once          one-shot push of folder edits (manual alternative to the daemon)
   sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
   sync --wait-all [--timeout N]   block until EVERY mount is pulled and drained (whole-handover gate)
-  sync --daemon [--interval N]     run the supervisor (one worker process per project, poll N seconds)
-  sync ls                         list active ticket↔folder mounts
+  sync --daemon [--interval N]     run the supervisor foreground (mounting auto-starts a background daemon)
+  sync ls                         list active ticket↔folder mounts (+ daemon pid)
   sync --stop <TC-N>              unmount (daemon exits, folder kept)
   get HT-N [--comments] [--full] [--max-chars N] [--raw] [--fields f1,f2]
                                   renders blockedBy[]/blocks[] (short handles):
@@ -439,12 +440,15 @@ export async function run(argv: string[]): Promise<unknown> {
         const raw = typeof args.flags.interval === "string" ? Number(args.flags.interval) : 5;
         if (!Number.isFinite(raw) || raw <= 0)
           throw new UsageError("validation", `invalid --interval '${args.flags.interval}'`, { valid: ["positive seconds"] });
+        const live = daemonAlive();
+        if (live !== null)
+          return { daemon: true, alreadyRunning: live, suggestion: "the mount auto-started the daemon — edit files or the web UI, changes sync both ways" };
         await runSupervisor({ intervalMs: Math.round(raw * 1000) });
         return { daemon: true };
       }
       if (sub === "ls" && dirF === undefined && stopF === undefined) {
         const mounts = readMounts();
-        return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })) };
+        return { syncs: mounts.map((m) => ({ ticket: m.ticket, dir: m.dir, lastPoll: m.lastPoll, pending: m.pending })), daemon: daemonAlive() };
       }
       if (stopF !== undefined) {
         if (typeof stopF !== "string" || !stopF.trim())
@@ -463,14 +467,18 @@ export async function run(argv: string[]): Promise<unknown> {
         writeMounts(mounts.filter((m) => m !== hit));
         return { ticket: handle, stopped: true, dirKept: hit.dir };
       }
-      if (dirF !== undefined) {
+      // Mount trigger: an explicit --dir, or a bare ticket sub — but never
+        // when a gate/push flag is present (those operate on existing mounts).
+        if ((dirF !== undefined || sub !== undefined) && args.flags["push-once"] !== true && args.flags["wait-all"] !== true && args.flags.wait === undefined) {
         if (sub === undefined)
           throw new UsageError("validation", "sync --dir needs a ticket: plane sync TEST-1 --dir <path>", {
             suggestion: "plane sync ls to list active mounts",
           });
         const ref = await p.issueRef(sub, { fresh: true });
         const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
-        const absDir = resolve(dirF);
+        const absDir = dirF
+          ? resolve(dirF)
+          : join(homedir(), ".config", "plane", "sync", handle);
         const mounts = readMounts();
         const dup = mounts.find((m) => m.ticket.toUpperCase() === handle);
         if (dup)
@@ -507,7 +515,8 @@ export async function run(argv: string[]): Promise<unknown> {
         writeMounts([...mounts, base]);
         if (noWait) {
           writeStatusFile(absDir, { ticket: handle, ready: false, lastPoll: null, pending: 0, rev: null });
-          return { ticket: handle, dir: absDir, mounted: true, waiting: true };
+          const d = ensureSupervisor();
+          return { ticket: handle, dir: absDir, mounted: true, waiting: true, daemon: d.started ? `started (pid ${d.pid})` : `running (pid ${d.pid})` };
         }
         // Blocking default: initial pull so the folder is complete before
         // this returns.
@@ -516,7 +525,8 @@ export async function run(argv: string[]): Promise<unknown> {
           ...readMounts().filter((m) => m.ticket.toUpperCase() !== handle),
           { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids },
         ]);
-        return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children };
+        const daemon = ensureSupervisor();
+        return { ticket: handle, dir: absDir, mounted: true, comments: pulled.comments, children: pulled.children, daemon: daemon.started ? `started (pid ${daemon.pid})` : `running (pid ${daemon.pid})` };
       }
       if (args.flags["wait-all"] === true) {
         // Whole-handover gate: EVERY mount pulled (lastRev set) and drained
@@ -587,10 +597,6 @@ export async function run(argv: string[]): Promise<unknown> {
           });
         return await pushTicket(p, hit);
       }
-      if (sub !== undefined)
-        throw new UsageError("validation", `sync ${sub} needs --dir <path>: plane sync ${sub} --dir <path>`, {
-          suggestion: "bare plane sync refreshes the cache; plane sync ls lists mounts",
-        });
       // Capture the default project id BEFORE dropping `project:<name>` —
       const pid = p.projectId();
       cache.drop(`project:${cfg.projectName}`);
