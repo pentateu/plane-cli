@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { Cache } from "./cache.ts";
 import { ApiError, Plane, VALID_STATES, htmlToText, mdToHtml, parseTicketRef, type IssueRelations, type RelMap } from "./api.ts";
 import { UsageError, availableSeats, resolveConfig, type Config } from "./config.ts";
-import { readMounts, writeMounts, writeStatusFile } from "./sync.ts";
+import { readMounts, writeMounts, writeStatusFile, findMount } from "./sync.ts";
 import { pullTicket } from "./syncPull.ts";
 import { countPending, pushTicket } from "./syncPush.ts";
 import { runSupervisor, ensureSupervisor, daemonAlive } from "./syncSupervisor.ts";
@@ -283,7 +283,7 @@ VERBS
   config                          show resolved seat/apiBase/project/tokenSource/cache
   projects                        list workspace projects (name, identifier, id)
   sync                            force-refresh cached states/labels/member/ticket index
-  sync <TC-N>                     mount ticket↔folder mirror (default dir ~/.config/plane/sync/TC-N; blocks until pulled)
+  sync <TC-N>                     mount ticket↔folder mirror (default dir: $PLANE_TICKETS_ROOT/TC-N/tmp/ticket-sync, else ~/.config/plane/sync/TC-N; blocks until pulled)
   sync <TC-N> --dir <path>        mount into <path>; --no-wait returns at once
   sync <TC-N> --push-once [--force]  one-shot push of folder edits (manual alternative to the daemon; --force = local-wins conflict resolution)
   sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
@@ -397,6 +397,24 @@ export async function run(argv: string[]): Promise<unknown> {
       });
     return id;
   };
+
+  // R-15 folder-only surface (§29.8): while a ticket is sync-mounted, the
+  // FOLDER is the only sanctioned write/read surface for agents — direct
+  // verb calls on it refuse loud, naming the mount. Read-only verbs
+  // (get/comments/list) stay allowed for humans/inspection; the WRITE verbs
+  // are what the sync channel replaces.
+  const R15_VERBS = new Set(["claim", "state", "comment", "reply", "uncomment", "unclaim", "label-add", "label-remove", "delete", "create"]);
+  if (R15_VERBS.has(args.verb)) {
+    const target = args.verb === "create" ? null : (args.positionals[0] ?? null);
+    if (target) {
+      const mounted = findMount(target);
+      if (mounted)
+        throw new UsageError("validation", `refused: ${mounted.ticket} is sync-mounted — the folder is the surface (R-15)`, {
+          detail: `direct '${args.verb}' on a synced ticket is banned; the mount dir is the write surface`,
+          suggestion: `edit ticket.md in ${mounted.dir} (plane sync ls), or plane sync --stop ${mounted.ticket} first`,
+        });
+    }
+  }
 
   switch (args.verb) {
     case "whoami": {
@@ -513,9 +531,17 @@ export async function run(argv: string[]): Promise<unknown> {
           });
         const ref = await p.issueRef(sub, { fresh: true });
         const handle = `${ref.ident}-${ref.seq}`.toUpperCase();
+        // §29.8 temp-folder placement: the mount lives in the ticket's temp
+        // folder (`<tickets-root>/TC-N/tmp/ticket-sync/`, §14.7 close-time
+        // cleanup removes it with the ticket). The root comes from
+        // PLANE_TICKETS_ROOT (teamctl owns the tickets/ tree); without it
+        // the fallback is the config dir (standalone plane-cli use).
+        const ticketsRoot = process.env.PLANE_TICKETS_ROOT;
         const absDir = dirF
           ? resolve(dirF)
-          : join(homedir(), ".config", "plane", "sync", handle);
+          : ticketsRoot
+            ? join(ticketsRoot, handle, "tmp", "ticket-sync")
+            : join(homedir(), ".config", "plane", "sync", handle);
         const mounts = readMounts();
         const dup = mounts.find((m) => m.ticket.toUpperCase() === handle);
         if (dup)

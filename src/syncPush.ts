@@ -16,6 +16,7 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Plane, Raw } from "./api.ts";
 import { htmlToText } from "./api.ts";
 import { countPendingEvents, readEventsFile, readMounts, writeMounts, writeStatusFile, metaDir, type SyncMount } from "./sync.ts";
@@ -111,6 +112,59 @@ function appendEvent(dir: string, e: SyncEvent): void {
   writeFileSync(join(metaDir(dir), "comments.events.jsonl"), JSON.stringify(e) + "\n", { flag: "a" });
 }
 
+/**
+ * §30.3 intent-claim check (daemon-side, call-time): a LIVE `pending_plane`
+ * journal-intent claim from a DIFFERENT hand blocks the front-matter apply —
+ * the ticket's Plane state is being mutated (or about to be) through the
+ * teamctl journal outbox; racing it would double-write.
+ *
+ * Journal sidecar shape (teamctl src/journal.ts): `~/.local/state/teamctl/
+ * <workspace>/journals/<TC-N>.header.json` → `pending.plane = {entry, op,
+ * attempts, last_error} | null`; the arming entry's seat lives in the
+ * entries file (`<TC-N>.md`, line with iso == entry). Missing/unreadable
+ * journal → no claim (fail-open here: plane-cli tickets may have no journal
+ * at all — the coordination layer is teamctl's, this is the advisory hook).
+ */
+export function readLiveIntentClaim(mountTicket: string, workspace: string): { seat: string; iso: string; op: string } | null {
+  const stateHome = process.env.TEAMCTL_STATE_HOME ?? join(process.env.HOME ?? "", ".local", "state", "teamctl");
+  const headerPath = join(stateHome, workspace, "journals", `${mountTicket}.header.json`);
+  if (!existsSync(headerPath)) return null;
+  try {
+    const header = JSON.parse(readFileSync(headerPath, "utf8")) as { pending?: { plane?: { entry: string; op: string } | null } };
+    const slot = header.pending?.plane;
+    if (!slot) return null;
+    // Arming entry seat: the entries file is markdown — `## <iso> — <kind>
+    // — <seat>` headings (teamctl journal.ts render). Scan for the iso.
+    const entriesPath = join(stateHome, workspace, "journals", `${mountTicket}.md`);
+    let seat = "unknown";
+    if (existsSync(entriesPath)) {
+      for (const line of readFileSync(entriesPath, "utf8").split("\n")) {
+        const m = /^## (\S+) — (\S+) — (\S+)\s*$/.exec(line);
+        if (m && m[1] === slot.entry) {
+          seat = m[3]!;
+          break;
+        }
+      }
+    }
+    return { seat, iso: slot.entry, op: slot.op };
+  } catch {
+    return null;
+  }
+}
+
+/** Five-field §30.3 refusal block for an intent-claim conflict. */
+function intentClaimBlock(ticket: string, claim: { seat: string; iso: string; op: string }, caller: string): string {
+  return [
+    `refused: intent-claim — ${ticket} front-matter apply blocked by LIVE pending_plane:${claim.op} (§30.3/§2.1)`,
+    `  what: intent-claim — ${ticket} state apply vs journal-intent ${claim.op}`,
+    `  who: ${claim.seat} holds the claim (caller: ${caller})`,
+    `  since: ${claim.iso}`,
+    `  why: true-conflict — another hand's Plane write is armed; racing it double-writes`,
+    `  wait: let the claim apply (the journal outbox drains it), then re-edit the front-matter`,
+    `  override: none — sync-channel writes never self-override a live foreign claim`,
+  ].join("\n");
+}
+
 /** ONE notice per (server rev, base rev) pair: while a conflict sits
  *  unresolved, every poll cycle re-detects it — re-notifying each time
  *  would spam ~12 identical rows/min at the 5s cadence. */
@@ -163,10 +217,13 @@ export async function reconcileEvents(p: Plane, mount: SyncMount): Promise<{ ado
       continue;
     }
     // Match by author display/seat? Server actor is a member id; event author
-    // is a seat. Match on parent + body text containment both ways is too
-    // loose — match parent + identical posted-HTML shape instead: the daemon
-    // posts `<p>${esc(body)}</p>`, so compare against that rendering.
-    const rendered = `<p>${e.body.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`;
+    // is a seat. Match on parent + identical posted-HTML shape instead: the
+    // daemon posts `<p>${esc(body)} — teamctl · entry <msg_id></p>` (§2.1
+    // stamp) — compare against that rendering, stamp included.
+    const escd = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const rendered = e.entry
+      ? `<p>${escd(`${e.body} — teamctl · entry ${e.entry}`)}</p>`
+      : `<p>${escd(e.body)}</p>`;
     const hit = server.find((c) => (c.parent ?? null) === (e.parent ?? null) && c.body === rendered);
     if (hit) {
       e.id = hit.id;
@@ -183,6 +240,19 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
   const md = readFileSync(join(dir, "ticket.md"), "utf8");
   const { fm, title, body } = parseTicketMd(md);
   const patch: Raw = {};
+
+  // §30.3 (a) intent-claim: a LIVE foreign pending_plane claim blocks the
+  // front-matter apply (state/assignee/labels/priority are the mutation
+  // surface — comment posts and title/body edits are not gated by it).
+  const stateChanging = Boolean(fm.state) || fm.assignee !== undefined || fm.labels.length > 0 || Boolean(fm.priority);
+  if (stateChanging) {
+    const claim = readLiveIntentClaim(mount.ticket, process.env.PLANE_WORKSPACE ?? "ai-tutor");
+    if (claim && claim.seat !== mount.seat) {
+      const block = intentClaimBlock(mount.ticket, claim, mount.seat);
+      appendEvent(dir, { event: "add", op: `conflict-${Date.now()}`, id: null, parent: null, author: "sync-daemon", body: block, body_sha: sha256(block), at: new Date().toISOString(), status: "conflict" });
+      throw Object.assign(new Error(block), { refusal: { refused: true, rule: "intent-claim", ticket: mount.ticket, detail: `LIVE pending_plane:${claim.op} by ${claim.seat}`, remedy: "let the journal outbox drain, then re-edit" } as PushRefusal });
+    }
+  }
 
   // State (CLI token → server id).
   if (fm.state) {
@@ -273,12 +343,19 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw): Pr
   // file (reconcile matching + future API support); the §29.6 quote rule
   // (quote the referenced passage inline as `> quote`) carries the thread
   // context in-body instead.
+  // §2.1 uniform stamp: every daemon-posted comment carries
+  // `— teamctl · entry <msg_id>` (one stamp, one narrow grep). The msg_id is
+  // minted per post and recorded on the event row (`entry`) — the NATS
+  // outbox (§4.5) later reuses it as the Nats-Msg-Id.
   const events = readEvents(dir);
   let posted = 0;
   for (const e of events) {
     if (e.status !== "pending") continue;
-    const res = (await p.postComment(mount.uuid, `<p>${esc(e.body)}</p>`, e.parent ?? undefined, mount.projectId)) as Raw;
+    const msgId = randomUUID();
+    const stamped = `${e.body} — teamctl · entry ${msgId}`;
+    const res = (await p.postComment(mount.uuid, `<p>${esc(stamped)}</p>`, e.parent ?? undefined, mount.projectId)) as Raw;
     e.id = String(res.id ?? res.comment_id ?? "");
+    e.entry = msgId;
     e.status = "synced";
     posted++;
   }

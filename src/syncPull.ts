@@ -29,6 +29,9 @@ export interface SyncEvent {
   body_sha: string;
   at: string;
   status: "pending" | "synced" | "conflict";
+  /** §2.1 msg_id the daemon stamped the post with (synced posts only);
+   *  the NATS outbox (§4.5) reuses it as Nats-Msg-Id. */
+  entry?: string;
 }
 
 export function sha256(s: string): string {

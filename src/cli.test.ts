@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Cache } from "./cache.ts";
@@ -60,7 +60,7 @@ function relationsShapeRouter(relations: Record<string, unknown>): (m: string, p
   };
 }
 
-const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "PLANE_SYNC_STATE", "HOMETUTOR_TICKETS_PROJECT_ID", "HOME"];
+const ENV_KEYS = ["PLANE_API_BASE", "PLANE_WORKSPACE", "PLANE_PROJECT_NAME", "PLANE_PROJECT_ID", "PLANE_IDENT", "PLANE_SEAT", "PLANE_TOKEN", "HOMETUTOR_TICKETS_TOKEN_TEST", "PLANE_CACHE", "PLANE_BACKOFF_MS", "PLANE_SYNC_STATE", "HOMETUTOR_TICKETS_PROJECT_ID", "HOME", "TEAMCTL_STATE_HOME"];
 
 function capture(obj: any, method: string): any {
   const s = spyOn(obj, method).mockImplementation(() => {});
@@ -1413,7 +1413,21 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(String(caught.message)).toContain("one dir mounts one ticket");
   });
 
-  test("bare ticket mounts into the default dir ($HOME/.config/plane/sync/TC-N)", async () => {
+  test("bare ticket mounts into the temp folder when PLANE_TICKETS_ROOT is set (§29.8)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "plane-tickets-"));
+    tmpDirs.push(root);
+    process.env.PLANE_TICKETS_ROOT = root;
+    const d = (await run(["sync", "HT-66"])) as Record<string, unknown>;
+    const def = join(root, "HT-66", "tmp", "ticket-sync");
+    expect(d).toMatchObject({ ticket: "HT-66", dir: def, mounted: true });
+    expect(existsSync(def)).toBeTrue();
+    const ls = (await run(["sync", "ls"])) as Record<string, any>;
+    expect(ls.syncs).toHaveLength(1);
+    delete process.env.PLANE_TICKETS_ROOT;
+    await run(["sync", "--stop-all"]);
+  });
+
+  test("bare ticket mounts into the default dir (~/.config/plane/sync/TC-N)", async () => {
     const d = (await run(["sync", "HT-66"])) as Record<string, unknown>;
     const def = join(homedir(), ".config", "plane", "sync", "HT-66");
     expect(d).toMatchObject({ ticket: "HT-66", dir: def, mounted: true });
@@ -1599,6 +1613,97 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(d2.pushed).toEqual([]);
     const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+  });
+
+  test("R-15: write verbs refuse loud on a sync-mounted ticket", async () => {
+    const dir = mountDir("r15");
+    await run(["sync", "HT-67", "--dir", dir]);
+    for (const argv of [
+      ["state", "HT-67", "done"],
+      ["comment", "HT-67", "direct"],
+      ["claim", "HT-67"],
+      ["unclaim", "HT-67"],
+      ["delete", "HT-67", "--yes"],
+    ]) {
+      let caught: any;
+      try {
+        await run(argv);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught.kind, argv.join(" ")).toBe("validation");
+      expect(String(caught.message), argv.join(" ")).toContain("sync-mounted");
+      expect(String(caught.message), argv.join(" ")).toContain("R-15");
+    }
+    // Reads stay allowed (inspection surface for humans).
+    const g = (await run(["get", "HT-67"])) as Record<string, unknown>;
+    expect(g).toBeTruthy();
+    await run(["sync", "--stop", "HT-67"]);
+    // After stop, the same write works again (no lingering refusal).
+    const s = (await run(["state", "HT-67", "todo"])) as Record<string, unknown>;
+    expect(s).toBeTruthy();
+  });
+
+  test("pending events post with the §2.1 entry stamp + record the msg_id", async () => {
+    const dir = mountDir("stamp");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const pending = { event: "add", op: "evt-stamp-1", id: null, parent: null, author: "dev1", body: "stamped note", body_sha: "sha256-s", at: "2026-09-12T00:00:00.000Z", status: "pending" };
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify(pending) + "\n", { flag: "a" });
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.comments).toBe(1);
+    const post = calls.find((c) => c.method === "POST" && /\/issues\/is-67\/comments\/$/.test(c.path))!;
+    expect(String((post.body as any).comment_html)).toContain("— teamctl · entry ");
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const mine = rows.find((r: any) => r.op === "evt-stamp-1");
+    expect(mine.status).toBe("synced");
+    expect(typeof mine.entry).toBe("string");
+    expect(mine.entry.length).toBe(36); // uuid
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("§30.3 intent-claim: foreign LIVE pending_plane blocks state apply with five-field refusal", async () => {
+    const dir = mountDir("ic");
+    await run(["sync", "HT-67", "--dir", dir]);
+    // Arm a foreign claim in a fake teamctl journal sidecar.
+    const stateHome = mkdtempSync(join(tmpdir(), "plane-coord-"));
+    tmpDirs.push(stateHome);
+    const jr = join(stateHome, "ai-tutor", "journals");
+    mkdirSync(jr, { recursive: true });
+    writeFileSync(join(jr, "HT-67.header.json"), JSON.stringify({ state: "todo", pending: { plane: { entry: "2026-09-13T00:00:00.000Z", op: "state", attempts: 0, last_error: null } } }));
+    writeFileSync(join(jr, "HT-67.md"), "## 2026-09-13T00:00:00.000Z — claim — manager\n");
+    process.env.TEAMCTL_STATE_HOME = stateHome;
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(String(caught.message)).toContain("refused: intent-claim");
+    expect(String(caught.message)).toContain("who: manager holds the claim");
+    expect(String(caught.message)).toContain("  override: none");
+    expect(calls.some((c) => c.method === "PATCH")).toBeFalse();
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && r.body.includes("intent-claim"))).toBeTrue();
+    delete process.env.TEAMCTL_STATE_HOME;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("§30.3 intent-claim: SAME-seat claim does not block (same-hand rule)", async () => {
+    const dir = mountDir("ic2");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateHome = mkdtempSync(join(tmpdir(), "plane-coord-"));
+    tmpDirs.push(stateHome);
+    const jr = join(stateHome, "ai-tutor", "journals");
+    mkdirSync(jr, { recursive: true });
+    writeFileSync(join(jr, "HT-67.header.json"), JSON.stringify({ state: "todo", pending: { plane: { entry: "2026-09-13T00:00:00.000Z", op: "state", attempts: 0, last_error: null } } }));
+    writeFileSync(join(jr, "HT-67.md"), "## 2026-09-13T00:00:00.000Z — claim — dev1\n"); // mount seat is dev1
+    process.env.TEAMCTL_STATE_HOME = stateHome;
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const d = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d.pushed).toContain("state");
+    delete process.env.TEAMCTL_STATE_HOME;
+    await run(["sync", "--stop", "HT-67"]);
   });
 
   test("push-once with unknown state refuses loud with a conflict notice", async () => {
