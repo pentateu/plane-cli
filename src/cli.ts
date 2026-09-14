@@ -27,7 +27,7 @@ function finish(code: number): never {
 const VERBS = ["whoami", "config", "sync", "projects", "get", "list", "claim", "assign", "state", "comments", "reply", "comment", "uncomment", "delete", "unclaim", "label-add", "label-remove", "create", "sub", "blocks", "depends", "unblocks", "states", "labels", "modules"] as const;
 
 const FLAGS_WITH_VALUE = new Set(["seat", "as", "fields", "page", "state", "label", "assignee", "parent", "search", "blocked-by", "title", "type", "priority", "project", "dir", "stop", "wait", "interval", "timeout", "max-chars", "limit", "body", "body-file", "body-md", "file", "comment"]);
-const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "force", "daemon", "no-wait", "wait-all", "stop-all", "check"]);
+const BOOLEAN_FLAGS = new Set(["full", "raw", "dry-run", "comments", "yes", "push-once", "force", "force-all", "daemon", "no-wait", "wait-all", "stop-all", "check"]);
 const REPEATABLE_FLAGS = new Set(["state"]);
 
 type Args = {
@@ -292,7 +292,7 @@ VERBS
   sync                            force-refresh cached states/labels/member/ticket index
   sync <TC-N>                     mount ticket↔folder mirror (default dir: $PLANE_TICKETS_ROOT/TC-N/tmp/ticket-sync, else ~/.config/plane/sync/TC-N; blocks until pulled)
   sync <TC-N> --dir <path>        mount into <path>; --no-wait returns at once
-  sync <TC-N> --push-once [--force]  one-shot push of folder edits (manual alternative to the daemon; --force = local-wins conflict resolution)
+  sync <TC-N> --push-once [--force|--force-all]  one-shot push (manual only, never the daemon; --force = local-wins parent only, --force-all = local-wins whole tree)
   sync --wait <TC-N> [--timeout N] block until the mount is pulled and drained (start_ticket handover gate)
   sync --wait-all [--timeout N]   block until EVERY mount is pulled and drained (whole-handover gate)
   sync --daemon [--interval N]     run the supervisor foreground (mounting auto-starts a background daemon)
@@ -681,10 +681,19 @@ export async function run(argv: string[]): Promise<unknown> {
             valid: mounts.map((m) => m.ticket),
             suggestion: "plane sync ls to list active mounts",
           });
-        // --force is the deliberate local-wins resolution (manual only — the
-        // daemon never force-pushes): local fields overwrite the server side
-        // and baselines follow, clearing the conflict.
-        return await pushTicket(p, hit, args.flags.force === true ? { force: true } : undefined);
+        // --force is the deliberate local-wins parent-only resolution, --force-all
+        // the whole-tree variant (manual only — the daemon never force-pushes):
+        // local fields overwrite the server side and baselines follow. A
+        // successful force also cleans up: its ticket.md.conflict file is
+        // deleted and its conflict notice rows flip to terminal "resolved"
+        // (kept for audit, never re-fire).
+        if (args.flags.force === true && args.flags["force-all"] === true)
+          throw new UsageError("validation", "sync --push-once takes either --force or --force-all, not both (explicit scope)", {
+            suggestion: "--force = local-wins parent only; --force-all = local-wins whole tree",
+          });
+        const force = args.flags.force === true;
+        const forceAll = args.flags["force-all"] === true;
+        return await pushTicket(p, hit, force || forceAll ? { force, forceAll } : undefined);
       }
       // Capture the default project id BEFORE dropping `project:<name>` —
       const pid = p.projectId();

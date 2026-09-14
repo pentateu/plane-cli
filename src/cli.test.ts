@@ -1597,6 +1597,37 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
   });
 
+  test("M3: .conflict is markdown with provenance + same schema as ticket.md (not JSON)", async () => {
+    const dir = mountDir("m3");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]);
+    const snap = readFileSync(join(dir, "ticket.md.conflict"), "utf8");
+    // NOT JSON.
+    expect(() => JSON.parse(snap)).toThrow();
+    // Provenance comment present with baseRev + serverRev.
+    expect(snap).toContain("<!-- conflict snapshot: server side wins nothing yet — local file kept");
+    expect(snap).toContain("ticket: HT-67");
+    expect(snap).toContain("baseRev: stale-rev");
+    expect(snap).toContain("serverRev: 2026-09-13T08:00:00.000Z");
+    expect(snap).toContain("resolve: diff against ticket.md;");
+    // Standard ticket.md rendering: front-matter + title + plain-text body.
+    expect(snap).toContain("---\nstate: todo\nassignee: dev2\nlabels: [type:bug]\npriority: none\n---\n");
+    expect(snap).toContain("# [bug] overshoot quota");
+    // Body matches htmlToText of the mocked server description (<p>short body</p>).
+    expect(snap).toContain("short body");
+    // Server side kept (todo), not the local edit (progress).
+    expect(snap).not.toContain("state: progress");
+    // Notice body names the markdown snapshot.
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const notice = rows.find((r: any) => r.status === "conflict");
+    expect(String(notice.body)).toContain("ticket.md.conflict as markdown — same format as ticket.md, diff them");
+  });
+
   test("conflict notice fires ONCE across repeated polls (no per-cycle spam)", async () => {
     const dir = mountDir("i2");
     await run(["sync", "HT-67", "--dir", dir]);
@@ -1629,6 +1660,103 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(d2.pushed).toEqual([]);
     const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+  });
+
+  test("M5 linger: normal conflict then --force cleans snapshot + resolves rows", async () => {
+    const dir = mountDir("m5-linger");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const c1 = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(c1.pushed).toEqual([]);
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeTrue();
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
+    const d = (await run(["sync", "HT-67", "--push-once", "--force"])) as Record<string, any>;
+    expect(d.pushed).toContain("forced");
+    // .conflict gone, conflict rows flipped to resolved (kept for audit).
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeFalse();
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    // comments.json rewritten with resolved status.
+    const snap = JSON.parse(readFileSync(join(dir, ".plane", "comments.json"), "utf8"));
+    expect(snap.some((r: any) => r.status === "resolved")).toBeTrue();
+    // Follow-up clean, resolved rows stay (never re-fire, never vanish).
+    const d2 = (await run(["sync", "HT-67", "--push-once"])) as Record<string, any>;
+    expect(d2.pushed).toEqual([]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+  });
+
+  test("M5 parent-only: --force pushes parent but files child conflict (not bulldozed)", async () => {
+    const dir = mountDir("m5-parent");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    const kidUuid = mounts[0].kids[0].uuid as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    // Edit both parent and child.
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const childMd = join(dir, kidRel, "ticket.md");
+    writeFileSync(childMd, readFileSync(childMd, "utf8") + "\nchild local edit\n");
+    const d = (await run(["sync", "HT-67", "--push-once", "--force"])) as Record<string, any>;
+    expect(d.pushed).toContain("forced");
+    // Parent PATCH landed, child did NOT.
+    expect(calls.some((c) => c.method === "PATCH" && /\/issues\/is-67\/$/.test(c.path))).toBeTrue();
+    expect(calls.some((c) => c.method === "PATCH" && new RegExp(`/issues/${kidUuid}/`).test(c.path))).toBeFalse();
+    // Child conflict filed (snapshot + notice + pushed entry).
+    expect(existsSync(`${childMd}.conflict`)).toBeTrue();
+    const childSnap = readFileSync(`${childMd}.conflict`, "utf8");
+    expect(() => JSON.parse(childSnap)).toThrow();
+    expect(childSnap).toContain("<!-- conflict snapshot:");
+    expect(childSnap).toContain("baseRev: stale-kid-rev");
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && String(r.body).includes(`child ${kidRel}:`))).toBeTrue();
+    expect(d.pushed.some((s: string) => s.includes(`${kidRel}: conflict`) && s.includes("--force-all"))).toBeTrue();
+  });
+
+  test("M5 force-all: same setup pushes both, no child .conflict", async () => {
+    const dir = mountDir("m5-all");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const childMd = join(dir, kidRel, "ticket.md");
+    writeFileSync(childMd, readFileSync(childMd, "utf8") + "\nchild local edit\n");
+    const d = (await run(["sync", "HT-67", "--push-once", "--force-all"])) as Record<string, any>;
+    expect(d.pushed).toContain("forced");
+    expect(d.pushed.some((s: string) => s.startsWith(`${kidRel}:`))).toBeTrue();
+    expect(existsSync(`${childMd}.conflict`)).toBeFalse();
+    expect(calls.some((c) => c.method === "PATCH" && /\/issues\/is-67\/$/.test(c.path))).toBeTrue();
+    // Child PATCH landed (is-66).
+    expect(calls.some((c) => c.method === "PATCH" && /\/issues\/is-66\/$/.test(c.path))).toBeTrue();
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && String(r.body).includes(`child ${kidRel}:`))).toBeFalse();
+  });
+
+  test("M5: --force + --force-all together is UsageError (explicit scope)", async () => {
+    const dir = mountDir("m5-scope");
+    await run(["sync", "HT-67", "--dir", dir]);
+    let caught: any;
+    try {
+      await run(["sync", "HT-67", "--push-once", "--force", "--force-all"]);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught.kind).toBe("validation");
+    expect(String(caught.message)).toContain("either --force or --force-all");
   });
 
   test("R-15: write verbs refuse loud on a sync-mounted ticket", async () => {
@@ -2881,5 +3009,332 @@ describe("TC-95 r4 follow-ups (N1/N3)", () => {
     expect(calls.some((c) => c.method === "PATCH" && /issues\/is-72\//.test(c.path))).toBeFalse();
     delete (globalThis as any).__extraIssues;
     await run(["sync", "--stop", "HT-66"]);
+  });
+});
+
+describe("review r2 — M3/M5 conflict UX fixes (I1-I5, M1-M4)", () => {
+  test("I3: second fresh conflict after resolved files a new conflict row while keeping the old resolved", async () => {
+    const dir = reviewMountDir("i3-refire");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    // First conflict
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev-1";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]);
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.filter((r: any) => r.status === "conflict")).toHaveLength(1);
+    // Force-resolve
+    await run(["sync", "HT-67", "--push-once", "--force"]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.filter((r: any) => r.status === "resolved")).toHaveLength(1);
+    expect(rows.filter((r: any) => r.status === "conflict")).toHaveLength(0);
+    // Second fresh conflict with DIFFERENT serverRev
+    const origUpdated = ISSUES[1]!.updated_at;
+    (ISSUES[1] as any).updated_at = "2026-09-13T09:00:00.000Z";
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev-2";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    // Need a NEW local change vs the updated baseline (post-force fileSha); append a line
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8") + "\nsecond edit\n");
+    await run(["sync", "HT-67", "--push-once"]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.filter((r: any) => r.status === "conflict")).toHaveLength(1);
+    expect(rows.filter((r: any) => r.status === "resolved")).toHaveLength(1);
+    const conflictRow = rows.find((r: any) => r.status === "conflict");
+    expect(String(conflictRow.body)).toContain("2026-09-13T09:00:00.000Z");
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeTrue();
+    const snap = readFileSync(join(dir, "ticket.md.conflict"), "utf8");
+    expect(snap).toContain("serverRev: 2026-09-13T09:00:00.000Z");
+    (ISSUES[1] as any).updated_at = origUpdated;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I2: pull converts conflict→resolved — force-then-pull preserves resolved", async () => {
+    const dir = reviewMountDir("i2-force-pull");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]); // conflict
+    await run(["sync", "HT-67", "--push-once", "--force"]); // resolved
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    // Simulate daemon pull after force
+    const { pullTicket } = await import("./syncPull.ts");
+    const { Plane } = await import("./api.ts");
+    const { resolveConfig } = await import("./config.ts");
+    const { Cache } = await import("./cache.ts");
+    const cfg = resolveConfig({});
+    const p = new Plane(cfg, new Cache(process.env.PLANE_CACHE!));
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    await pullTicket(p, mounts[0]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I2: pull converts conflict→resolved — pull-then-force preserves resolved", async () => {
+    const dir = reviewMountDir("i2-pull-force");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]); // conflict
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeTrue();
+    // Pull before force (daemon wins first)
+    const { pullTicket } = await import("./syncPull.ts");
+    const { Plane } = await import("./api.ts");
+    const { resolveConfig } = await import("./config.ts");
+    const { Cache } = await import("./cache.ts");
+    const cfg = resolveConfig({});
+    const p = new Plane(cfg, new Cache(process.env.PLANE_CACHE!));
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const pulled = await pullTicket(p, mounts[0]);
+    // Sync registry baselines after pull — otherwise next push sees stale guard and re-pulls
+    let allMounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    allMounts[0].lastRev = pulled.rev;
+    allMounts[0].lastFileSha = pulled.fileSha;
+    allMounts[0].lastBodySha = pulled.bodySha;
+    allMounts[0].kids = pulled.kids;
+    writeFileSync(stateFile, JSON.stringify(allMounts));
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+    // Snapshot should be deleted by pull
+    expect(existsSync(join(dir, "ticket.md.conflict"))).toBeFalse();
+    // Now force with NO new edits — same-conflict no-op (not a fresh push)
+    const beforeCalls = calls.length;
+    const noOp = (await run(["sync", "HT-67", "--push-once", "--force"])) as Record<string, any>;
+    expect(noOp.pushed).toEqual([]);
+    expect(calls.slice(beforeCalls).some((c) => c.method === "PATCH")).toBeFalse();
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    expect(rows.some((r: any) => r.status === "conflict")).toBeFalse();
+    // Subsequent fresh push after audit — re-stale and append, force should PATCH
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev-2";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8") + "\nforced line 2\n");
+    const fresh = (await run(["sync", "HT-67", "--push-once", "--force"])) as Record<string, any>;
+    expect(fresh.pushed).toContain("forced");
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "resolved")).toBeTrue();
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I4: structured meta match hits and legacy fallback hits", async () => {
+    const dir = reviewMountDir("i4-meta");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]);
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const conflictRow = rows.find((r: any) => r.status === "conflict");
+    expect(conflictRow.meta).toEqual({ kind: "push-conflict", ticket: "HT-67", rel: null });
+    // Child meta — reuse same mount, trigger child conflict via parent-only force
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, kidRel, "ticket.md"), readFileSync(join(dir, kidRel, "ticket.md"), "utf8") + "\nchild edit\n");
+    // Parent-only force leaves child conflict
+    await run(["sync", "HT-67", "--push-once", "--force"]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const childRow = rows.find((r: any) => r.status === "conflict" && String(r.body).includes(`child ${kidRel}:`));
+    expect(childRow.meta).toEqual({ kind: "push-conflict", ticket: "HT-67", rel: kidRel });
+    // Legacy fallback: manually write a row without meta and ensure force cleanup flips it
+    const legacy = { event: "add", op: "legacy-1", id: null, parent: null, author: "sync-daemon", body: `refused: conflict — conflict: server rev stale vs local edits (base old) on HT-67 (local kept, server side in ticket.md.conflict as markdown — same format as ticket.md, diff them — resolve with \`sync HT-67 --push-once --force\` for local-wins, or re-mount for server-wins)`, body_sha: "sha", at: new Date().toISOString(), status: "conflict" };
+    writeFileSync(join(dir, ".plane", "comments.events.jsonl"), JSON.stringify(legacy) + "\n", { flag: "a" });
+    // Re-stale for force to trigger legacy flip
+    let allMounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const idx = allMounts.findIndex((m: any) => m.dir === dir);
+    allMounts[idx].lastRev = "stale-rev2";
+    writeFileSync(stateFile, JSON.stringify(allMounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8") + "\nforce2\n");
+    await run(["sync", "HT-67", "--push-once", "--force"]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const legacyAfter = rows.find((r: any) => r.op === "legacy-1");
+    expect(legacyAfter.status).toBe("resolved");
+    await run(["sync", "--stop-all"]);
+  });
+
+  test("I4-child: child-conflict→pull converts to resolved and deletes child snapshot", async () => {
+    const dir = reviewMountDir("i4-child-pull");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    writeFileSync(join(dir, kidRel, "ticket.md"), readFileSync(join(dir, kidRel, "ticket.md"), "utf8") + "\nchild edit\n");
+    await run(["sync", "HT-67", "--push-once", "--force"]); // parent-only force → files child conflict
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const childConflict = rows.find((r: any) => r.status === "conflict" && String(r.body).includes(`child ${kidRel}:`));
+    expect(childConflict).toBeTruthy();
+    expect(existsSync(join(dir, kidRel, "ticket.md.conflict"))).toBeTrue();
+    // Pull should flip child conflict→resolved and delete snapshot
+    const { pullTicket } = await import("./syncPull.ts");
+    const { Plane } = await import("./api.ts");
+    const { resolveConfig } = await import("./config.ts");
+    const { Cache } = await import("./cache.ts");
+    const cfg = resolveConfig({});
+    const p = new Plane(cfg, new Cache(process.env.PLANE_CACHE!));
+    mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    await pullTicket(p, mounts[0]);
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && String(r.body).includes(`child ${kidRel}:`))).toBeFalse();
+    expect(rows.some((r: any) => r.status === "resolved" && r.meta?.rel === kidRel)).toBeTrue();
+    expect(existsSync(join(dir, kidRel, "ticket.md.conflict"))).toBeFalse();
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I4-child: force-all flips seeded child conflict (non-vacuous cleanup)", async () => {
+    const dir = reviewMountDir("i4-child-forceall");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    writeFileSync(join(dir, kidRel, "ticket.md"), readFileSync(join(dir, kidRel, "ticket.md"), "utf8") + "\nchild edit\n");
+    await run(["sync", "HT-67", "--push-once", "--force"]); // seeds child conflict
+    let rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && r.meta?.rel === kidRel)).toBeTrue();
+    expect(existsSync(join(dir, kidRel, "ticket.md.conflict"))).toBeTrue();
+    // Now force-all should push child and flip its row
+    const res = (await run(["sync", "HT-67", "--push-once", "--force-all"])) as Record<string, any>;
+    expect(res.pushed.some((s: string) => s.startsWith(`${kidRel}:`))).toBeTrue();
+    rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(rows.some((r: any) => r.status === "conflict" && r.meta?.rel === kidRel)).toBeFalse();
+    expect(rows.some((r: any) => r.status === "resolved" && r.meta?.rel === kidRel)).toBeTrue();
+    expect(existsSync(join(dir, kidRel, "ticket.md.conflict"))).toBeFalse();
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("I5: conflict path does exactly 3 extra fetches, not 3 per child", async () => {
+    const dir = reviewMountDir("i5-perf");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    writeFileSync(join(dir, kidRel, "ticket.md"), readFileSync(join(dir, kidRel, "ticket.md"), "utf8") + "\nchild edit\n");
+    calls.length = 0;
+    await run(["sync", "HT-67", "--push-once", "--force"]);
+    // After force, the child conflict case is not triggered (forceAll false -> child conflict filed, but that is after pushOne)
+    // For this test we want a plain conflict without force to measure getConflictMaps: reset and do conflict without force
+    await run(["sync", "--stop", "HT-67"]);
+    // Re-mount fresh for single conflict measurement
+    const dir2 = reviewMountDir("i5-single");
+    await run(["sync", "HT-67", "--dir", dir2]);
+    mounts = JSON.parse(readFileSync(process.env.PLANE_SYNC_STATE!, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(process.env.PLANE_SYNC_STATE!, JSON.stringify(mounts));
+    writeFileSync(join(dir2, "ticket.md"), readFileSync(join(dir2, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    calls.length = 0;
+    await run(["sync", "HT-67", "--push-once"]);
+    const singleFetches = calls.filter((c) => c.path.endsWith("/states/") || c.path.endsWith("/labels/") || c.path === "/members/").length;
+    // getConflictMaps does 3 fetches (states, labels, members); plus one initial members fetch for comment merge = 4 total in harness
+    expect([3,4]).toContain(singleFetches);
+    await run(["sync", "--stop", "HT-67"]);
+    // Now 2-child conflict push still same bound (not 3×children)
+    const dir3 = reviewMountDir("i5-multi");
+    globalThis.__extraIssues = [
+      { id: "is-99", sequence_id: 99, name: "extra child", state: "st-todo", priority: "none", assignees: [], labels: [], parent: "is-67", description_html: "<p>extra</p>", updated_at: "2026-09-13T08:00:00.000Z" },
+    ];
+    await run(["sync", "HT-67", "--dir", dir3]);
+    mounts = JSON.parse(readFileSync(process.env.PLANE_SYNC_STATE!, "utf8"));
+    // Add second kid baseline manually via re-read? adoptNewcomers will have added is-99, but we need to stale both kids
+    mounts[0].lastRev = "stale-rev";
+    for (const k of mounts[0].kids) k.rev = "stale-kid-rev";
+    writeFileSync(process.env.PLANE_SYNC_STATE!, JSON.stringify(mounts));
+    for (const k of mounts[0].kids) {
+      const p = join(dir3, k.rel, "ticket.md");
+      if (existsSync(p)) writeFileSync(p, readFileSync(p, "utf8") + "\nedit\n");
+    }
+    calls.length = 0;
+    await run(["sync", "HT-67", "--push-once"]);
+    const multiFetches = calls.filter((c) => c.path.endsWith("/states/") || c.path.endsWith("/labels/") || c.path === "/members/").length;
+    // Still bounded — memoized per pushTicket call, not N×3 (allow +1 variance for harness members caching)
+    expect(multiFetches).toBeLessThanOrEqual(singleFetches + 1);
+    expect(multiFetches).toBeLessThan(7);
+    delete (globalThis as any).__extraIssues;
+    await run(["sync", "--stop-all"]);
+  });
+
+  test("M4: frontMatter quoting is byte-tested for comma and leading #", async () => {
+    const { frontMatter } = await import("./syncPull.ts");
+    const out = frontMatter("todo", "#hashseat", ["type:bug,comma", "type:feature"], "high");
+    expect(out).toContain(`assignee: "#hashseat"`);
+    expect(out).toContain(`"type:bug,comma"`);
+    // Snapshot byte-equality: conflict snapshot's front-matter portion equals frontMatter() + "# title"
+    const dir = reviewMountDir("m4-snap");
+    // Setup a ticket whose server side has a comma label and # assignee via mock
+    const origLabels = [...LABELS];
+    const origMembers = [...MEMBERS];
+    LABELS.push({ id: "lb-comma", name: "type:bug,comma" });
+    MEMBERS.push({ id: "mb-hash", display_name: "#hashseat", email: "#hashseat@x" });
+    const origIssue = { ...ISSUES[1]! };
+    (ISSUES[1] as any).labels = ["lb-comma"];
+    (ISSUES[1] as any).assignees = ["mb-hash"];
+    await run(["sync", "HT-67", "--dir", dir]);
+    const snapPull = readFileSync(join(dir, "ticket.md"), "utf8");
+    expect(snapPull).toContain('"type:bug,comma"');
+    expect(snapPull).toContain('assignee: "#hashseat"');
+    // Conflict snapshot should byte-match the same rendering
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace('assignee: "#hashseat"', 'assignee: dev2'));
+    await run(["sync", "HT-67", "--push-once"]);
+    const conflictSnap = readFileSync(join(dir, "ticket.md.conflict"), "utf8");
+    expect(conflictSnap).toContain('"type:bug,comma"');
+    expect(conflictSnap).toContain('assignee: "#hashseat"');
+    // Restore
+    LABELS.length = 0; LABELS.push(...origLabels);
+    MEMBERS.length = 0; MEMBERS.push(...origMembers);
+    (ISSUES[1] as any).labels = origIssue.labels;
+    (ISSUES[1] as any).assignees = origIssue.assignees;
+    await run(["sync", "--stop", "HT-67"]);
+  });
+
+  test("M3: child provenance is parent ticket + child rel", async () => {
+    const dir = reviewMountDir("m3-child-prov");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    let mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    const kidRel = mounts[0].kids[0].rel as string;
+    mounts[0].lastRev = "stale-rev";
+    mounts[0].kids[0].rev = "stale-kid-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    writeFileSync(join(dir, kidRel, "ticket.md"), readFileSync(join(dir, kidRel, "ticket.md"), "utf8") + "\nchild edit\n");
+    await run(["sync", "HT-67", "--push-once", "--force"]);
+    const childSnap = readFileSync(join(dir, kidRel, "ticket.md.conflict"), "utf8");
+    expect(childSnap).toContain("ticket: HT-67");
+    expect(childSnap).toContain(`child: ${kidRel}`);
+    expect(childSnap).not.toContain(`ticket: HT-67/${kidRel}`);
+    await run(["sync", "--stop", "HT-67"]);
   });
 });

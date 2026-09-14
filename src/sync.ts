@@ -176,16 +176,33 @@ export function writeEventsFile(dir: string, events: StoredEvent[]): void {
  * window fully needs lock-holding appends (a watched FIFO or inotify), a
  * later phase. Contract: appends are single-line JSON + \n, one write() —
  * torn appends heal on the next read.
+ *
+ * I1 (review r2): extracted locked RMW core as withEventsLock so conflict
+ * snapshot + notice row + comments.json land atomically inside ONE lock.
+ * updateEvents delegates to this helper (single writing path).
  */
-export async function updateEvents(dir: string, mutate: (events: StoredEvent[]) => void): Promise<void> {
-  await withLock(join(metaDir(dir), "events.lock"), () => {
+export async function withEventsLock(dir: string, mutate: (events: StoredEvent[]) => void | Promise<void>): Promise<void> {
+  await withLock(join(metaDir(dir), "events.lock"), async () => {
     const events = readEventsFile(dir);
     const known = new Set(events.map((e) => String((e as { op?: string }).op ?? "")));
-    mutate(events);
+    await mutate(events);
     // Rows appended while the mutator ran (unknown ops) are merged back —
     // an append landing mid-section survives the rewrite.
     const fresh = readEventsFile(dir).filter((e) => !known.has(String((e as { op?: string }).op ?? "")));
     const resultOps = new Set(events.map((e) => String((e as { op?: string }).op ?? "")));
-    writeEventsFile(dir, [...events, ...fresh.filter((e) => !resultOps.has(String((e as { op?: string }).op ?? "")))]);
+    const merged = [...events, ...fresh.filter((e) => !resultOps.has(String((e as { op?: string }).op ?? "")))];
+    writeEventsFile(dir, merged);
+    // I1: derived comments.json is rewritten atomically alongside events inside the same lock
+    try {
+      mkdirSync(metaDir(dir), { recursive: true });
+      writeFileSync(
+        join(metaDir(dir), "comments.json"),
+        JSON.stringify(merged.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
+      );
+    } catch { /* advisory — events landed */ }
   });
+}
+
+export async function updateEvents(dir: string, mutate: (events: StoredEvent[]) => void): Promise<void> {
+  await withEventsLock(dir, mutate);
 }
