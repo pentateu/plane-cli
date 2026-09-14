@@ -270,6 +270,22 @@ function changedFields(a: TicketFields, b: TicketFields): Set<FieldName> {
   return out;
 }
 
+/** I-1: do both sides now agree on this field (converged, regardless of the baseline)? */
+function fieldsConvergeOn(local: TicketFields, server: TicketFields, field: FieldName): boolean {
+  return JSON.stringify(changedFieldOf(local, field)) === JSON.stringify(changedFieldOf(server, field));
+}
+
+function changedFieldOf(t: TicketFields, field: FieldName): unknown {
+  switch (field) {
+    case "state": return t.state;
+    case "assignee": return t.assignee;
+    case "labels": return t.labels;
+    case "priority": return t.priority;
+    case "title": return t.title;
+    case "body": return t.bodyNormalizedSha;
+  }
+}
+
 function mergeFields(local: TicketFields, server: TicketFields, serverChanged: Set<FieldName>): TicketFields {
   return {
     state: serverChanged.has("state") ? server.state : local.state,
@@ -732,6 +748,14 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     const localFields = fieldsFromLocal(parseTicketMd(md));
     serverCh = changedFields(serverFields, baseline);
     shared = new Set([...changedFields(localFields, baseline)].filter((f) => serverCh.has(f)));
+    // I-1: exclude CONVERGED fields (local === server, both agree regardless
+    // of the baseline) from the conflict set — they need no push and no
+    // conflict. Covers the failed-merge-push residue (previous cycle merged
+    // the server field, then pushOne threw; baselines stayed stale) and
+    // independent convergent edits.
+    for (const f of shared) {
+      if (fieldsConvergeOn(localFields, serverFields, f)) shared.delete(f);
+    }
     if (!shared.size && serverChanged && serverCh.size > 0) {
       // Disjoint merge: adopt the SERVER-changed fields into ticket.md
       // (byte-matched frontMatter emitter), keep the local-changed ones.
@@ -790,10 +814,12 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     return existsSync(f) && sha256(readFileSync(f, "utf8")) !== k.fileSha;
   });
   if (serverChanged && !legacyLocalChanged && !editedKids.length) {
-    // Server-only move (local file untouched): re-pull wins (local files
-    // refresh, baselines follow). With field baselines the disjoint-merge
-    // logic above only fires when the LOCAL file changed — server-only
-    // changes land here so pushOne never reverts the server side.
+    // Server-only move (local file untouched bytes-wise): re-pull wins —
+    // even when the merge above rewrote ticket.md to project the server
+    // fields into it (an untouched root has no local edits to keep, so the
+    // re-pull's full refresh supersedes the merge rewrite). With local
+    // edits (or edited children) this branch is skipped and the merged
+    // file flows into pushOne, which never reverts the server side.
     const pulled = await pullTicket(p, mount);
     await updateMounts((mounts) => {
       const hit = mounts.find((m) => m.ticket === mount.ticket);
@@ -884,6 +910,12 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
           const childLocal = fieldsFromLocal(parseTicketMd(readFileSync(childMd, "utf8")));
           childCh = changedFields(childServer, kidBaseline);
           const shared = new Set([...changedFields(childLocal, kidBaseline)].filter((f) => childCh.has(f)));
+          // I-1: exclude converged fields (local === server) from the child's
+          // conflict set — an earlier merge cycle's residue (or convergent
+          // edits) must not manufacture a conflict.
+          for (const f of shared) {
+            if (fieldsConvergeOn(childLocal, childServer, f)) shared.delete(f);
+          }
           childConflict = shared.size > 0 || childCh.size === 0; // empty serverCh = unknown server edit → legacy coarse guard
           if (!childConflict && childCh.size > 0) {
             // Disjoint (or local-untouched) child merge: adopt the

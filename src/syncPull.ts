@@ -43,13 +43,25 @@ export function sha256(s: string): string {
   return `sha256-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 12)}`;
 }
 
+/**
+ * Whitespace-insensitive body normalization (M4 Option B).
+ * - trailing whitespace is trimmed PER LINE (M-2: leading indentation of a
+ *   content line is NEVER touched — markdown indentation is semantic);
+ * - runs of 3+ newlines collapse to a markdown blank line (2);
+ * - leading/trailing BLANK LINES are dropped (not `.trim()` — that would
+ *   strip the first content line's indentation).
+ */
 export function normalizeBody(body: string): string {
-  return body
-    .split("\n")
-    .map((l) => l.replace(/\s+$/g, ""))
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return (
+    body
+      .split("\n")
+      .map((l) => l.replace(/\s+$/g, ""))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      // blank-line-only edge trim (never strips content indentation)
+      .replace(/^\n+/, "")
+      .replace(/\n+$/, "")
+  );
 }
 
 export function ticketSlug(title: string, fallback: string): string {

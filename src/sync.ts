@@ -25,7 +25,10 @@ export interface SyncMount {
   lastPoll: string | null; // daemon fills; null until first poll
   pending: number; // daemon fills; events awaiting push
   lastRev: string | null; // server updated_at at last pull/push (revision guard)
-  lastBodySha: string | null; // sha of ticket BODY text at last pull/push (body-push decision) — M4: normalized sha
+  // Deprecated role (M-3): kept populated for backward compatibility with
+  // older readers / registry rollback — body-change decisions now use the
+  // normalized sha field (lastBodyNormalizedSha / kids bodyNormalizedSha).
+  lastBodySha: string | null;
   lastFileSha: string | null; // sha of the whole ticket.md file (ANY local edit → conflict detection)
   kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string; state?: string; assignee?: string; labels?: string[]; priority?: string; title?: string; bodyNormalizedSha?: string }>; // sub-ticket baselines, rel = dir path relative to mount root (no registry rows for children)
   // M4 field-level baselines (optional for backward compat; populated after next pull/push)
