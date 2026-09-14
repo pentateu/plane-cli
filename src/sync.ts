@@ -168,7 +168,14 @@ export function writeEventsFile(dir: string, events: StoredEvent[]): void {
  * event file, reads FRESH inside the section, applies the mutator, writes.
  * Merge rule for concurrent shell appends (the documented agent path): rows
  * whose `op` is unknown to the mutator's read are PRESERVED — an append
- * landing mid-section survives the rewrite. `op` is the row identity.
+ * landing mid-section survives the rewrite.
+ *
+ * N2 (review r4, accepted micro-window): an agent O_APPEND landing in the
+ * microseconds between the post-mutate re-read and writeEventsFile is NOT
+ * in `fresh` and is lost. Agents append via `>>` (no lock); closing that
+ * window fully needs lock-holding appends (a watched FIFO or inotify), a
+ * later phase. Contract: appends are single-line JSON + \n, one write() —
+ * torn appends heal on the next read.
  */
 export async function updateEvents(dir: string, mutate: (events: StoredEvent[]) => void): Promise<void> {
   await withLock(join(metaDir(dir), "events.lock"), () => {

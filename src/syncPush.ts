@@ -552,8 +552,17 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       // gate inside pushOne consults the child's own journal (a foreign
       // claim on the parent must not block child edits, and a refusal must
       // name the child, not the parent).
+      // N3 (review r4): a falsy sequence_id must NOT fall back to the
+      // parent's handle — the child gate would consult the parent's journal.
+      // Without a seq there is no safe child handle: skip the child this
+      // cycle (the refusal names the real problem; next pull re-fetches
+      // sequence_id and the child syncs then).
       const childSeq = Number(childTicket.sequence_id ?? 0);
-      const childMount: SyncMount = { ...mount, uuid: kid.uuid, ticket: childSeq ? `${mount.ident}-${childSeq}` : mount.ticket, lastBodySha: kid.bodySha, lastFileSha: kid.fileSha };
+      if (!childSeq) {
+        pushed.push(`${kid.rel}: skipped (no sequence_id — gate cannot address the child safely)`);
+        continue;
+      }
+      const childMount: SyncMount = { ...mount, uuid: kid.uuid, ticket: `${mount.ident}-${childSeq}`, lastBodySha: kid.bodySha, lastFileSha: kid.fileSha };
       const cr = await pushOne(p, childMount, childDir, childTicket, childRev);
       comments += cr.comments;
       if (cr.pushed.length) pushed.push(`${kid.rel}: ${cr.pushed.join(",")}`);

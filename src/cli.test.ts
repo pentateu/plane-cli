@@ -165,7 +165,7 @@ function useDefaultRouter() {
     }
     const issueHit = path.match(ISSUE_RE);
     if (issueHit) {
-      const issue = ISSUES.find((i) => i.id === issueHit[1])!;
+      const issue = [...ISSUES, ...(globalThis.__extraIssues ?? [])].find((i) => i.id === issueHit[1])!;
       void globalThis.__method;
       return { status: 200, json: { ...issue, ...(globalThis.__patchBody ?? {}) } };
     }
@@ -2829,6 +2829,56 @@ describe("TC-95 review fixes — races, locks, pidfile, crash-safety", () => {
     expect(bodies.filter((b) => b.includes("# twin child")).length).toBe(2);
     // Each twin has its own .plane comment home (I5).
     for (const t of twins) expect(existsSync(join(sub, t, ".plane"))).toBeTrue();
+    delete (globalThis as any).__extraIssues;
+    await run(["sync", "--stop", "HT-66"]);
+  });
+});
+
+describe("TC-95 r4 follow-ups (N1/N3)", () => {
+  test("N1: a DEAD lock holder is stolen immediately (no 15s wait)", async () => {
+    const lockPath = join(tmpdir(), `plane-deadlock-${Date.now()}.lock`);
+    // Claim with a definitely-dead pid + fresh timestamp.
+    const victim = Bun.spawn(["true"]);
+    await victim.exited;
+    writeFileSync(lockPath, `${victim.pid} ${Date.now()}`);
+    // withLock must acquire within well under STALE_MS (5s) — the ESRCH
+    // steal fires on the first retry.
+    const t0 = Date.now();
+    await withLock(lockPath, () => {}, 2_000);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(existsSync(lockPath)).toBeFalse(); // released after our section
+  });
+
+  test("N1: a LIVE foreign holder is never stolen (fresh claim survives)", async () => {
+    const lockPath = join(tmpdir(), `plane-livelock-${Date.now()}.lock`);
+    writeFileSync(lockPath, `${process.pid} ${Date.now()}`); // us = alive
+    let ran = false;
+    let timedOut = false;
+    try {
+      await withLock(lockPath, () => { ran = true; }, 300); // short timeout: holder is ALIVE, must not steal
+    } catch (e) {
+      timedOut = String((e as Error).message).includes("lock timeout");
+    }
+    expect(ran).toBeFalse();
+    expect(timedOut).toBeTrue();
+    expect(existsSync(lockPath)).toBeTrue(); // untouched
+    rmSync(lockPath, { force: true });
+  });
+
+  test("N3: child with falsy sequence_id is skipped, not gated under the parent handle", async () => {
+    const dir = reviewMountDir("n3");
+    globalThis.__extraIssues = [
+      { id: "is-72", sequence_id: null, name: "no seq child", state: "st-todo", priority: "none", assignees: [], labels: [], parent: "is-66", description_html: "<p>x</p>", updated_at: "2026-09-13T08:00:00.000Z" },
+    ];
+    await run(["sync", "HT-66", "--dir", dir]);
+    // Edit the child locally to force a push attempt.
+    const childDir = readdirSync(join(dir, "sub-tickets")).find((d) => d.startsWith("no-seq-child"));
+    expect(childDir).toBeTruthy();
+    writeFileSync(join(dir, "sub-tickets", childDir!, "ticket.md"), readFileSync(join(dir, "sub-tickets", childDir!, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    const d = (await run(["sync", "HT-66", "--push-once"])) as Record<string, any>;
+    expect(d.pushed.some((s: string) => s.includes("no-seq-child") && s.includes("skipped"))).toBeTrue();
+    // No PATCH may have landed for the child.
+    expect(calls.some((c) => c.method === "PATCH" && /issues\/is-72\//.test(c.path))).toBeFalse();
     delete (globalThis as any).__extraIssues;
     await run(["sync", "--stop", "HT-66"]);
   });

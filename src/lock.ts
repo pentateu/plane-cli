@@ -15,20 +15,42 @@
 import { existsSync, mkdirSync, openSync, readFileSync, closeSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
-const STALE_MS = 15_000;
+/** N1 (review r4): STALE_MS must be SHORTER than the default timeout —
+ *  otherwise a holder that dies mid-section blocks waiters until the
+ *  timeout fires BEFORE the claim ever looks stale. 5s stale / 10s
+ *  timeout: a dead holder is stolen in ≤5s, a live-but-slow holder gets
+ *  the remaining 5s of wait budget. Sections are ms-short (no network),
+ *  so 5s is ~100x the longest legitimate section. */
+const STALE_MS = 5_000;
 const RETRY_MS = 25;
 
-/** True when the existing claim is dead-old enough to steal. */
+/** True when the existing claim is dead-old enough to steal. Also steals
+ *  IMMEDIATELY when the claim's pid is provably dead (N1: kill(pid,0)
+ *  ESRCH — no age wait for a corpse). Unparseable/garbage claims are
+ *  treated as stale (nothing live writes garbage). */
 function stealIfStale(lockPath: string): boolean {
+  let raw = "";
   try {
-    const raw = readFileSync(lockPath, "utf8");
-    const at = Number(raw.trim().split(" ")[1] ?? 0);
-    if (Number.isFinite(at) && at > 0 && Date.now() - at < STALE_MS) return false;
-    unlinkSync(lockPath);
-    return true;
+    raw = readFileSync(lockPath, "utf8");
   } catch {
     return !existsSync(lockPath); // vanished under us → free to try
   }
+  const parts = raw.trim().split(" ");
+  const pid = Number(parts[0]);
+  const at = Number(parts[1] ?? 0);
+  const ageFresh = Number.isFinite(at) && at > 0 && Date.now() - at < STALE_MS;
+  if (ageFresh && Number.isFinite(pid) && pid > 0) {
+    try {
+      process.kill(pid, 0); // alive (incl. our own pid) → leave it alone
+      return false;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ESRCH") return false; // EPERM etc: alive enough
+      // ESRCH: the holder is a CORPSE — steal now, whatever the age.
+    }
+  }
+  if (ageFresh && (!Number.isFinite(pid) || pid <= 0)) return false; // malformed but fresh: brief grace
+  unlinkSync(lockPath);
+  return true;
 }
 
 export async function withLock<T>(lockPath: string, fn: () => T | Promise<T>, timeoutMs = 10_000): Promise<T> {
