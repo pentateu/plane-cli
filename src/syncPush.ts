@@ -19,7 +19,7 @@
  * - C5 crash-safe posting: the §2.1 msg_id is PERSISTED before the POST
  *   (row status "posting"), flipped to synced after; restart reconcile
  *   adopts by stamp substring — no double-post, no lost post.
- * - Event-file rewrites ALL go through updateEvents (lock + merge, C2);
+ * - Event-file rewrites ALL go through withEventsLock (updateEvents delegates) (lock + merge, C2);
  *   registry rewrites through updateMounts (C1).
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -27,8 +27,8 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Plane, Raw } from "./api.ts";
 import { htmlToText } from "./api.ts";
-import { readEventsFile, updateMounts, updateEvents, withEventsLock, writeStatusFile, metaDir, countPendingEvents, type SyncMount, type StoredEvent } from "./sync.ts";
-import { adoptNewcomers, pullTicket, sha256, frontMatter, type SyncEvent } from "./syncPull.ts";
+import { readEventsFile, updateMounts, updateEvents, withEventsLock, writeStatusFile, countPendingEvents, type SyncMount, type StoredEvent } from "./sync.ts";
+import { adoptNewcomers, pullTicket, sha256, frontMatter, normalizeBody, type SyncEvent } from "./syncPull.ts";
 
 export interface PushRefusal {
   refused: true;
@@ -174,18 +174,133 @@ function renderConflictSnapshot(ticket: Raw, ctx: ConflictSnapshotCtx): string {
 async function refuseOnce(dir: string, ticket: string, rule: string, detail: string, rel: string | null = null): Promise<void> {
   await updateEvents(dir, (events) => {
     const marker = `${rule}: ${detail}`;
-    const already = (events as SyncEvent[]).some((e) => {
-      if (e.status !== "conflict") return false;
-      if (e.meta?.kind === "push-conflict") {
-        return e.meta.ticket === ticket && (e.meta.rel ?? null) === (rel ?? null) && e.body.includes(marker);
-      }
-      return e.body.includes(marker) && e.body.includes(`on ${ticket}`);
-    });
-    if (!already) {
-      events.push(conflictNotice(ticket, `${rule}: ${detail}`, rel));
-    }
+    if (isConflictAlready(events as SyncEvent[], ticket, rel, marker)) return undefined;
+    events.push(conflictNotice(ticket, `${rule}: ${detail}`, rel));
     return undefined;
   });
+}
+
+function isConflictAlready(events: SyncEvent[], ticket: string, rel: string | null, marker: string): boolean {
+  return events.some((e) => {
+    if (e.status !== "conflict") return false;
+    if (e.meta?.kind === "push-conflict") {
+      return e.meta.ticket === ticket && (e.meta.rel ?? null) === (rel ?? null) && e.body.includes(marker);
+    }
+    return e.body.includes(marker) && e.body.includes(`on ${ticket}`);
+  });
+}
+
+// ── M4 field-level merge helpers ──
+type FieldName = "state" | "assignee" | "labels" | "priority" | "title" | "body";
+interface TicketFields {
+  state: string;
+  assignee: string;
+  labels: string[];
+  priority: string;
+  title: string;
+  body: string; // raw body text
+  bodyNormalizedSha: string;
+}
+
+function fieldsFromServer(ticket: Raw, maps: { stateById: Map<string, string>; labelById: Map<string, string>; seatByMember: Map<string, string> }): TicketFields {
+  const stateToken = maps.stateById.get(String(ticket.state)) ?? String(ticket.state);
+  const assignees = (Array.isArray(ticket.assignees) ? ticket.assignees : []).map((a: unknown) =>
+    typeof a === "string" ? a : (a as Raw)?.id,
+  ).filter((s: unknown): s is string => typeof s === "string" && s.length > 0);
+  const seat = assignees.length ? (maps.seatByMember.get(assignees[0]!) ?? assignees[0]!) : "";
+  const labels = (Array.isArray(ticket.labels) ? ticket.labels : []).map((l: unknown) => {
+    const id = typeof l === "string" ? l : (l as Raw)?.id;
+    return typeof id === "string" ? (maps.labelById.get(id) ?? id) : null;
+  }).filter((s: unknown): s is string => typeof s === "string").sort();
+  const priority = String(ticket.priority ?? "none");
+  const title = String(ticket.name ?? "");
+  const body = htmlToText(String(ticket.description_html ?? ""));
+  const bodyNormalizedSha = sha256(normalizeBody(body));
+  return { state: stateToken, assignee: seat, labels, priority, title, body, bodyNormalizedSha };
+}
+
+function fieldsFromLocal(parsed: { fm: FrontMatter; title: string; body: string }): TicketFields {
+  return {
+    state: parsed.fm.state,
+    assignee: parsed.fm.assignee,
+    labels: [...parsed.fm.labels].sort(),
+    priority: parsed.fm.priority,
+    title: parsed.title,
+    body: parsed.body,
+    bodyNormalizedSha: sha256(normalizeBody(parsed.body)),
+  };
+}
+
+function fieldsFromBaselineMount(mount: SyncMount): TicketFields | null {
+  if (mount.lastState === undefined || mount.lastAssignee === undefined || mount.lastLabels === undefined || mount.lastPriority === undefined || mount.lastTitle === undefined || mount.lastBodyNormalizedSha === undefined) return null;
+  return {
+    state: mount.lastState,
+    assignee: mount.lastAssignee,
+    labels: [...mount.lastLabels].sort(),
+    priority: mount.lastPriority,
+    title: mount.lastTitle,
+    body: "", // not needed for baseline comparison (only sha used)
+    bodyNormalizedSha: mount.lastBodyNormalizedSha,
+  };
+}
+
+function fieldsFromBaselineKid(kid: { state?: string; assignee?: string; labels?: string[]; priority?: string; title?: string; bodyNormalizedSha?: string; bodySha?: string }): TicketFields | null {
+  if (kid.state === undefined || kid.assignee === undefined || kid.labels === undefined || kid.priority === undefined || kid.title === undefined) return null;
+  const bodySha = kid.bodyNormalizedSha ?? kid.bodySha;
+  if (bodySha === undefined) return null;
+  return {
+    state: kid.state,
+    assignee: kid.assignee,
+    labels: [...kid.labels].sort(),
+    priority: kid.priority,
+    title: kid.title,
+    body: "",
+    bodyNormalizedSha: bodySha,
+  };
+}
+
+function changedFields(a: TicketFields, b: TicketFields): Set<FieldName> {
+  const out = new Set<FieldName>();
+  if (a.state !== b.state) out.add("state");
+  if (a.assignee !== b.assignee) out.add("assignee");
+  if (JSON.stringify(a.labels) !== JSON.stringify(b.labels)) out.add("labels");
+  if (a.priority !== b.priority) out.add("priority");
+  if (a.title !== b.title) out.add("title");
+  if (a.bodyNormalizedSha !== b.bodyNormalizedSha) out.add("body");
+  return out;
+}
+
+/** I-1: do both sides now agree on this field (converged, regardless of the baseline)? */
+function fieldsConvergeOn(local: TicketFields, server: TicketFields, field: FieldName): boolean {
+  return JSON.stringify(changedFieldOf(local, field)) === JSON.stringify(changedFieldOf(server, field));
+}
+
+function changedFieldOf(t: TicketFields, field: FieldName): unknown {
+  switch (field) {
+    case "state": return t.state;
+    case "assignee": return t.assignee;
+    case "labels": return t.labels;
+    case "priority": return t.priority;
+    case "title": return t.title;
+    case "body": return t.bodyNormalizedSha;
+  }
+}
+
+function mergeFields(local: TicketFields, server: TicketFields, serverChanged: Set<FieldName>): TicketFields {
+  return {
+    state: serverChanged.has("state") ? server.state : local.state,
+    assignee: serverChanged.has("assignee") ? server.assignee : local.assignee,
+    labels: serverChanged.has("labels") ? server.labels : local.labels,
+    priority: serverChanged.has("priority") ? server.priority : local.priority,
+    title: serverChanged.has("title") ? server.title : local.title,
+    body: serverChanged.has("body") ? server.body : local.body,
+    bodyNormalizedSha: serverChanged.has("body") ? server.bodyNormalizedSha : local.bodyNormalizedSha,
+  };
+}
+
+function writeMergedTicketMd(dir: string, merged: TicketFields): void {
+  const md = `${frontMatter(merged.state, merged.assignee, merged.labels, merged.priority)}# ${merged.title}\n\n${merged.body}\n`;
+  writeFileSync(join(dir, "ticket.md"), md);
 }
 
 /**
@@ -253,14 +368,6 @@ function intentClaimBlock(ticket: string, claim: { seat: string; iso: string; op
 
 function readEvents(dir: string): SyncEvent[] {
   return readEventsFile(dir) as SyncEvent[];
-}
-
-/** Rebuild the derived comments.json snapshot from the events file. */
-function writeCommentsJson(dir: string, events: SyncEvent[]): void {
-  writeFileSync(
-    join(metaDir(dir), "comments.json"),
-    JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
-  );
 }
 
 function writeSnapshotAtomic(conflictPath: string, content: string): void {
@@ -365,7 +472,6 @@ export async function reconcileEvents(p: Plane, mount: SyncMount): Promise<{ ado
     return undefined;
   });
   const after = readEvents(dir) as SyncEvent[];
-  writeCommentsJson(dir, after);
   return { adopted, stillPending: after.filter((e) => e.status === "pending" || e.status === "posting").length };
 }
 
@@ -411,7 +517,10 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw, gua
     }
   }
   // Labels (board names → ids).
-  if (fm.labels.length) {
+  // C1: [] is an intentional clear — always reconcile labels (PATCH empty id
+  // list when local cleared). Skipping the PATCH while storing [] as the
+  // baseline caused the next server move to silently revert the clear.
+  if (fm.labels !== undefined) {
     const lm = await p.labelMap(mount.projectId);
     const ids: string[] = [];
     for (const name of fm.labels) {
@@ -447,8 +556,11 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw, gua
     patch.name = title;
     pushed.push("title");
   }
-  const bodySha = sha256(body);
-  if (bodySha !== mount.lastBodySha) {
+  const bodySha = sha256(normalizeBody(body));
+  const serverBodyNormalizedSha = sha256(normalizeBody(htmlToText(String(ticket.description_html ?? ""))));
+  if (bodySha !== serverBodyNormalizedSha) {
+    // Body is compared normalized: whitespace-only edits do not count as change.
+    // Push only if local normalized differs from server normalized.
     patch.description_html = body.split("\n").map((l) => `<p>${esc(l) || "<br>"}</p>`).join("");
     pushed.push("body");
   }
@@ -525,7 +637,8 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw, gua
     });
     posted++;
   }
-  if (posted) writeCommentsJson(dir, readEvents(dir));
+  // (withEventsLock/updateEvents already rewrote comments.json atomically —
+  // single-writer rule, no extra outside-lock write.)
 
   const after = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`)) as Raw;
   return { pushed, comments: posted, rev: String(after.updated_at ?? ""), bodySha };
@@ -577,10 +690,11 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       }
       return undefined;
     });
-    if (added) writeCommentsJson(dir, readEvents(dir));
+    // (updateEvents already rewrote comments.json atomically inside the lock
+    // — single-writer rule, no extra outside-lock write.)
   }
-  const md = readFileSync(join(dir, "ticket.md"), "utf8");
-  const localChanged = sha256(md) !== mount.lastFileSha;
+  let md = readFileSync(join(dir, "ticket.md"), "utf8");
+  let mdShaAtRead = sha256(md);
   const serverChanged = mount.lastRev !== null && serverRev !== mount.lastRev;
   // M5: --force = local-wins parent only, --force-all = local-wins whole tree.
   const localForce = Boolean(opts?.force || opts?.forceAll);
@@ -621,7 +735,80 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     return conflictMaps;
   }
 
-  if (serverChanged && localChanged && !localForce) {
+  // ── M4 field-level merge (TC-108) ──
+  // Compare the local file and the server ticket against the field
+  // baselines; conflict fires only when the SAME field moved on both
+  // sides. Disjoint edits auto-merge. Back-compat: a mount WITHOUT the
+  // field baselines (pre-upgrade row) uses the legacy coarse whole-file
+  // guard — never silently merge on unknown baselines; the next pull or
+  // push populates the fields and field-level kicks in.
+  const baseline = fieldsFromBaselineMount(mount);
+  let legacyLocalChanged = sha256(md) !== mount.lastFileSha;
+  let serverCh: Set<FieldName> = new Set();
+  let shared: Set<FieldName> = new Set();
+  // I1: hoisted for the coarse-fallback below (whitespace-only edits have no
+  // field dirtiness even though the raw whole-file sha moved).
+  let localFields: TicketFields | null = null;
+  // I2: merge residue tracking — restored iff pushOne's C6 guard aborts.
+  let preMergeRootMd: string | null = null;
+  let didRootMerge = false;
+  let expectedRootSha = mdShaAtRead;
+  if (baseline) {
+    const maps = await getConflictMaps();
+    // C2: re-check ticket.md — an external save landing during the awaits
+    // above must not be lost by the merge write below. One extra
+    // readFileSync+sha256; on move, refresh our view and recompute from it.
+    try {
+      const mdFresh = readFileSync(join(dir, "ticket.md"), "utf8");
+      if (sha256(mdFresh) !== mdShaAtRead) {
+        md = mdFresh;
+        mdShaAtRead = sha256(md);
+        expectedRootSha = mdShaAtRead;
+      }
+    } catch { /* file vanished — let later reads throw the real error */ }
+    legacyLocalChanged = sha256(md) !== mount.lastFileSha;
+    const serverFields = fieldsFromServer(ticket, maps);
+    localFields = fieldsFromLocal(parseTicketMd(md));
+    serverCh = changedFields(serverFields, baseline);
+    shared = new Set([...changedFields(localFields, baseline)].filter((f) => serverCh.has(f)));
+    // I-1: exclude CONVERGED fields (local === server, both agree regardless
+    // of the baseline) from the conflict set — they need no push and no
+    // conflict. Covers the failed-merge-push residue (previous cycle merged
+    // the server field, then pushOne threw; baselines stayed stale) and
+    // independent convergent edits.
+    for (const f of shared) {
+      if (fieldsConvergeOn(localFields, serverFields, f)) shared.delete(f);
+    }
+    if (!shared.size && serverChanged && serverCh.size > 0) {
+      // Disjoint merge: adopt the SERVER-changed fields into ticket.md
+      // (byte-matched frontMatter emitter), keep the local-changed ones.
+      // pushOne below then pushes only the local-changed fields (it diffs
+      // each field against the server GET).
+      // C2: no await sits between the re-check above and this write, so the
+      // fresh view is still current — safe to persist.
+      preMergeRootMd = md;
+      writeMergedTicketMd(dir, mergeFields(localFields, serverFields, serverCh));
+      didRootMerge = true;
+      try {
+        expectedRootSha = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
+      } catch {
+        expectedRootSha = mdShaAtRead;
+      }
+    }
+  }
+  // Conflict decision:
+  //  - legacy mounts (no field baselines): coarse whole-file rule.
+  //  - field baselines but NO known server field changed (unknown server
+  //    edit / rev-only bump): field-level fallback — conflict only when a
+  //    tracked field actually moved locally (I1: a whitespace-only edit plus
+  //    a rev-only bump must not conflict).
+  //  - field baselines with known server field changes: conflict only on a
+  //    SHARED field (both sides moved the same one).
+  // I1: fallback uses field dirtiness, not the raw whole-file sha.
+  const localFieldDirty = baseline && localFields ? changedFields(localFields, baseline).size > 0 : legacyLocalChanged;
+  const conflictRoot = serverChanged && (baseline ? (serverCh.size > 0 ? shared.size > 0 : localFieldDirty) : legacyLocalChanged);
+
+  if (serverChanged && conflictRoot && !localForce) {
     // Conflict: local kept, server side aside, ONE notice, push nothing.
     // --force / --force-all (manual `sync TC-N --push-once` only, never the daemon)
     // skips this branch: local wins, baselines follow the push below.
@@ -629,14 +816,7 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     // 5s should not refetch/render/rewrite when notice already exists.
     const detail = `server rev ${serverRev} vs local edits (base ${mount.lastRev})`;
     const marker = `conflict: ${detail}`;
-    const alreadyLocal = (readEventsFile(dir) as SyncEvent[]).some((e) => {
-      if (e.status !== "conflict") return false;
-      if (e.meta?.kind === "push-conflict") {
-        return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === null && e.body.includes(marker);
-      }
-      return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
-    });
-    if (alreadyLocal && existsSync(join(dir, "ticket.md.conflict"))) {
+    if (isConflictAlready(readEvents(dir), mount.ticket, null, marker) && existsSync(join(dir, "ticket.md.conflict"))) {
       return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
     }
     // I1: snapshot + notice row + comments.json land atomically inside ONE withEventsLock.
@@ -652,14 +832,7 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       const conflictPath = join(dir, "ticket.md.conflict");
       writeSnapshotAtomic(conflictPath, snapshot);
       const evs = events as SyncEvent[];
-      const already = evs.some((e) => {
-        if (e.status !== "conflict") return false;
-        if (e.meta?.kind === "push-conflict") {
-          return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === null && e.body.includes(marker);
-        }
-        return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
-      });
-      if (!already) evs.push(conflictNotice(mount.ticket, marker, null));
+      if (!isConflictAlready(evs, mount.ticket, null, marker)) evs.push(conflictNotice(mount.ticket, marker, null));
     });
     return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
   }
@@ -676,8 +849,27 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     const f = join(dir, k.rel, "ticket.md");
     return existsSync(f) && sha256(readFileSync(f, "utf8")) !== k.fileSha;
   });
-  if (serverChanged && !localChanged && !editedKids.length) {
-    // Server-only move: re-pull wins (local files refresh, baselines follow).
+  // C2: re-check before the server-only re-pull — the listIssues await above
+  // is a window where an external save could land; re-pulling over it would
+  // clobber the save. One extra readFileSync+sha256; on move, treat as
+  // locally edited (block the re-pull, let the merged/fresh file flow to
+  // pushOne and the next cycle).
+  try {
+    const cur = readFileSync(join(dir, "ticket.md"), "utf8");
+    if (sha256(cur) !== expectedRootSha) {
+      md = cur;
+      mdShaAtRead = sha256(cur);
+      legacyLocalChanged = sha256(cur) !== mount.lastFileSha;
+      expectedRootSha = mdShaAtRead;
+    }
+  } catch { /* file vanished — pullTicket below surfaces the real error */ }
+  if (serverChanged && !legacyLocalChanged && !editedKids.length) {
+    // Server-only move (local file untouched bytes-wise): re-pull wins —
+    // even when the merge above rewrote ticket.md to project the server
+    // fields into it (an untouched root has no local edits to keep, so the
+    // re-pull's full refresh supersedes the merge rewrite). With local
+    // edits (or edited children) this branch is skipped and the merged
+    // file flows into pushOne, which never reverts the server side.
     const pulled = await pullTicket(p, mount);
     await updateMounts((mounts) => {
       const hit = mounts.find((m) => m.ticket === mount.ticket);
@@ -685,6 +877,12 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
         hit.lastRev = pulled.rev;
         hit.lastBodySha = pulled.bodySha;
         hit.lastFileSha = pulled.fileSha;
+        hit.lastState = pulled.state;
+        hit.lastAssignee = pulled.assignee;
+        hit.lastLabels = pulled.labels;
+        hit.lastPriority = pulled.priority;
+        hit.lastTitle = pulled.title;
+        hit.lastBodyNormalizedSha = pulled.bodyNormalizedSha;
         hit.kids = pulled.kids;
         hit.lastPoll = new Date().toISOString();
       }
@@ -692,22 +890,47 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     });
     return { ticket: mount.ticket, pushed: ["pulled"], comments: 0, rev: pulled.rev };
   }
-  const r = await pushOne(p, mount, dir, ticket, serverRev);
+  // I2: the disjoint merge above persisted before pushOne's C6 rev-guard. A
+  // C6 abort must not leave the stale merged file + stale baselines (next
+  // cycle spurious same-field conflict and stale --force push). Revert to
+  // the pre-merge content iff the file still holds our merge (an external
+  // save after the merge wins over the revert). Non-C6 throws (e.g. PATCH
+  // failure) keep the residue — the I-1 converged-field exclusion handles it.
+  let r: { pushed: string[]; comments: number; rev: string; bodySha: string };
+  try {
+    r = await pushOne(p, mount, dir, ticket, serverRev);
+  } catch (e) {
+    const rule = (e as { refusal?: { rule?: string } })?.refusal?.rule;
+    if (rule === "server-moved" && didRootMerge && preMergeRootMd !== null) {
+      try {
+        const cur = readFileSync(join(dir, "ticket.md"), "utf8");
+        if (sha256(cur) === expectedRootSha) {
+          writeFileSync(join(dir, "ticket.md"), preMergeRootMd);
+          expectedRootSha = sha256(preMergeRootMd);
+        }
+      } catch { /* best-effort revert — next cycle re-evaluates */ }
+    }
+    throw e;
+  }
 
   // Adopt server-side newcomers (pulled into slug dirs + baselined), then
   // recurse into known children (registry baselines; unknown local dirs are
   // creation flow — a later phase, ignored here).
   const adopted = await adoptNewcomers(p, mount, newcomers);
   const pushed = [...r.pushed, ...adopted.map((k) => `+${k.rel}`)];
-  if (localForce && serverChanged && localChanged) pushed.unshift("forced");
+  if (localForce && serverChanged && legacyLocalChanged) pushed.unshift("forced");
   // M5: force-cleanup symmetry — the force push just landed, so the root's
   // prior conflict litter (if any) resolves: delete its snapshot, flip its
   // push-conflict rows to "resolved". Child rows are NOT touched here (a
   // parent-only --force must leave newly filed child conflicts active).
-  if (localForce && serverChanged && localChanged) {
+  if (localForce && serverChanged && legacyLocalChanged) {
     await resolveForceCleanup(dir, join(dir, "ticket.md.conflict"), mount.ticket, null);
   }
   let comments = r.comments;
+  // M4: refresh the field-level baselines from the file we just pushed —
+  // after pushOne, the local front-matter matches the server (any differing
+  // fields were PATCHed), and the normalized body sha matches r.bodySha.
+  const pushedFields = fieldsFromLocal(parseTicketMd(readFileSync(join(dir, "ticket.md"), "utf8")));
   // I10: persist the parent result + adopted baselines BEFORE the child
   // loop — a child-loop throw must not orphan the parent's landed work.
   let kids = [...(mount.kids ?? []), ...adopted];
@@ -717,6 +940,12 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       hit.lastRev = r.rev;
       hit.lastBodySha = r.bodySha;
       hit.lastFileSha = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
+      hit.lastState = pushedFields.state;
+      hit.lastAssignee = pushedFields.assignee;
+      hit.lastLabels = pushedFields.labels;
+      hit.lastPriority = pushedFields.priority;
+      hit.lastTitle = pushedFields.title;
+      hit.lastBodyNormalizedSha = r.bodySha;
       hit.kids = kids;
       hit.lastPoll = new Date().toISOString();
       hit.pending = countPendingEvents(dir);
@@ -728,6 +957,11 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     const childMd = join(childDir, "ticket.md");
     if (!existsSync(childMd)) continue;
     if (sha256(readFileSync(childMd, "utf8")) === kid.fileSha) continue;
+    // I2: per-child merge residue for C6 revert — hoisted so the pushOne
+    // catch below can restore the pre-merge file on a child C6 abort.
+    let preMergeChildMd: string | null = null;
+    let didChildMerge = false;
+    let expectedChildSha: string | null = null;
     try {
       const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
       const childRev = String(childTicket.updated_at ?? "");
@@ -740,42 +974,93 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       if (childRev !== kid.rev && !opts?.forceAll) {
         const detail = `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`;
         const marker = `conflict: ${detail}`;
-        const alreadyChild = (readEventsFile(dir) as SyncEvent[]).some((e) => {
-          if (e.status !== "conflict") return false;
-          if (e.meta?.kind === "push-conflict") {
-            return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === kid.rel && e.body.includes(marker);
+        // ── M4 child field-level: conflict only when the SAME kid field
+        // moved on both sides. Back-compat: kids without the field fields
+        // keep the legacy rev-bump rule below.
+        const kidBaseline = fieldsFromBaselineKid(kid);
+        let childCh: Set<FieldName> = new Set(); // server-changed kid fields
+        let childConflict: boolean;
+        if (kidBaseline) {
+          const maps = await getConflictMaps();
+          const childServer = fieldsFromServer(childTicket, maps);
+          // C2: the child file read lands AFTER the await above, so it is
+          // fresh; snapshot its sha so the write below can re-check it (one
+          // extra readFileSync+sha256, no extra GETs).
+          let childRaw = readFileSync(childMd, "utf8");
+          let childShaAtRead = sha256(childRaw);
+          let childLocal = fieldsFromLocal(parseTicketMd(childRaw));
+          childCh = changedFields(childServer, kidBaseline);
+          let shared = new Set([...changedFields(childLocal, kidBaseline)].filter((f) => childCh.has(f)));
+          // I-1: exclude converged fields (local === server) from the child's
+          // conflict set — an earlier merge cycle's residue (or convergent
+          // edits) must not manufacture a conflict.
+          for (const f of shared) {
+            if (fieldsConvergeOn(childLocal, childServer, f)) shared.delete(f);
           }
-          return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
-        });
-        if (alreadyChild && existsSync(`${childMd}.conflict`)) {
+          // I1: empty serverCh = unknown server edit → conflict only when a
+          // tracked child field actually moved locally (whitespace-only child
+          // edit + rev-only bump must not conflict).
+          const localChildFieldChanged = changedFields(childLocal, kidBaseline).size > 0;
+          childConflict = shared.size > 0 || (childCh.size === 0 && localChildFieldChanged);
+          if (!childConflict && childCh.size > 0) {
+            // Disjoint (or local-untouched) child merge: adopt the
+            // server-changed fields, keep the local edits; pushOne lands only
+            // the local-changed fields.
+            // C2: re-check before the write; on move refresh and re-evaluate
+            // instead of clobbering the concurrent save.
+            try {
+              const curRaw = readFileSync(childMd, "utf8");
+              if (sha256(curRaw) !== childShaAtRead) {
+                childRaw = curRaw;
+                childShaAtRead = sha256(childRaw);
+                childLocal = fieldsFromLocal(parseTicketMd(childRaw));
+                const freshLocalCh = changedFields(childLocal, kidBaseline);
+                shared = new Set([...freshLocalCh].filter((f) => childCh.has(f)));
+                for (const f of shared) {
+                  if (fieldsConvergeOn(childLocal, childServer, f)) shared.delete(f);
+                }
+                const freshDirty = freshLocalCh.size > 0;
+                childConflict = shared.size > 0 || (childCh.size === 0 && freshDirty);
+              }
+            } catch { /* vanished — write below surfaces it */ }
+            if (!childConflict) {
+              preMergeChildMd = childRaw;
+              writeMergedTicketMd(childDir, mergeFields(childLocal, childServer, childCh));
+              didChildMerge = true;
+              try {
+                expectedChildSha = sha256(readFileSync(childMd, "utf8"));
+              } catch {
+                expectedChildSha = childShaAtRead;
+              }
+            }
+          }
+        } else {
+          childConflict = true; // legacy: any rev-vs-edit mismatch conflicts
+        }
+        if (childConflict) {
+          if (isConflictAlready(readEvents(dir), mount.ticket, kid.rel, marker) && existsSync(`${childMd}.conflict`)) {
+            pushed.push(`${kid.rel}: conflict (server rev ${childRev} vs local edits — resolve child or re-run with --force-all)`);
+            continue;
+          }
+          const maps = await getConflictMaps();
+          const snapshot = renderConflictSnapshot(childTicket, {
+            handle: mount.ticket,
+            baseRev: kid.rev,
+            serverRev: childRev,
+            at: new Date().toISOString(),
+            resolveHandle: mount.ticket,
+            childRel: kid.rel,
+            ...maps,
+          });
+          await withEventsLock(dir, (events) => {
+            const conflictPath = `${childMd}.conflict`;
+            writeSnapshotAtomic(conflictPath, snapshot);
+            const evs = events as SyncEvent[];
+            if (!isConflictAlready(evs, mount.ticket, kid.rel, marker)) evs.push(conflictNotice(mount.ticket, marker, kid.rel));
+          });
           pushed.push(`${kid.rel}: conflict (server rev ${childRev} vs local edits — resolve child or re-run with --force-all)`);
           continue;
         }
-        const maps = await getConflictMaps();
-        const snapshot = renderConflictSnapshot(childTicket, {
-          handle: mount.ticket,
-          baseRev: kid.rev,
-          serverRev: childRev,
-          at: new Date().toISOString(),
-          resolveHandle: mount.ticket,
-          childRel: kid.rel,
-          ...maps,
-        });
-        await withEventsLock(dir, (events) => {
-          const conflictPath = `${childMd}.conflict`;
-          writeSnapshotAtomic(conflictPath, snapshot);
-          const evs = events as SyncEvent[];
-          const already = evs.some((e) => {
-            if (e.status !== "conflict") return false;
-            if (e.meta?.kind === "push-conflict") {
-              return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === kid.rel && e.body.includes(marker);
-            }
-            return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
-          });
-          if (!already) evs.push(conflictNotice(mount.ticket, marker, kid.rel));
-        });
-        pushed.push(`${kid.rel}: conflict (server rev ${childRev} vs local edits — resolve child or re-run with --force-all)`);
-        continue;
       }
       // I4: the child mount carries the CHILD's handle — the intent-claim
       // gate inside pushOne consults the child's own journal (a foreign
@@ -803,9 +1088,40 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       }
       const afterChild = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
       const newFileSha = sha256(readFileSync(childMd, "utf8"));
-      const newSha = sha256(parseTicketMd(readFileSync(childMd, "utf8")).body);
-      kids = kids.map((k) => (k.uuid === kid.uuid ? { ...k, rev: String(afterChild.updated_at ?? ""), bodySha: newSha, fileSha: newFileSha } : k));
+      const newParsed = parseTicketMd(readFileSync(childMd, "utf8"));
+      const newSha = sha256(normalizeBody(newParsed.body));
+      kids = kids.map((k) =>
+        k.uuid === kid.uuid
+          ? {
+              ...k,
+              rev: String(afterChild.updated_at ?? ""),
+              bodySha: newSha,
+              fileSha: newFileSha,
+              // M4: refresh the kid's field baselines too (post-push the local
+              // front-matter matches the server).
+              state: newParsed.fm.state,
+              assignee: newParsed.fm.assignee,
+              labels: [...newParsed.fm.labels].sort(),
+              priority: newParsed.fm.priority,
+              title: newParsed.title,
+              bodyNormalizedSha: newSha,
+            }
+          : k,
+      );
     } catch (e) {
+      // I2: child C6 abort must not leave the stale merged child file.
+      // Revert to pre-merge iff the file still holds our merge (an external
+      // save after the merge wins). Non-C6 throws keep the residue for the
+      // I-1 converged-field exclusion.
+      const crule = (e as { refusal?: { rule?: string } })?.refusal?.rule;
+      if (crule === "server-moved" && didChildMerge && preMergeChildMd !== null) {
+        try {
+          const cur = readFileSync(childMd, "utf8");
+          if (expectedChildSha !== null && sha256(cur) === expectedChildSha) {
+            writeFileSync(childMd, preMergeChildMd);
+          }
+        } catch { /* best-effort — next cycle re-evaluates */ }
+      }
       // I2/I10: a poisoned child records its refusal and never kills the
       // parent cycle (the refusal row is already filed by refuseOnce).
       const message = String((e as Error)?.message ?? e).slice(0, 200);

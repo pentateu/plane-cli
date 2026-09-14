@@ -608,7 +608,7 @@ export async function run(argv: string[]): Promise<unknown> {
         await updateMounts((mounts) => {
           const kept = mounts.filter((m) => m.ticket.toUpperCase() !== handle);
           mounts.length = 0;
-          mounts.push(...kept, { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids });
+          mounts.push(...kept, { ...base, lastPoll: new Date().toISOString(), lastRev: pulled.rev, lastBodySha: pulled.bodySha, lastFileSha: pulled.fileSha, kids: pulled.kids, lastState: pulled.state, lastAssignee: pulled.assignee, lastLabels: pulled.labels, lastPriority: pulled.priority, lastTitle: pulled.title, lastBodyNormalizedSha: pulled.bodyNormalizedSha });
           return undefined;
         });
         const daemon = ensureSupervisor();
