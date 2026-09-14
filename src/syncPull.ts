@@ -29,7 +29,7 @@ export interface SyncEvent {
   body: string;
   body_sha: string;
   at: string;
-  status: "pending" | "posting" | "synced" | "conflict";
+  status: "pending" | "posting" | "synced" | "conflict" | "resolved";
   /** §2.1 msg_id the daemon stamped the post with (persisted BEFORE the
    *  POST — review C5); the NATS outbox (§4.5) reuses it as Nats-Msg-Id. */
   entry?: string;
@@ -206,7 +206,8 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     const prior = stored as SyncEvent[];
     const surviving = prior.filter((e) => e.status === "pending" || e.status === "posting");
     kept = surviving.length;
-    const priorSynced = prior.filter((e) => e.status === "synced");
+    // "resolved" rows are terminal audit — they survive pulls like synced rows.
+    const priorSynced = prior.filter((e) => e.status === "synced" || e.status === "resolved");
     const knownIds = new Set(priorSynced.filter((e) => e.id).map((e) => e.id as string));
     const list = (((rawComments as Raw).results ?? rawComments) as Raw[]).slice()
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
@@ -227,7 +228,7 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
         status: "synced",
       } as SyncEvent);
     }
-    // Prior synced rows keep their ops (stable dedup keys); fresh server
+    // Prior synced/resolved rows keep their ops (stable dedup keys); fresh server
     // rows append in time order; local pending/posting rows stay verbatim;
     // conflict rows are dropped (resolved by this pull).
     prior.length = 0;
