@@ -1,0 +1,166 @@
+{
+  "v": 1,
+  "loops": {
+    "page-edit": {
+      "steps": [
+        "pull the page (ot pull <page> --out <dir>)",
+        "edit the local md file",
+        "validate (R-12: mermaid renders, json parses, fence parity, byte-claims)",
+        "push with revision guard (ot push <page> <file> --publish --expect-rev <updatedAt>)",
+        "round-trip verify (re-pull + diff byte-identical)"
+      ],
+      "rules": [
+        "R-11 local-first loop is the standard for ALL page edits",
+        "R-12 pre-push validation is mandatory"
+      ],
+      "governing": [
+        "§29.2 (hub ab0cf76a-ac52-4c85-9b37-9f389ce391c8)",
+        "R-11/R-12 (§19.3, P9)"
+      ]
+    },
+    "comment-read": {
+      "steps": [
+        "read human feedback in one call (ot comment list <page> --unanswered)",
+        "act in a LOCAL review file, never the page thread",
+        "reply via verdict or wake, never an agent page comment"
+      ],
+      "rules": [
+        "R-14 one call: comment list <page> --unanswered",
+        "R-13 agents never comment pages"
+      ],
+      "governing": [
+        "§29.3 (hub)",
+        "R-13/R-14 (§19.3, P9)"
+      ]
+    },
+    "ticket-work": {
+      "steps": [
+        "check blockers (plane list --blocked-by <id>)",
+        "claim the ticket (plane claim <id> --comment \"starting\")",
+        "work the ticket; record progress on Plane",
+        "hand over for review (handover)",
+        "verdict loop until APPROVE"
+      ],
+      "rules": [
+        "R-13 agents never comment Outline pages",
+        "R-7 --dry-run covers every mutating verb",
+        "R-1/R-4 no silent truncation; compact JSON on machine reads"
+      ],
+      "governing": [
+        "§2 tool action map + §13 manager action tools (P1 d9a264d3-fce1-48f0-9ea6-668463832ff6)",
+        "R-13 (§19.3, P9)"
+      ]
+    },
+    "ticket-machine": {
+      "steps": [
+        "start_ticket (claim + spawn + journal pair)",
+        "work the ticket; the journal is truth",
+        "handover (sha == tip, clean worktree)",
+        "verdict (APPROVE / WITH_CHANGES / BLOCK)",
+        "approve (test cases + merge gate)",
+        "merge-approved"
+      ],
+      "rules": [
+        "R-5 handover/wake paths first",
+        "R-7 --dry-run covers every mutating verb"
+      ],
+      "governing": [
+        "§1.2–§1.6 (hub) + §10/§12 wake payloads (P2 dbc8b736-afd1-47f3-81c3-2b62e9b4af93) + §28 roster/tell (P6 d237f715-d9ab-44a3-ab77-34819a33cd5f)"
+      ]
+    }
+  },
+  "verbs": [
+    {"cli": "ot", "verb": "pull", "loop": "page-edit", "step": 1, "perVerb": true},
+    {"cli": "ot", "verb": "page get", "loop": "page-edit", "step": 1, "perVerb": true},
+    {"cli": "ot", "verb": "page set", "loop": "page-edit", "step": 4, "perVerb": true},
+    {"cli": "ot", "verb": "push", "loop": "page-edit", "step": 4, "perVerb": true},
+    {"cli": "ot", "verb": "history list", "loop": "page-edit", "step": 5, "perVerb": true},
+    {"cli": "ot", "verb": "comment list", "loop": "comment-read", "step": 1, "perVerb": true},
+    {"cli": "ot", "verb": "comment add", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "comment reply", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "comment resolve", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "comment unresolve", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page new", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page meta", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page move", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page archive", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page unarchive", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "page delete", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "search", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "url", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "collection list", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "collection create", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "collection update", "loop": null, "step": null, "perVerb": false},
+    {"cli": "ot", "verb": "collection delete", "loop": null, "step": null, "perVerb": false},
+
+    {"cli": "plane", "verb": "list", "loop": "ticket-work", "step": 1, "perVerb": true},
+    {"cli": "plane", "verb": "get", "loop": "ticket-work", "step": 1, "perVerb": true},
+    {"cli": "plane", "verb": "blocks", "loop": "ticket-work", "step": 1, "perVerb": true},
+    {"cli": "plane", "verb": "depends", "loop": "ticket-work", "step": 1, "perVerb": true},
+    {"cli": "plane", "verb": "unblocks", "loop": "ticket-work", "step": 1, "perVerb": true},
+    {"cli": "plane", "verb": "claim", "loop": "ticket-work", "step": 2, "perVerb": true},
+    {"cli": "plane", "verb": "state", "loop": "ticket-work", "step": 3, "perVerb": true},
+    {"cli": "plane", "verb": "comment", "loop": "ticket-work", "step": 3, "perVerb": true},
+    {"cli": "plane", "verb": "create", "loop": "ticket-work", "step": 3, "perVerb": true},
+    {"cli": "plane", "verb": "sub", "loop": "ticket-work", "step": 3, "perVerb": true},
+    {"cli": "plane", "verb": "comments", "loop": "ticket-work", "step": 4, "perVerb": true},
+    {"cli": "plane", "verb": "reply", "loop": "ticket-work", "step": 4, "perVerb": true},
+    {"cli": "plane", "verb": "whoami", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "config", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "sync", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "projects", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "assign", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "unclaim", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "label-add", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "label-remove", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "uncomment", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "delete", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "states", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "labels", "loop": null, "step": null, "perVerb": false},
+    {"cli": "plane", "verb": "modules", "loop": null, "step": null, "perVerb": false},
+
+    {"cli": "tc", "verb": "start_ticket", "loop": "ticket-machine", "step": 1, "perVerb": true},
+    {"cli": "tc", "verb": "handover", "loop": "ticket-machine", "step": 3, "perVerb": true},
+    {"cli": "tc", "verb": "verdict", "loop": "ticket-machine", "step": 4, "perVerb": true},
+    {"cli": "tc", "verb": "approve", "loop": "ticket-machine", "step": 5, "perVerb": true},
+    {"cli": "tc", "verb": "merge-approved", "loop": "ticket-machine", "step": 6, "perVerb": true},
+    {"cli": "tc", "verb": "tell", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "status", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "log", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "needs-you", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "goal", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "evidence", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "doctor", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "sessions", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "burn", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "init", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "install", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "up", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "refresh", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "watch", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "tap", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "mux", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "attach", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "register", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "unregister", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "hold", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "rotate", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "release", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "read_latest", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "interrupt", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "model", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "tick", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "mon", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "dash", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "fleet", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "rules", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "park", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "unpark", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "cost", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "workspaces", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "connect", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "remote", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "sync", "loop": null, "step": null, "perVerb": false},
+    {"cli": "tc", "verb": "team", "loop": null, "step": null, "perVerb": false}
+  ]
+}
