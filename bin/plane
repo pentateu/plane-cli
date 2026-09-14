@@ -1,22 +1,21 @@
 #!/usr/bin/env sh
 # plane — Plane ticket CLI shim (HomeTutor fleet).
-# Install (after merge to development): ln -s "$PWD/tools/plane-cli/bin/plane" ~/.local/bin/plane
-# Update policy (push-based, 2026-08-29): no auto-pull on run.
-# Run ./scripts/deploy.sh after pushing to origin/development to roll out.
-# Opt-in one-off pull: PLANE_AUTO_PULL=1 plane ...
+#
+# HOT PATH: zero git, zero network. Resolves the pinned release symlink and
+# execs bun. Updates happen in the BACKGROUND (bin/update-live.sh via the
+# systemd timer, tag-based) — a run in flight keeps its version; the next
+# invocation picks up the newly pinned release.
+#
+# Layout (operator directive):
+#   /home/rafael/Development/plane-cli-releases/<tag>   released copies
+#   /home/rafael/Development/plane-cli-current          symlink → release
+#   Dev happens in /home/rafael/Development/plane-cli (worktrees) — NEVER
+#   executed by agents.
 set -e
-SELF="$0"
-TARGET="$(readlink -f "$SELF" 2>/dev/null || realpath "$SELF" 2>/dev/null || true)"
-if [ -z "$TARGET" ]; then
-  TARGET="$SELF"
-  echo "WARNING: plane shim could not resolve its symlink (no readlink -f / realpath) — using the invoked path; symlink installs may run a stale copy" >&2
-fi
-DIR="$(cd "$(dirname "$TARGET")" && pwd)"
-REPO="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null || cd "$DIR/.." && pwd)"
-if [ "${PLANE_AUTO_PULL:-0}" == "1" ] && [ -d "$REPO/.git" ]; then
-  if [ -z "$(git -C "$REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-    git -C "$REPO" pull --ff-only -q origin main 2>/dev/null || true
-  fi
+CURRENT="${PLANE_CLI_CURRENT:-/home/rafael/Development/plane-cli-current}"
+if [ ! -e "$CURRENT/src/cli.ts" ]; then
+  echo "plane: no release pinned at $CURRENT — run plane-cli bin/deploy.sh or bin/update-live.sh" >&2
+  exit 1
 fi
 BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
-exec "$BUN" run "$DIR/../src/cli.ts" "$@"
+exec "$BUN" run "$CURRENT/src/cli.ts" "$@"
