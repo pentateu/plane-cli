@@ -263,6 +263,18 @@ function writeCommentsJson(dir: string, events: SyncEvent[]): void {
   );
 }
 
+function writeSnapshotAtomic(conflictPath: string, content: string): void {
+  mkdirSync(dirname(conflictPath), { recursive: true });
+  const tmp = `${conflictPath}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, content);
+    renameSync(tmp, conflictPath);
+  } catch (e) {
+    try { rmSync(tmp, { force: true }); } catch {}
+    throw e;
+  }
+}
+
 /**
  * M5: force-cleanup symmetry (mirrors pullTicket server-wins, but keeps audit).
  * After a force/forceAll push lands, delete the ticket's .conflict snapshot
@@ -534,11 +546,14 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // Pull new server comments that don't bump the issue rev (comments are
   // separate from updated_at). Merge by id, keep pending rows. C2: the
   // merge runs through updateEvents (lock + unknown-op preservation).
+  // I-2: keep roster for reuse in conflict maps (avoids extra /members/ GET per stuck poll).
+  let mergeSeatByMember: Map<string, string> | null = null;
   {
     const raw = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`)) as Raw;
     const server = (((raw as any).results ?? raw) as Raw[]).slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
     const members = (await p.request("GET", `${p.base()}/members/`)) as Raw[];
     const seatByMember = new Map((Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]));
+    mergeSeatByMember = seatByMember;
     let added = 0;
     await updateEvents(dir, (stored) => {
       const prior = stored as SyncEvent[];
@@ -573,24 +588,35 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // M3: resolver maps for conflict snapshots — fetched once per pushTicket
   // call, reused for root + children (same id->token/name/seat mapping as
   // pullOne so the snapshot byte-matches pullTicket's rendering).
-  // I5: bounded cost — exactly 3 fetches (states, labels, members) on the
-  // FIRST conflict of a push; children reuse the same maps (O(1), not O(N)).
-  // stateMap/labelMap are disk-cache-backed; only /members/ is a real HTTP GET.
+  // I5/I-2: bounded cost — memoised per pushTicket call (O(1), not O(N)).
+  // stateMap/labelMap are disk-cache-backed; members is the only real HTTP
+  // GET, reused from the merge-block roster when available to avoid extra
+  // fetches on stuck conflicts.
   let conflictMaps: { stateById: Map<string, string>; labelById: Map<string, string>; seatByMember: Map<string, string> } | null = null;
   async function getConflictMaps(): Promise<{ stateById: Map<string, string>; labelById: Map<string, string>; seatByMember: Map<string, string> }> {
     if (!conflictMaps) {
-      const [states, labels, members] = await Promise.all([
-        p.stateMap(mount.projectId),
-        p.labelMap(mount.projectId),
-        p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
-      ]);
-      conflictMaps = {
-        stateById: new Map(Object.entries(states).map(([token, id]) => [id, token])),
-        labelById: new Map(Object.entries(labels).map(([name, id]) => [id, name])),
-        seatByMember: new Map(
-          (Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]),
-        ),
-      };
+      // I-2: reuse merge-block roster if we already fetched it this cycle
+      if (mergeSeatByMember) {
+        const [states, labels] = await Promise.all([p.stateMap(mount.projectId), p.labelMap(mount.projectId)]);
+        conflictMaps = {
+          stateById: new Map(Object.entries(states).map(([token, id]) => [id, token])),
+          labelById: new Map(Object.entries(labels).map(([name, id]) => [id, name])),
+          seatByMember: mergeSeatByMember,
+        };
+      } else {
+        const [states, labels, members] = await Promise.all([
+          p.stateMap(mount.projectId),
+          p.labelMap(mount.projectId),
+          p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
+        ]);
+        conflictMaps = {
+          stateById: new Map(Object.entries(states).map(([token, id]) => [id, token])),
+          labelById: new Map(Object.entries(labels).map(([name, id]) => [id, name])),
+          seatByMember: new Map(
+            (Array.isArray(members) ? members : []).map((m) => [String(m.id), String(m.display_name || String(m.email ?? "").split("@")[0] || m.id)]),
+          ),
+        };
+      }
     }
     return conflictMaps;
   }
@@ -599,6 +625,20 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     // Conflict: local kept, server side aside, ONE notice, push nothing.
     // --force / --force-all (manual `sync TC-N --push-once` only, never the daemon)
     // skips this branch: local wins, baselines follow the push below.
+    // I-2: check dedup before fetching maps — stuck conflicts re-polling every
+    // 5s should not refetch/render/rewrite when notice already exists.
+    const detail = `server rev ${serverRev} vs local edits (base ${mount.lastRev})`;
+    const marker = `conflict: ${detail}`;
+    const alreadyLocal = (readEventsFile(dir) as SyncEvent[]).some((e) => {
+      if (e.status !== "conflict") return false;
+      if (e.meta?.kind === "push-conflict") {
+        return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === null && e.body.includes(marker);
+      }
+      return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
+    });
+    if (alreadyLocal && existsSync(join(dir, "ticket.md.conflict"))) {
+      return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
+    }
     // I1: snapshot + notice row + comments.json land atomically inside ONE withEventsLock.
     const maps = await getConflictMaps();
     const snapshot = renderConflictSnapshot(ticket, {
@@ -608,13 +648,9 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       at: new Date().toISOString(),
       ...maps,
     });
-    const detail = `server rev ${serverRev} vs local edits (base ${mount.lastRev})`;
-    const marker = `conflict: ${detail}`;
     await withEventsLock(dir, (events) => {
       const conflictPath = join(dir, "ticket.md.conflict");
-      const tmp = `${conflictPath}.tmp.${process.pid}`;
-      writeFileSync(tmp, snapshot);
-      renameSync(tmp, conflictPath);
+      writeSnapshotAtomic(conflictPath, snapshot);
       const evs = events as SyncEvent[];
       const already = evs.some((e) => {
         if (e.status !== "conflict") return false;
@@ -700,7 +736,21 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       // notice and record a pushed[] entry naming the remedy.
       // M3/I1: child snapshot provenance always names the parent mount ticket + child rel,
       // atomically with the notice row inside ONE lock.
+      // I-2: check dedup before fetching maps for stuck child conflicts.
       if (childRev !== kid.rev && !opts?.forceAll) {
+        const detail = `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`;
+        const marker = `conflict: ${detail}`;
+        const alreadyChild = (readEventsFile(dir) as SyncEvent[]).some((e) => {
+          if (e.status !== "conflict") return false;
+          if (e.meta?.kind === "push-conflict") {
+            return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === kid.rel && e.body.includes(marker);
+          }
+          return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
+        });
+        if (alreadyChild && existsSync(`${childMd}.conflict`)) {
+          pushed.push(`${kid.rel}: conflict (server rev ${childRev} vs local edits — resolve child or re-run with --force-all)`);
+          continue;
+        }
         const maps = await getConflictMaps();
         const snapshot = renderConflictSnapshot(childTicket, {
           handle: mount.ticket,
@@ -711,14 +761,9 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
           childRel: kid.rel,
           ...maps,
         });
-        const detail = `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`;
-        const marker = `conflict: ${detail}`;
         await withEventsLock(dir, (events) => {
           const conflictPath = `${childMd}.conflict`;
-          const tmp = `${conflictPath}.tmp.${process.pid}`;
-          mkdirSync(dirname(conflictPath), { recursive: true });
-          writeFileSync(tmp, snapshot);
-          renameSync(tmp, conflictPath);
+          writeSnapshotAtomic(conflictPath, snapshot);
           const evs = events as SyncEvent[];
           const already = evs.some((e) => {
             if (e.status !== "conflict") return false;

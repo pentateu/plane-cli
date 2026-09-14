@@ -207,9 +207,15 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   // state — the conflict is resolved (server-wins), so its notice row
   // becomes terminal audit (I2 race: pull-then-force and force-then-pull
   // both preserve the audit marker). Stale .conflict snapshots are litter
-  // and deleted after the lock.
+  // and deleted inside the same lock (I-1: pull-vs-push race).
   let kept = 0;
   await updateEvents(mount.dir, (stored) => {
+    // I-1: delete snapshots inside the lock so a concurrent push filing
+    // in the gap after we release cannot have its snapshot deleted.
+    try { rmSync(join(mount.dir, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
+    for (const kid of ctx.kids) {
+      try { rmSync(join(mount.dir, kid.rel, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
+    }
     const prior = stored as SyncEvent[];
     const surviving = prior.filter((e) => e.status === "pending" || e.status === "posting");
     kept = surviving.length;
@@ -245,16 +251,8 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     prior.push(...priorSynced, ...priorConflictsAsResolved, ...fresh, ...surviving);
   });
   const events = readEventsFile(mount.dir) as SyncEvent[];
-  writeFileSync(
-    join(metaDir(mount.dir), "comments.json"),
-    JSON.stringify(events.map(({ id, parent, author, body, at, status }) => ({ id, parent, author, body, at, status })), null, 2) + "\n",
-  );
-  // Stale conflict snapshots: the pull just made server state local — any
-  // .conflict file (root or child) describes a fight that is now over.
-  try { rmSync(join(mount.dir, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
-  for (const kid of ctx.kids) {
-    try { rmSync(join(mount.dir, kid.rel, "ticket.md.conflict"), { force: true }); } catch { /* absent */ }
-  }
+  // comments.json already rewritten atomically inside the lock (withEventsLock);
+  // no extra outside-lock write (fixes double-writer minor).
   writeStatusFile(mount.dir, { ticket: mount.ticket, ready: kept === 0, lastPoll: new Date().toISOString(), pending: kept, rev });
   return { rev, bodySha, fileSha, comments: events.length, children, kids: ctx.kids };
 }
