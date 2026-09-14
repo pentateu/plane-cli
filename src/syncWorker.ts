@@ -39,6 +39,12 @@ export async function workerCycle(projectId: string): Promise<Array<{ ticket: st
             hit.lastRev = pulled.rev;
             hit.lastBodySha = pulled.bodySha;
             hit.lastFileSha = pulled.fileSha;
+            hit.lastState = pulled.state;
+            hit.lastAssignee = pulled.assignee;
+            hit.lastLabels = pulled.labels;
+            hit.lastPriority = pulled.priority;
+            hit.lastTitle = pulled.title;
+            hit.lastBodyNormalizedSha = pulled.bodyNormalizedSha;
             hit.kids = pulled.kids;
             hit.lastPoll = new Date().toISOString();
             hit.pending = 0;

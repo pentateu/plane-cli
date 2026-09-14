@@ -43,6 +43,15 @@ export function sha256(s: string): string {
   return `sha256-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 12)}`;
 }
 
+export function normalizeBody(body: string): string {
+  return body
+    .split("\n")
+    .map((l) => l.replace(/\s+$/g, ""))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function ticketSlug(title: string, fallback: string): string {
   const slug = title
     .toLowerCase()
@@ -68,7 +77,7 @@ interface PullCtx {
   labelById: Map<string, string>; // label uuid -> board name
   seatByMember: Map<string, string>; // member uuid -> seat (email local-part)
   visited: Set<string>;
-  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>;
+  kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string; state: string; assignee: string; labels: string[]; priority: string; title: string; bodyNormalizedSha: string }>;
   root: string; // mount dir (kids rel paths resolve against it)
 }
 
@@ -92,7 +101,7 @@ function childRelFor(ctx: PullCtx, child: Raw, siblingTitles: string[], existing
   return `sub-tickets/${name}`;
 }
 
-async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: string; bodySha: string; fileSha: string }> {
+async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: string; bodySha: string; fileSha: string; state: string; assignee: string; labels: string[]; priority: string; title: string; bodyNormalizedSha: string }> {
   const uuid = String(issue.id);
   ctx.visited.add(uuid);
   mkdirSync(dir, { recursive: true });
@@ -107,11 +116,15 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
     return typeof id === "string" ? (ctx.labelById.get(id) ?? id) : null;
   }).filter((s: unknown): s is string => typeof s === "string");
   const body = htmlToText(String(issue.description_html ?? ""));
-  const md = `${frontMatter(stateToken, seat, labels, String(issue.priority ?? "none"))}# ${String(issue.name ?? uuid)}\n\n${body}\n`;
+  const priority = String(issue.priority ?? "none");
+  const title = String(issue.name ?? uuid);
+  const md = `${frontMatter(stateToken, seat, labels, priority)}# ${title}\n\n${body}\n`;
   writeFileSync(join(dir, "ticket.md"), md);
   // Baseline tracks the BODY text only: front-matter edits must not read as
   // body changes (the whole-file sha would flag every state/label edit).
-  const bodySha = sha256(body);
+  // M4: normalized sha so whitespace-only edits never conflict.
+  const bodyNormalizedSha = sha256(normalizeBody(body));
+  const bodySha = bodyNormalizedSha;
   const fileSha = sha256(md);
 
   // Children (recursive) — grandchildren nest per §29.7 tree rules.
@@ -124,7 +137,7 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
     const rel = childRelFor(ctx, child, siblingTitles, ctx.kids.map((k) => k.rel));
     const childDir = join(dir, rel);
     const r = await pullOne(ctx, child, childDir);
-    ctx.kids.push({ rel: relative(ctx.root, childDir), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha });
+    ctx.kids.push({ rel: relative(ctx.root, childDir), uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha, state: r.state, assignee: r.assignee, labels: r.labels, priority: r.priority, title: r.title, bodyNormalizedSha: r.bodyNormalizedSha });
   }
 
   // I5 (review): EVERY ticket in the tree gets its own comment home — the
@@ -137,7 +150,7 @@ async function pullOne(ctx: PullCtx, issue: Raw, dir: string): Promise<{ rev: st
   } catch { /* comments are best-effort on pull — the ticket.md landed */ }
 
   const rev = String(issue.updated_at ?? "");
-  return { rev, bodySha, fileSha };
+  return { rev, bodySha, fileSha, state: stateToken, assignee: seat, labels: [...labels].sort(), priority, title, bodyNormalizedSha };
 }
 
 /** Merge server comments into a dir's events file (root OR child). */
@@ -187,7 +200,7 @@ function buildCtx(p: Plane, mount: SyncMount, members: Raw[], states: Record<str
   };
 }
 
-export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; fileSha: string; comments: number; children: number; kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }> }> {
+export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: string; bodySha: string; fileSha: string; state: string; assignee: string; labels: string[]; priority: string; title: string; bodyNormalizedSha: string; comments: number; children: number; kids: Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string; state: string; assignee: string; labels: string[]; priority: string; title: string; bodyNormalizedSha: string }> }> {
   const [issue, rawComments, members, states, labels] = await Promise.all([
     p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/`) as Promise<Raw>,
     p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${mount.uuid}/comments/`) as Promise<Raw>,
@@ -196,7 +209,7 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     p.labelMap(mount.projectId),
   ]);
   const ctx = buildCtx(p, mount, members, states, labels);
-  const { rev, bodySha, fileSha } = await pullOne(ctx, issue, mount.dir);
+  const { rev, bodySha, fileSha, state, assignee, labels: lbls, priority, title, bodyNormalizedSha } = await pullOne(ctx, issue, mount.dir);
   const children = ctx.visited.size - 1;
 
   // Existing comments → synced events + derived snapshot (root; children
@@ -254,7 +267,7 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   // comments.json already rewritten atomically inside the lock (withEventsLock);
   // no extra outside-lock write (fixes double-writer minor).
   writeStatusFile(mount.dir, { ticket: mount.ticket, ready: kept === 0, lastPoll: new Date().toISOString(), pending: kept, rev });
-  return { rev, bodySha, fileSha, comments: events.length, children, kids: ctx.kids };
+  return { rev, bodySha, fileSha, state, assignee, labels: lbls, priority, title, bodyNormalizedSha, comments: events.length, children, kids: ctx.kids };
 }
 
 /**
@@ -264,7 +277,7 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
  * folders (locally edited children keep their files; push guards them).
  * I9: the dir respects sibling-slug collisions (same rule as pullOne).
  */
-export async function adoptNewcomers(p: Plane, mount: SyncMount, newcomers: Raw[]): Promise<Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string }>> {
+export async function adoptNewcomers(p: Plane, mount: SyncMount, newcomers: Raw[]): Promise<Array<{ rel: string; uuid: string; rev: string; bodySha: string; fileSha: string; state: string; assignee: string; labels: string[]; priority: string; title: string; bodyNormalizedSha: string }>> {
   if (!newcomers.length) return [];
   const [members, states, labels] = await Promise.all([
     p.request("GET", `${p.base()}/members/`) as Promise<Raw[]>,
@@ -281,7 +294,7 @@ export async function adoptNewcomers(p: Plane, mount: SyncMount, newcomers: Raw[
     if (existsSync(join(childDir, "ticket.md"))) continue;
     const full = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${String(child.id)}/`)) as Raw;
     const r = await pullOne(ctx, full, childDir);
-    ctx.kids.push({ rel, uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha });
+    ctx.kids.push({ rel, uuid: String(child.id), rev: r.rev, bodySha: r.bodySha, fileSha: r.fileSha, state: r.state, assignee: r.assignee, labels: r.labels, priority: r.priority, title: r.title, bodyNormalizedSha: r.bodyNormalizedSha });
   }
   return ctx.kids;
 }
