@@ -22,12 +22,12 @@
  * - Event-file rewrites ALL go through updateEvents (lock + merge, C2);
  *   registry rewrites through updateMounts (C1).
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Plane, Raw } from "./api.ts";
 import { htmlToText } from "./api.ts";
-import { readEventsFile, updateMounts, updateEvents, writeStatusFile, metaDir, countPendingEvents, type SyncMount, type StoredEvent } from "./sync.ts";
+import { readEventsFile, updateMounts, updateEvents, withEventsLock, writeStatusFile, metaDir, countPendingEvents, type SyncMount, type StoredEvent } from "./sync.ts";
 import { adoptNewcomers, pullTicket, sha256, frontMatter, type SyncEvent } from "./syncPull.ts";
 
 export interface PushRefusal {
@@ -98,7 +98,7 @@ export function parseTicketMd(text: string): { fm: FrontMatter; title: string; b
   return { fm, title, body: bodyLines.join("\n").trim() };
 }
 
-function conflictNotice(ticket: string, detail: string): SyncEvent {
+function conflictNotice(ticket: string, detail: string, rel: string | null = null): SyncEvent {
   return {
     event: "add",
     op: `conflict-${Date.now()}-${randomUUID().slice(0, 8)}`,
@@ -109,10 +109,11 @@ function conflictNotice(ticket: string, detail: string): SyncEvent {
     body_sha: sha256(`${ticket}:${detail}`),
     at: new Date().toISOString(),
     status: "conflict",
+    meta: { kind: "push-conflict", ticket, rel },
   };
 }
 
-export interface ConflictSnapshotCtx {
+interface ConflictSnapshotCtx {
   handle: string;
   baseRev: string | null;
   serverRev: string;
@@ -123,6 +124,9 @@ export interface ConflictSnapshotCtx {
   /** Mount handle used in the resolve hint; defaults to `handle`. Child
    *  snapshots pass the parent handle so the hint names a real mount. */
   resolveHandle?: string;
+  /** M3: for child snapshots, the relative dir (e.g. sub-tickets/foo); when set,
+   *  provenance prints `child: <rel>` alongside `ticket: <parent>`. */
+  childRel?: string;
 }
 
 /**
@@ -133,7 +137,7 @@ export interface ConflictSnapshotCtx {
  * for the same server issue (same frontMatter emitter, same `# title`, same
  * htmlToText body).
  */
-export function renderConflictSnapshot(ticket: Raw, ctx: ConflictSnapshotCtx): string {
+function renderConflictSnapshot(ticket: Raw, ctx: ConflictSnapshotCtx): string {
   const uuid = String(ticket.id ?? "");
   const stateToken = ctx.stateById.get(String(ticket.state)) ?? String(ticket.state);
   const assignees = (Array.isArray(ticket.assignees) ? ticket.assignees : []).map((a: unknown) =>
@@ -147,14 +151,16 @@ export function renderConflictSnapshot(ticket: Raw, ctx: ConflictSnapshotCtx): s
   const body = htmlToText(String(ticket.description_html ?? ""));
   const md = `${frontMatter(stateToken, seat, labels, String(ticket.priority ?? "none"))}# ${String(ticket.name ?? uuid)}\n\n${body}\n`;
   const resolveHandle = ctx.resolveHandle ?? ctx.handle;
-  const provenance = [
+  const provenanceLines = [
     `<!-- conflict snapshot: server side wins nothing yet — local file kept`,
     `ticket: ${ctx.handle}`,
+    ...(ctx.childRel ? [`child: ${ctx.childRel}`] : []),
     `baseRev: ${ctx.baseRev ?? ""}`,
     `serverRev: ${ctx.serverRev}`,
     `at: ${ctx.at}`,
     `resolve: diff against ticket.md; \`sync ${resolveHandle} --push-once --force\` = local-wins, re-mount/pull = server-wins; never edit this file expecting it to sync -->`,
-  ].join("\n");
+  ];
+  const provenance = provenanceLines.join("\n");
   return `${provenance}\n\n${md}`;
 }
 
@@ -163,13 +169,20 @@ export function renderConflictSnapshot(ticket: Raw, ctx: ConflictSnapshotCtx): s
  * every poll cycle while the condition holds; without dedup a blocked mount
  * spams ~12 identical rows/min. Dedup scope INCLUDES the ticket (M2): two
  * mounts sharing a dir must not suppress each other's notices.
+ * I4 (review r2): meta-based dedup (exact ticket+rel) with body fallback for legacy rows.
  */
-async function refuseOnce(dir: string, ticket: string, rule: string, detail: string): Promise<void> {
+async function refuseOnce(dir: string, ticket: string, rule: string, detail: string, rel: string | null = null): Promise<void> {
   await updateEvents(dir, (events) => {
     const marker = `${rule}: ${detail}`;
-    const already = (events as SyncEvent[]).some((e) => e.status === "conflict" && e.body.includes(marker) && e.body.includes(`on ${ticket}`));
+    const already = (events as SyncEvent[]).some((e) => {
+      if (e.status !== "conflict") return false;
+      if (e.meta?.kind === "push-conflict") {
+        return e.meta.ticket === ticket && (e.meta.rel ?? null) === (rel ?? null) && e.body.includes(marker);
+      }
+      return e.body.includes(marker) && e.body.includes(`on ${ticket}`);
+    });
     if (!already) {
-      events.push(conflictNotice(ticket, `${rule}: ${detail}`));
+      events.push(conflictNotice(ticket, `${rule}: ${detail}`, rel));
     }
     return undefined;
   });
@@ -254,27 +267,35 @@ function writeCommentsJson(dir: string, events: SyncEvent[]): void {
  * M5: force-cleanup symmetry (mirrors pullTicket server-wins, but keeps audit).
  * After a force/forceAll push lands, delete the ticket's .conflict snapshot
  * (if present) and flip its conflict notice rows to terminal "resolved"
- * (kept for audit, rewritten to comments.json). `match` selects the rows for
- * THIS ticket: root matches its own push-conflict rows, child matches its
- * `child <rel>:` rows — never the other's. "resolved" rows never re-fire:
- * refuseOnce only dedups status "conflict" rows, so a NEW conflict later
- * files a fresh row.
+ * (kept for audit, rewritten to comments.json). Structured meta match first
+ * (I4); legacy body fallback only for rows without meta. I1: snapshot delete
+ * + flip + comments.json rewrite land atomically inside ONE withEventsLock.
+ * "resolved" rows never re-fire: refuseOnce only dedups status "conflict"
+ * rows, so a NEW conflict later files a fresh row.
  */
-async function resolveForceCleanup(dir: string, conflictPath: string, match: (body: string) => boolean): Promise<void> {
-  try {
-    const { rmSync } = await import("node:fs");
-    rmSync(conflictPath, { force: true });
-  } catch { /* absent */ }
-  await updateEvents(dir, (stored) => {
+async function resolveForceCleanup(dir: string, conflictPath: string, ticket: string, rel: string | null): Promise<void> {
+  await withEventsLock(dir, (stored) => {
+    try {
+      rmSync(conflictPath, { force: true });
+    } catch { /* absent */ }
     const rows = stored as SyncEvent[];
     for (const e of rows) {
-      if (e.status === "conflict" && match(e.body)) {
-        e.status = "resolved";
+      if (e.status !== "conflict") continue;
+      let isMatch = false;
+      if (e.meta?.kind === "push-conflict") {
+        isMatch = e.meta.ticket === ticket && (e.meta.rel ?? null) === (rel ?? null);
+      } else {
+        // Legacy fallback: match the exact strings produced today
+        if (rel === null) {
+          isMatch = e.body.includes(`on ${ticket}`) && e.body.includes("conflict: server rev") && !e.body.includes("conflict: child");
+        } else {
+          isMatch = e.body.includes(`on ${ticket}`) && e.body.includes(`conflict: child ${rel}:`);
+        }
       }
+      if (isMatch) e.status = "resolved";
     }
-    return undefined;
   });
-  writeCommentsJson(dir, readEvents(dir));
+  // withEventsLock already rewrote comments.json atomically; no extra write needed
 }
 
 /**
@@ -552,6 +573,9 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // M3: resolver maps for conflict snapshots — fetched once per pushTicket
   // call, reused for root + children (same id->token/name/seat mapping as
   // pullOne so the snapshot byte-matches pullTicket's rendering).
+  // I5: bounded cost — exactly 3 fetches (states, labels, members) on the
+  // FIRST conflict of a push; children reuse the same maps (O(1), not O(N)).
+  // stateMap/labelMap are disk-cache-backed; only /members/ is a real HTTP GET.
   let conflictMaps: { stateById: Map<string, string>; labelById: Map<string, string>; seatByMember: Map<string, string> } | null = null;
   async function getConflictMaps(): Promise<{ stateById: Map<string, string>; labelById: Map<string, string>; seatByMember: Map<string, string> }> {
     if (!conflictMaps) {
@@ -575,15 +599,32 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     // Conflict: local kept, server side aside, ONE notice, push nothing.
     // --force / --force-all (manual `sync TC-N --push-once` only, never the daemon)
     // skips this branch: local wins, baselines follow the push below.
+    // I1: snapshot + notice row + comments.json land atomically inside ONE withEventsLock.
     const maps = await getConflictMaps();
-    writeFileSync(join(dir, "ticket.md.conflict"), renderConflictSnapshot(ticket, {
+    const snapshot = renderConflictSnapshot(ticket, {
       handle: mount.ticket,
       baseRev: mount.lastRev,
       serverRev,
       at: new Date().toISOString(),
       ...maps,
-    }));
-    await refuseOnce(dir, mount.ticket, "conflict", `server rev ${serverRev} vs local edits (base ${mount.lastRev})`);
+    });
+    const detail = `server rev ${serverRev} vs local edits (base ${mount.lastRev})`;
+    const marker = `conflict: ${detail}`;
+    await withEventsLock(dir, (events) => {
+      const conflictPath = join(dir, "ticket.md.conflict");
+      const tmp = `${conflictPath}.tmp.${process.pid}`;
+      writeFileSync(tmp, snapshot);
+      renameSync(tmp, conflictPath);
+      const evs = events as SyncEvent[];
+      const already = evs.some((e) => {
+        if (e.status !== "conflict") return false;
+        if (e.meta?.kind === "push-conflict") {
+          return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === null && e.body.includes(marker);
+        }
+        return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
+      });
+      if (!already) evs.push(conflictNotice(mount.ticket, marker, null));
+    });
     return { ticket: mount.ticket, pushed: [], comments: 0, rev: mount.lastRev ?? serverRev };
   }
   // Child arrivals don't bump the parent rev (Plane-side fact, proven live):
@@ -628,9 +669,7 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // push-conflict rows to "resolved". Child rows are NOT touched here (a
   // parent-only --force must leave newly filed child conflicts active).
   if (localForce && serverChanged && localChanged) {
-    await resolveForceCleanup(dir, join(dir, "ticket.md.conflict"), (body) =>
-      body.includes(`on ${mount.ticket}`) && body.includes("conflict: server rev") && !body.includes("conflict: child"),
-    );
+    await resolveForceCleanup(dir, join(dir, "ticket.md.conflict"), mount.ticket, null);
   }
   let comments = r.comments;
   // I10: persist the parent result + adopted baselines BEFORE the child
@@ -659,19 +698,37 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       // M5: parent-only --force no longer bulldozes children — only --force-all
       // force-pushes conflicted children. Skipped children file a snapshot +
       // notice and record a pushed[] entry naming the remedy.
+      // M3/I1: child snapshot provenance always names the parent mount ticket + child rel,
+      // atomically with the notice row inside ONE lock.
       if (childRev !== kid.rev && !opts?.forceAll) {
         const maps = await getConflictMaps();
-        const childSeqForSnap = Number(childTicket.sequence_id ?? 0);
-        const childHandle = childSeqForSnap ? `${mount.ident}-${childSeqForSnap}` : `${mount.ticket}/${kid.rel}`;
-        writeFileSync(`${childMd}.conflict`, renderConflictSnapshot(childTicket, {
-          handle: childHandle,
+        const snapshot = renderConflictSnapshot(childTicket, {
+          handle: mount.ticket,
           baseRev: kid.rev,
           serverRev: childRev,
           at: new Date().toISOString(),
           resolveHandle: mount.ticket,
+          childRel: kid.rel,
           ...maps,
-        }));
-        await refuseOnce(dir, mount.ticket, "conflict", `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`);
+        });
+        const detail = `child ${kid.rel}: server rev ${childRev} vs local edits (base ${kid.rev})`;
+        const marker = `conflict: ${detail}`;
+        await withEventsLock(dir, (events) => {
+          const conflictPath = `${childMd}.conflict`;
+          const tmp = `${conflictPath}.tmp.${process.pid}`;
+          mkdirSync(dirname(conflictPath), { recursive: true });
+          writeFileSync(tmp, snapshot);
+          renameSync(tmp, conflictPath);
+          const evs = events as SyncEvent[];
+          const already = evs.some((e) => {
+            if (e.status !== "conflict") return false;
+            if (e.meta?.kind === "push-conflict") {
+              return e.meta.ticket === mount.ticket && (e.meta.rel ?? null) === kid.rel && e.body.includes(marker);
+            }
+            return e.body.includes(marker) && e.body.includes(`on ${mount.ticket}`);
+          });
+          if (!already) evs.push(conflictNotice(mount.ticket, marker, kid.rel));
+        });
         pushed.push(`${kid.rel}: conflict (server rev ${childRev} vs local edits — resolve child or re-run with --force-all)`);
         continue;
       }
@@ -697,9 +754,7 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       // M5: a child actually pushed under --force-all resolves its prior
       // conflict litter (snapshot + notice rows flip to "resolved").
       if (opts?.forceAll && wasChildConflict) {
-        await resolveForceCleanup(dir, `${childMd}.conflict`, (body) =>
-          body.includes(`on ${mount.ticket}`) && body.includes(`conflict: child ${kid.rel}:`),
-        );
+        await resolveForceCleanup(dir, `${childMd}.conflict`, mount.ticket, kid.rel);
       }
       const afterChild = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
       const newFileSha = sha256(readFileSync(childMd, "utf8"));

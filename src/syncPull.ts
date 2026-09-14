@@ -33,6 +33,10 @@ export interface SyncEvent {
   /** §2.1 msg_id the daemon stamped the post with (persisted BEFORE the
    *  POST — review C5); the NATS outbox (§4.5) reuses it as Nats-Msg-Id. */
   entry?: string;
+  /** I4 (review r2): structured dedup key for push-conflict notices.
+   *  Optional for backward compat (legacy rows have no meta; predicates fall
+   *  back to body substring checks). */
+  meta?: { kind: "push-conflict"; ticket: string; rel: string | null };
 }
 
 export function sha256(s: string): string {
@@ -48,6 +52,7 @@ export function ticketSlug(title: string, fallback: string): string {
   return slug || fallback;
 }
 
+/** @internal — single sanctioned emitter (pull + conflict snapshot); quote-aware */ 
 export function frontMatter(state: string, assignee: string, labels: string[], priority: string): string {
   // Minimal emitter: quote only when the value would confuse the Phase 3
   // line parser (commas, newlines, leading #/space). `type:bug` stays bare;
@@ -197,10 +202,12 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
   // Existing comments → synced events + derived snapshot (root; children
   // got theirs inside pullOne). Local pending/posting rows SURVIVE the
   // rewrite (re-pull must never drop unposted work); server rows already
-  // present (by id) are not duplicated. Conflict rows + .conflict snapshots
-  // are DROPPED: a completed pull means the server state is now the local
-  // state — the conflict is resolved (server-wins), so its notice row and
-  // stale snapshot are litter.
+  // present (by id) are not duplicated. Conflict rows are CONVERTED to
+  // "resolved": a completed pull means the server state is now the local
+  // state — the conflict is resolved (server-wins), so its notice row
+  // becomes terminal audit (I2 race: pull-then-force and force-then-pull
+  // both preserve the audit marker). Stale .conflict snapshots are litter
+  // and deleted after the lock.
   let kept = 0;
   await updateEvents(mount.dir, (stored) => {
     const prior = stored as SyncEvent[];
@@ -208,6 +215,9 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
     kept = surviving.length;
     // "resolved" rows are terminal audit — they survive pulls like synced rows.
     const priorSynced = prior.filter((e) => e.status === "synced" || e.status === "resolved");
+    // I2: convert conflict → resolved instead of dropping (makes both
+    // pull-then-force and force-then-pull safe; audit survives either order).
+    const priorConflictsAsResolved: SyncEvent[] = prior.filter((e) => e.status === "conflict").map((e) => ({ ...e, status: "resolved" as const }));
     const knownIds = new Set(priorSynced.filter((e) => e.id).map((e) => e.id as string));
     const list = (((rawComments as Raw).results ?? rawComments) as Raw[]).slice()
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
@@ -228,11 +238,11 @@ export async function pullTicket(p: Plane, mount: SyncMount): Promise<{ rev: str
         status: "synced",
       } as SyncEvent);
     }
-    // Prior synced/resolved rows keep their ops (stable dedup keys); fresh server
-    // rows append in time order; local pending/posting rows stay verbatim;
-    // conflict rows are dropped (resolved by this pull).
+    // Prior synced/resolved rows keep their ops (stable dedup keys); converted
+    // conflict→resolved rows join them; fresh server rows append in time order;
+    // local pending/posting rows stay verbatim.
     prior.length = 0;
-    prior.push(...priorSynced, ...fresh, ...surviving);
+    prior.push(...priorSynced, ...priorConflictsAsResolved, ...fresh, ...surviving);
   });
   const events = readEventsFile(mount.dir) as SyncEvent[];
   writeFileSync(
