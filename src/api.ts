@@ -115,6 +115,7 @@ export class Plane {
   }
 
   async request(method: string, path: string, body?: unknown): Promise<Raw | Raw[]> {
+    if (process.env.TRACE_PLANE_REQ) console.error(`TRACE ${method} ${path}`);
     const doFetch = async (): Promise<Response> => {
       try {
         return await fetch(`${this.cfg.apiBase}${path}`, {
@@ -443,7 +444,7 @@ export class Plane {
     return out;
   }
 
-  async shapeIssue(i: Raw, opts: { full?: boolean; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations; ident?: string; projectId?: string }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
+  async shapeIssue(i: Raw, opts: { full?: boolean; maxChars?: number; memberNames?: Record<string, string>; labelNames?: Record<string, string>; stateTokens?: Record<string, string>; relations?: IssueRelations; ident?: string; projectId?: string }): Promise<IssueRow & { description?: string; blockedBy?: string[]; blocks?: string[] }> {
     const ident = opts.ident ?? this.cfg.ident;
     const names = opts.memberNames ?? (await this.memberNames());
     const lm = opts.labelNames ?? (await this.labelMap(opts.projectId));
@@ -454,7 +455,7 @@ export class Plane {
     let description: string | undefined;
     if ("description_html" in i) {
       const t = htmlToText(String(i.description_html ?? ""));
-      const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : 500);
+      const tr = truncate(t, opts.full ? Number.MAX_SAFE_INTEGER : (opts.maxChars ?? 1000));
       description = tr.full ? tr.text : `${tr.text}…(+${tr.rest} chars — plane get ${ident}-${i.sequence_id} --full)`;
     }
     const normalizeIdArray = (v: unknown): string[] => (Array.isArray(v) ? (v as any[]).map((a) => (typeof a === "string" ? a : a?.id)).filter((s): s is string => typeof s === "string" && s.length > 0) : []);
