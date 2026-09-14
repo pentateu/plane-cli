@@ -517,7 +517,10 @@ async function pushOne(p: Plane, mount: SyncMount, dir: string, ticket: Raw, gua
     }
   }
   // Labels (board names → ids).
-  if (fm.labels.length) {
+  // C1: [] is an intentional clear — always reconcile labels (PATCH empty id
+  // list when local cleared). Skipping the PATCH while storing [] as the
+  // baseline caused the next server move to silently revert the clear.
+  if (fm.labels !== undefined) {
     const lm = await p.labelMap(mount.projectId);
     const ids: string[] = [];
     for (const name of fm.labels) {
@@ -690,7 +693,8 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     // (updateEvents already rewrote comments.json atomically inside the lock
     // — single-writer rule, no extra outside-lock write.)
   }
-  const md = readFileSync(join(dir, "ticket.md"), "utf8");
+  let md = readFileSync(join(dir, "ticket.md"), "utf8");
+  let mdShaAtRead = sha256(md);
   const serverChanged = mount.lastRev !== null && serverRev !== mount.lastRev;
   // M5: --force = local-wins parent only, --force-all = local-wins whole tree.
   const localForce = Boolean(opts?.force || opts?.forceAll);
@@ -739,13 +743,32 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
   // guard — never silently merge on unknown baselines; the next pull or
   // push populates the fields and field-level kicks in.
   const baseline = fieldsFromBaselineMount(mount);
-  const legacyLocalChanged = sha256(md) !== mount.lastFileSha;
+  let legacyLocalChanged = sha256(md) !== mount.lastFileSha;
   let serverCh: Set<FieldName> = new Set();
   let shared: Set<FieldName> = new Set();
+  // I1: hoisted for the coarse-fallback below (whitespace-only edits have no
+  // field dirtiness even though the raw whole-file sha moved).
+  let localFields: TicketFields | null = null;
+  // I2: merge residue tracking — restored iff pushOne's C6 guard aborts.
+  let preMergeRootMd: string | null = null;
+  let didRootMerge = false;
+  let expectedRootSha = mdShaAtRead;
   if (baseline) {
     const maps = await getConflictMaps();
+    // C2: re-check ticket.md — an external save landing during the awaits
+    // above must not be lost by the merge write below. One extra
+    // readFileSync+sha256; on move, refresh our view and recompute from it.
+    try {
+      const mdFresh = readFileSync(join(dir, "ticket.md"), "utf8");
+      if (sha256(mdFresh) !== mdShaAtRead) {
+        md = mdFresh;
+        mdShaAtRead = sha256(md);
+        expectedRootSha = mdShaAtRead;
+      }
+    } catch { /* file vanished — let later reads throw the real error */ }
+    legacyLocalChanged = sha256(md) !== mount.lastFileSha;
     const serverFields = fieldsFromServer(ticket, maps);
-    const localFields = fieldsFromLocal(parseTicketMd(md));
+    localFields = fieldsFromLocal(parseTicketMd(md));
     serverCh = changedFields(serverFields, baseline);
     shared = new Set([...changedFields(localFields, baseline)].filter((f) => serverCh.has(f)));
     // I-1: exclude CONVERGED fields (local === server, both agree regardless
@@ -761,16 +784,29 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
       // (byte-matched frontMatter emitter), keep the local-changed ones.
       // pushOne below then pushes only the local-changed fields (it diffs
       // each field against the server GET).
+      // C2: no await sits between the re-check above and this write, so the
+      // fresh view is still current — safe to persist.
+      preMergeRootMd = md;
       writeMergedTicketMd(dir, mergeFields(localFields, serverFields, serverCh));
+      didRootMerge = true;
+      try {
+        expectedRootSha = sha256(readFileSync(join(dir, "ticket.md"), "utf8"));
+      } catch {
+        expectedRootSha = mdShaAtRead;
+      }
     }
   }
   // Conflict decision:
   //  - legacy mounts (no field baselines): coarse whole-file rule.
   //  - field baselines but NO known server field changed (unknown server
-  //    edit / rev-only bump): coarse fallback — safe, never silently merges.
+  //    edit / rev-only bump): field-level fallback — conflict only when a
+  //    tracked field actually moved locally (I1: a whitespace-only edit plus
+  //    a rev-only bump must not conflict).
   //  - field baselines with known server field changes: conflict only on a
   //    SHARED field (both sides moved the same one).
-  const conflictRoot = serverChanged && (baseline ? (serverCh.size > 0 ? shared.size > 0 : legacyLocalChanged) : legacyLocalChanged);
+  // I1: fallback uses field dirtiness, not the raw whole-file sha.
+  const localFieldDirty = baseline && localFields ? changedFields(localFields, baseline).size > 0 : legacyLocalChanged;
+  const conflictRoot = serverChanged && (baseline ? (serverCh.size > 0 ? shared.size > 0 : localFieldDirty) : legacyLocalChanged);
 
   if (serverChanged && conflictRoot && !localForce) {
     // Conflict: local kept, server side aside, ONE notice, push nothing.
@@ -813,6 +849,20 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     const f = join(dir, k.rel, "ticket.md");
     return existsSync(f) && sha256(readFileSync(f, "utf8")) !== k.fileSha;
   });
+  // C2: re-check before the server-only re-pull — the listIssues await above
+  // is a window where an external save could land; re-pulling over it would
+  // clobber the save. One extra readFileSync+sha256; on move, treat as
+  // locally edited (block the re-pull, let the merged/fresh file flow to
+  // pushOne and the next cycle).
+  try {
+    const cur = readFileSync(join(dir, "ticket.md"), "utf8");
+    if (sha256(cur) !== expectedRootSha) {
+      md = cur;
+      mdShaAtRead = sha256(cur);
+      legacyLocalChanged = sha256(cur) !== mount.lastFileSha;
+      expectedRootSha = mdShaAtRead;
+    }
+  } catch { /* file vanished — pullTicket below surfaces the real error */ }
   if (serverChanged && !legacyLocalChanged && !editedKids.length) {
     // Server-only move (local file untouched bytes-wise): re-pull wins —
     // even when the merge above rewrote ticket.md to project the server
@@ -840,7 +890,28 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     });
     return { ticket: mount.ticket, pushed: ["pulled"], comments: 0, rev: pulled.rev };
   }
-  const r = await pushOne(p, mount, dir, ticket, serverRev);
+  // I2: the disjoint merge above persisted before pushOne's C6 rev-guard. A
+  // C6 abort must not leave the stale merged file + stale baselines (next
+  // cycle spurious same-field conflict and stale --force push). Revert to
+  // the pre-merge content iff the file still holds our merge (an external
+  // save after the merge wins over the revert). Non-C6 throws (e.g. PATCH
+  // failure) keep the residue — the I-1 converged-field exclusion handles it.
+  let r: { pushed: string[]; comments: number; rev: string; bodySha: string };
+  try {
+    r = await pushOne(p, mount, dir, ticket, serverRev);
+  } catch (e) {
+    const rule = (e as { refusal?: { rule?: string } })?.refusal?.rule;
+    if (rule === "server-moved" && didRootMerge && preMergeRootMd !== null) {
+      try {
+        const cur = readFileSync(join(dir, "ticket.md"), "utf8");
+        if (sha256(cur) === expectedRootSha) {
+          writeFileSync(join(dir, "ticket.md"), preMergeRootMd);
+          expectedRootSha = sha256(preMergeRootMd);
+        }
+      } catch { /* best-effort revert — next cycle re-evaluates */ }
+    }
+    throw e;
+  }
 
   // Adopt server-side newcomers (pulled into slug dirs + baselined), then
   // recurse into known children (registry baselines; unknown local dirs are
@@ -886,6 +957,11 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
     const childMd = join(childDir, "ticket.md");
     if (!existsSync(childMd)) continue;
     if (sha256(readFileSync(childMd, "utf8")) === kid.fileSha) continue;
+    // I2: per-child merge residue for C6 revert — hoisted so the pushOne
+    // catch below can restore the pre-merge file on a child C6 abort.
+    let preMergeChildMd: string | null = null;
+    let didChildMerge = false;
+    let expectedChildSha: string | null = null;
     try {
       const childTicket = (await p.request("GET", `${p.projectPathFor(mount.projectId)}/issues/${kid.uuid}/`)) as Raw;
       const childRev = String(childTicket.updated_at ?? "");
@@ -907,21 +983,56 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
         if (kidBaseline) {
           const maps = await getConflictMaps();
           const childServer = fieldsFromServer(childTicket, maps);
-          const childLocal = fieldsFromLocal(parseTicketMd(readFileSync(childMd, "utf8")));
+          // C2: the child file read lands AFTER the await above, so it is
+          // fresh; snapshot its sha so the write below can re-check it (one
+          // extra readFileSync+sha256, no extra GETs).
+          let childRaw = readFileSync(childMd, "utf8");
+          let childShaAtRead = sha256(childRaw);
+          let childLocal = fieldsFromLocal(parseTicketMd(childRaw));
           childCh = changedFields(childServer, kidBaseline);
-          const shared = new Set([...changedFields(childLocal, kidBaseline)].filter((f) => childCh.has(f)));
+          let shared = new Set([...changedFields(childLocal, kidBaseline)].filter((f) => childCh.has(f)));
           // I-1: exclude converged fields (local === server) from the child's
           // conflict set — an earlier merge cycle's residue (or convergent
           // edits) must not manufacture a conflict.
           for (const f of shared) {
             if (fieldsConvergeOn(childLocal, childServer, f)) shared.delete(f);
           }
-          childConflict = shared.size > 0 || childCh.size === 0; // empty serverCh = unknown server edit → legacy coarse guard
+          // I1: empty serverCh = unknown server edit → conflict only when a
+          // tracked child field actually moved locally (whitespace-only child
+          // edit + rev-only bump must not conflict).
+          const localChildFieldChanged = changedFields(childLocal, kidBaseline).size > 0;
+          childConflict = shared.size > 0 || (childCh.size === 0 && localChildFieldChanged);
           if (!childConflict && childCh.size > 0) {
             // Disjoint (or local-untouched) child merge: adopt the
             // server-changed fields, keep the local edits; pushOne lands only
             // the local-changed fields.
-            writeMergedTicketMd(childDir, mergeFields(childLocal, childServer, childCh));
+            // C2: re-check before the write; on move refresh and re-evaluate
+            // instead of clobbering the concurrent save.
+            try {
+              const curRaw = readFileSync(childMd, "utf8");
+              if (sha256(curRaw) !== childShaAtRead) {
+                childRaw = curRaw;
+                childShaAtRead = sha256(childRaw);
+                childLocal = fieldsFromLocal(parseTicketMd(childRaw));
+                const freshLocalCh = changedFields(childLocal, kidBaseline);
+                shared = new Set([...freshLocalCh].filter((f) => childCh.has(f)));
+                for (const f of shared) {
+                  if (fieldsConvergeOn(childLocal, childServer, f)) shared.delete(f);
+                }
+                const freshDirty = freshLocalCh.size > 0;
+                childConflict = shared.size > 0 || (childCh.size === 0 && freshDirty);
+              }
+            } catch { /* vanished — write below surfaces it */ }
+            if (!childConflict) {
+              preMergeChildMd = childRaw;
+              writeMergedTicketMd(childDir, mergeFields(childLocal, childServer, childCh));
+              didChildMerge = true;
+              try {
+                expectedChildSha = sha256(readFileSync(childMd, "utf8"));
+              } catch {
+                expectedChildSha = childShaAtRead;
+              }
+            }
           }
         } else {
           childConflict = true; // legacy: any rev-vs-edit mismatch conflicts
@@ -998,6 +1109,19 @@ export async function pushTicket(p: Plane, mount: SyncMount, opts?: { force?: bo
           : k,
       );
     } catch (e) {
+      // I2: child C6 abort must not leave the stale merged child file.
+      // Revert to pre-merge iff the file still holds our merge (an external
+      // save after the merge wins). Non-C6 throws keep the residue for the
+      // I-1 converged-field exclusion.
+      const crule = (e as { refusal?: { rule?: string } })?.refusal?.rule;
+      if (crule === "server-moved" && didChildMerge && preMergeChildMd !== null) {
+        try {
+          const cur = readFileSync(childMd, "utf8");
+          if (expectedChildSha !== null && sha256(cur) === expectedChildSha) {
+            writeFileSync(childMd, preMergeChildMd);
+          }
+        } catch { /* best-effort — next cycle re-evaluates */ }
+      }
       // I2/I10: a poisoned child records its refusal and never kills the
       // parent cycle (the refusal row is already filed by refuseOnce).
       const message = String((e as Error)?.message ?? e).slice(0, 200);
