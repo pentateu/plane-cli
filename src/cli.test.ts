@@ -1597,6 +1597,37 @@ describe("sync mounts + pull (TC-95 phases 1-2)", () => {
     expect(rows.some((r: any) => r.status === "conflict")).toBeTrue();
   });
 
+  test("M3: .conflict is markdown with provenance + same schema as ticket.md (not JSON)", async () => {
+    const dir = mountDir("m3");
+    await run(["sync", "HT-67", "--dir", dir]);
+    const stateFile = process.env.PLANE_SYNC_STATE!;
+    const mounts = JSON.parse(readFileSync(stateFile, "utf8"));
+    mounts[0].lastRev = "stale-rev";
+    writeFileSync(stateFile, JSON.stringify(mounts));
+    writeFileSync(join(dir, "ticket.md"), readFileSync(join(dir, "ticket.md"), "utf8").replace("state: todo", "state: progress"));
+    await run(["sync", "HT-67", "--push-once"]);
+    const snap = readFileSync(join(dir, "ticket.md.conflict"), "utf8");
+    // NOT JSON.
+    expect(() => JSON.parse(snap)).toThrow();
+    // Provenance comment present with baseRev + serverRev.
+    expect(snap).toContain("<!-- conflict snapshot: server side wins nothing yet — local file kept");
+    expect(snap).toContain("ticket: HT-67");
+    expect(snap).toContain("baseRev: stale-rev");
+    expect(snap).toContain("serverRev: 2026-09-13T08:00:00.000Z");
+    expect(snap).toContain("resolve: diff against ticket.md;");
+    // Standard ticket.md rendering: front-matter + title + plain-text body.
+    expect(snap).toContain("---\nstate: todo\nassignee: dev2\nlabels: [type:bug]\npriority: none\n---\n");
+    expect(snap).toContain("# [bug] overshoot quota");
+    // Body matches htmlToText of the mocked server description (<p>short body</p>).
+    expect(snap).toContain("short body");
+    // Server side kept (todo), not the local edit (progress).
+    expect(snap).not.toContain("state: progress");
+    // Notice body names the markdown snapshot.
+    const rows = readFileSync(join(dir, ".plane", "comments.events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const notice = rows.find((r: any) => r.status === "conflict");
+    expect(String(notice.body)).toContain("ticket.md.conflict as markdown — same format as ticket.md, diff them");
+  });
+
   test("conflict notice fires ONCE across repeated polls (no per-cycle spam)", async () => {
     const dir = mountDir("i2");
     await run(["sync", "HT-67", "--dir", dir]);

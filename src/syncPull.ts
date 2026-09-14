@@ -48,7 +48,7 @@ export function ticketSlug(title: string, fallback: string): string {
   return slug || fallback;
 }
 
-function frontMatter(state: string, assignee: string, labels: string[], priority: string): string {
+export function frontMatter(state: string, assignee: string, labels: string[], priority: string): string {
   // Minimal emitter: quote only when the value would confuse the Phase 3
   // line parser (commas, newlines, leading #/space). `type:bug` stays bare;
   // the parser JSON.parse-fallbacks anything quoted.
